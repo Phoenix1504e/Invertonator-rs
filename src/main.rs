@@ -1,18 +1,15 @@
-// Invertonator-rs — v0.2.0-stepA: UIA probe (diagnostic build)
+// Invertonator-rs — v0.2.0-stepA2: UIA probe + MAG WINDOW PROBE
 //
 //   Milestone 1: magnification invert/Dim, tray, hotkeys, settings. DONE.
-//   Milestone 2 STEP A: prove COM + IUIAutomation + cache-request walks.
+//   Milestone 2 STEP A: UIA probe proven (cache-request + live-walk).
+//   NEW: Mag window probe (F11) — proves MagSetWindowColorEffect /
+//   MagSetWindowSource / MagSetWindowTransform work from Rust externs.
+//   This de-risks the entire hole pool (Milestone 3).
 //
-//   NEW DIAGNOSTICS:
-//     · probe logs the ROOT WINDOW NAME — answers "what are we probing?"
-//     · walk_live logs every visited node + children count — answers
-//       "is the walk descending or stopping at depth 1?"
-//
-//   Press Ctrl+Alt+F10 with OPERA focused (not the terminal!).
+//   F11 test: a 300x200 window at (100,100) appears for 5s showing
+//   INVERTED content = the hole mechanism is proven from Rust.
 
-#![windows_subsystem = "windows"]
-// ^ uncomment for release; keep commented while debugging so panics/logs
-//   print to the console.
+// #![windows_subsystem = "windows"]   // ← uncomment for release
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -177,7 +174,8 @@ mod magnification {
 }
 
 // =====================================================================
-// RAW CreateWindowExW (ledger: "failed successfully" quirk)
+// RAW CreateWindowExW (ledger: "failed successfully" quirk).
+// Crate-root extern — main's window creation uses this.
 // =====================================================================
 
 #[link(name = "user32")]
@@ -196,7 +194,7 @@ extern "system" {
 }
 
 // =====================================================================
-// UIA PROBE — Milestone 2 Step A (with diagnostics)
+// UIA PROBE — Milestone 2 Step A (proven)
 // =====================================================================
 
 mod uia {
@@ -206,8 +204,8 @@ mod uia {
         COINIT_APARTMENTTHREADED,
     };
     use windows::Win32::UI::Accessibility::{
-        CUIAutomation, IUIAutomation, IUIAutomationElement, TreeScope,
-        TreeScope_Children, TreeScope_Descendants,
+        CUIAutomation, IUIAutomation, IUIAutomationElement,
+        TreeScope_Descendants,
         UIA_BoundingRectanglePropertyId, UIA_ControlTypePropertyId,
         UIA_LocalizedControlTypePropertyId, UIA_NamePropertyId,
     };
@@ -233,13 +231,18 @@ mod uia {
                 tracing::error!("uia-probe: ElementFromHandle failed");
                 return (0, 0, Vec::new());
             };
-            // WARM-UP: poke Chromium to fully expand the AX tree (the C#
-            // tracker's first FindAll did this implicitly; explicit is better).
-            let Ok(true_cond_warm) = automation.CreateTrueCondition() else {
+            let root_name = root
+                .CurrentName()
+                .map(|n| n.to_string())
+                .unwrap_or_else(|_| "<unnamed>".into());
+            tracing::info!("uia-probe: probing window \"{root_name}\"");
+
+            // WARM-UP: poke Chromium to fully expand the AX tree.
+            let Ok(warm_cond) = automation.CreateTrueCondition() else {
                 tracing::error!("uia-probe: warmup condition failed");
                 return (0, 0, Vec::new());
             };
-            match root.FindAll(TreeScope_Descendants, &true_cond_warm) {
+            match root.FindAll(TreeScope_Descendants, &warm_cond) {
                 Ok(pre) => {
                     let n = pre.Length().unwrap_or(0);
                     tracing::info!("uia-probe: warm-up FindAll: {n} elements");
@@ -248,14 +251,8 @@ mod uia {
             }
             std::thread::sleep(std::time::Duration::from_millis(800));
 
-            // DIAGNOSTIC: which window are we actually probing?
-            let root_name = root
-                .CurrentName()
-                .map(|n| n.to_string())
-                .unwrap_or_else(|_| "<unnamed>".into());
-            tracing::info!("uia-probe: probing window \"{root_name}\"");
-
-            // Cache request: all four properties, whole subtree, one call.
+            // Cache request — minimal form (no SetTreeScope/SetTreeFilter;
+            // defaults are Subtree + accept-all).
             let Ok(cache) = automation.CreateCacheRequest() else {
                 tracing::error!("uia-probe: CreateCacheRequest failed");
                 return (0, 0, Vec::new());
@@ -263,21 +260,7 @@ mod uia {
             let _ = cache.AddProperty(UIA_ControlTypePropertyId);
             let _ = cache.AddProperty(UIA_NamePropertyId);
             let _ = cache.AddProperty(UIA_LocalizedControlTypePropertyId);
-            let _ = cache.AddProperty(UIA_ControlTypePropertyId);
-            let _ = cache.AddProperty(UIA_NamePropertyId);
-            let _ = cache.AddProperty(UIA_LocalizedControlTypePropertyId);
             let _ = cache.AddProperty(UIA_BoundingRectanglePropertyId);
-            // ORDER MATTERS: filter BEFORE scope (COM docs order). And the
-            // earlier BuildUpdatedCache failure was WITH these two calls but
-            // WITHOUT... unknown — the fallback below covers any recurrence,
-            // and the cache path is worth one more attempt now that the
-            // environment is proven healthy (warm-up saw 931 nodes).
-            let Ok(true_cond) = automation.CreateTrueCondition() else {
-                tracing::error!("uia-probe: CreateTrueCondition failed");
-                return (0, 0, Vec::new());
-            };
-            let _ = cache.SetTreeFilter(&true_cond);
-            let _ = cache.SetTreeScope(TreeScope_Descendants);
 
             let cached_root = match root.BuildUpdatedCache(&cache) {
                 Ok(c) => c,
@@ -285,7 +268,7 @@ mod uia {
                     tracing::warn!(
                         "uia-probe: BuildUpdatedCache failed ({e}) — falling back to live walk"
                     );
-                    // FALLBACK: live walk (proven C# technology).
+                    // FALLBACK: live (non-cached) walk — proven C# technology.
                     let Ok(true_cond) = automation.CreateTrueCondition() else {
                         tracing::error!("uia-probe: CreateTrueCondition failed");
                         return (0, 0, Vec::new());
@@ -299,9 +282,11 @@ mod uia {
                     let mut total: u32 = 0;
                     let mut media: u32 = 0;
                     let mut samples: Vec<String> = Vec::new();
+                    // The flat FindAll already enumerated ALL descendants —
+                    // classify each, no recursion needed.
                     for i in 0..len {
                         if let Ok(el) = all.GetElement(i) {
-                            walk_live(el, &true_cond, &mut total, &mut media, &mut samples);
+                            classify_live(el, &mut total, &mut media, &mut samples);
                         }
                     }
                     return (total, media, samples);
@@ -366,10 +351,10 @@ mod uia {
         }
     }
 
-    /// Fallback walk with LIVE elements — logs every step (diagnostic).
-    fn walk_live(
+    /// Classify ONE live element (the fallback's flat FindAll already
+    /// enumerated all descendants — no recursion needed).
+    fn classify_live(
         el: IUIAutomationElement,
-        true_cond: &windows::Win32::UI::Accessibility::IUIAutomationCondition,
         total: &mut u32,
         media: &mut u32,
         samples: &mut Vec<String>,
@@ -384,12 +369,6 @@ mod uia {
             let name = el.CurrentName().map(|s| s.to_string()).unwrap_or_default();
             let rect = el.CurrentBoundingRectangle().unwrap_or_default();
 
-            tracing::info!(
-                "walk_live: [{}] \"{}\" {}x{} @({},{})",
-                lct, name, rect.right - rect.left, rect.bottom - rect.top,
-                rect.left, rect.top
-            );
-
             let lct_lower = lct.to_lowercase();
             if matches!(lct_lower.as_str(), "image" | "graphic" | "link" | "video") {
                 *media += 1;
@@ -402,23 +381,118 @@ mod uia {
                     ));
                 }
             }
-
-            // DIAGNOSTIC: how many children does FindAll see here?
-            match el.FindAll(TreeScope_Children, true_cond) {
-                Ok(kids) => {
-                    let len = kids.Length().unwrap_or(0);
-                    tracing::info!("walk_live: children={len}");
-                    for i in 0..len {
-                        if let Ok(kid) = kids.GetElement(i) {
-                            walk_live(kid, true_cond, total, media, samples);
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::info!("walk_live: FindAll(children) failed: {e}");
-                }
-            }
         }
+    }
+}
+
+// =====================================================================
+// MAG WINDOW PROBE — Milestone 3 pre-flight (F11)
+//   Self-contained: own raw externs (no Param-machinery fights), own
+//   imports. Proves MagSetWindow{Source,Transform,ColorEffect} from Rust.
+// =====================================================================
+
+mod magprobe {
+    use windows::Win32::Foundation::{
+        BOOL, HINSTANCE, HWND, RECT, LPARAM, LRESULT, WPARAM,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::HMENU;
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW,
+        ShowWindow, SW_SHOWNOACTIVATE, WS_CHILD, WS_VISIBLE,
+        WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW,
+    };
+
+    #[link(name = "Magnification")]
+    extern "system" {
+        fn MagSetColorEffect(hwnd: HWND, matrix: *const f32) -> BOOL;
+        fn MagSetWindowSource(hwnd: HWND, rect: RECT) -> BOOL;
+        fn MagSetWindowTransform(hwnd: HWND, matrix: *const f32) -> BOOL;
+    }
+
+    const INVERT_FLAT: [f32; 25] = [
+        -1.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, -1.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, -1.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 1.0, 0.0,
+        1.0, 1.0, 1.0, 0.0, 1.0,
+    ];
+
+    // The crate's DefWindowProcW is generic — wrap it in a concrete
+    // extern "system" fn so it coerces into WNDCLASSW.lpfnWndProc.
+    unsafe extern "system" fn host_wndproc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        DefWindowProcW(hwnd, msg, wparam, lparam)
+    }
+
+    pub unsafe fn run() {
+        let hinstance = HINSTANCE::from(GetModuleHandleW(None).unwrap());
+
+        let class_name = windows::core::w!("InvertonatorMagProbeHost");
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(host_wndproc),
+            hInstance: hinstance,
+            lpszClassName: class_name,
+            ..Default::default()
+        };
+        RegisterClassW(&wc);
+
+        // Host window — WS_POPUP | WS_VISIBLE, at (100,100), 300x200.
+        let host = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            class_name,
+            windows::core::w!("InvertonatorMagProbe"),
+            WINDOW_STYLE(0x9000_0000), // WS_POPUP | WS_VISIBLE
+            100, 100, 300, 200,
+            None,                    // no parent
+            HMENU::default(),        // no menu
+            hinstance,
+            None,
+        )
+        .unwrap_or_default();
+        if host.is_invalid() {
+            tracing::error!("mag-probe: host window failed");
+            return;
+        }
+        let _ = ShowWindow(host, SW_SHOWNOACTIVATE);
+
+        // Magnifier child — the hole-window class.
+        let mag = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            windows::core::w!("Magnifier"),
+            windows::core::PCWSTR::null(),
+            WINDOW_STYLE((WS_CHILD | WS_VISIBLE).0),
+            0, 0, 300, 200,
+            Some(&host),
+            HMENU::default(),
+            hinstance,
+            None,
+        )
+        .unwrap_or_default();
+        if mag.is_invalid() {
+            tracing::error!("mag-probe: Magnifier child failed");
+            let _ = DestroyWindow(host);
+            return;
+        }
+
+        // Source region (screen area it captures) + 1:1 transform + invert.
+        let src = RECT { left: 100, top: 100, right: 400, bottom: 300 };
+        let set_src = MagSetWindowSource(mag, src).as_bool();
+        let transform: [f32; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        let set_tf = MagSetWindowTransform(mag, transform.as_ptr()).as_bool();
+        let set_fx = MagSetColorEffect(mag, INVERT_FLAT.as_ptr()).as_bool();
+
+        tracing::info!(
+            "mag-probe: set_src={set_src} transform={set_tf} color_effect={set_fx} — window @(100,100) 300x200 shows INVERTED content for 5s"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(5000));
+        let _ = DestroyWindow(host);
+        tracing::info!("mag-probe: done — did it show INVERTED content?");
     }
 }
 
@@ -432,7 +506,6 @@ struct AppState {
     mode: ScreenMode,
     invert_on: AtomicBool,
     dim_level_milli: AtomicUsize,
-    // Used in Milestone 3 (hole placement relative to the host window).
     #[allow(dead_code)]
     hwnd: HWND,
     tray_nid: NOTIFYICONDATAW,
@@ -493,16 +566,19 @@ static TOGGLE_REQUEST: AtomicBool = AtomicBool::new(false);
 static QUIT_REQUEST: AtomicBool = AtomicBool::new(false);
 static CYCLE_REQUEST: AtomicBool = AtomicBool::new(false);
 static PROBE_REQUEST: AtomicBool = AtomicBool::new(false);
+static MAGPROBE_REQUEST: AtomicBool = AtomicBool::new(false);
 
 const HOTKEY_TOGGLE: i32 = 1;
 const HOTKEY_QUIT: i32 = 2;
 const HOTKEY_CYCLE: i32 = 3;
 const HOTKEY_PROBE: i32 = 4;
+const HOTKEY_MAGPROBE: i32 = 5;
 const HOTKEY_MODS: HOT_KEY_MODIFIERS = HOT_KEY_MODIFIERS(0x1 | 0x2 | 0x4000);
 const VK_F5: u32 = 0x74;
 const VK_F2: u32 = 0x71;
 const VK_F6: u32 = 0x75;
 const VK_F10: u32 = 0x79;
+const VK_F11: u32 = 0x7A;
 
 unsafe fn register_hotkeys(hwnd: HWND) -> bool {
     let register = |id: i32, vk: u32, name: &str| -> bool {
@@ -518,7 +594,8 @@ unsafe fn register_hotkeys(hwnd: HWND) -> bool {
     let b = register(HOTKEY_CYCLE, VK_F6, "mode");
     let c = register(HOTKEY_QUIT, VK_F2, "quit");
     let d = register(HOTKEY_PROBE, VK_F10, "uia-probe");
-    a && b && c && d
+    let e = register(HOTKEY_MAGPROBE, VK_F11, "mag-window-probe");
+    a && b && c && d && e
 }
 
 /// SAFE tray-tip write (the [u16;128] panic fix).
@@ -554,6 +631,7 @@ unsafe extern "system" fn wndproc(
                     HOTKEY_TOGGLE => TOGGLE_REQUEST.store(true, Ordering::Relaxed),
                     HOTKEY_CYCLE => CYCLE_REQUEST.store(true, Ordering::Relaxed),
                     HOTKEY_PROBE => PROBE_REQUEST.store(true, Ordering::Relaxed),
+                    HOTKEY_MAGPROBE => MAGPROBE_REQUEST.store(true, Ordering::Relaxed),
                     HOTKEY_QUIT => QUIT_REQUEST.store(true, Ordering::Relaxed),
                     _ => {}
                 }
@@ -577,15 +655,15 @@ unsafe extern "system" fn wndproc(
             update_tray_tip(&mut state.tray_nid, &tip_text);
         }
         if PROBE_REQUEST.swap(false, Ordering::Relaxed) {
-            // Probe targets the FOREGROUND window. NOTE: press F10 with
-            // OPERA focused — pressing it while the terminal is focused
-            // probes the terminal instead (the total=1 mystery).
             let target = GetForegroundWindow();
             let (total, media, samples) = uia::probe(target);
             tracing::info!("uia-probe: total={total} media={media}");
             for s in &samples {
                 tracing::info!("  media sample: {s}");
             }
+        }
+        if MAGPROBE_REQUEST.swap(false, Ordering::Relaxed) {
+            magprobe::run();
         }
         if QUIT_REQUEST.swap(false, Ordering::Relaxed) {
             tracing::info!("quit requested");
@@ -612,7 +690,7 @@ fn main() {
         .with_ansi(false)
         .init();
 
-    tracing::info!("=== Invertonator-rs v0.2.0-stepA (UIA probe, diagnostic) ===");
+    tracing::info!("=== Invertonator-rs v0.2.0-stepA2 (UIA + Mag window probe) ===");
 
     let settings = Settings::load();
     tracing::info!("settings: dimLevel={}", settings.features.dim_level);
