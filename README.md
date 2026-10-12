@@ -2,8 +2,6 @@
 
 **System-wide dark mode for Windows that websites cannot see — now in Rust.**
 
-*Like other dark modes, but evil.™ — now with zero GC pauses.*
-
 ![Invertonator](icon.svg)
 
 > **Status: v0.2.0-alpha.2** — the UIA detection layer **and** the
