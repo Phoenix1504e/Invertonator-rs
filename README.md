@@ -56,7 +56,7 @@ because the remaining bottlenecks are language-shaped:
   hallucinated Win32 function name that failed *silently at runtime* for a
   week. In Rust, the linker refused to compile it in seconds. The mistakes
   get caught before the product does.
-- **~2 MB binary, instant startup** — vs ~150 MB self-contained .NET.
+- **~0.5 MB binary, instant startup** — vs ~150 MB self-contained .NET.
 
 ## Current status (v0.2.0-alpha.2)
 
