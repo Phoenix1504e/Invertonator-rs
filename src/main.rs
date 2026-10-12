@@ -10,7 +10,16 @@
 //   INVERTED content = the hole mechanism is proven from Rust.
 
 // #![windows_subsystem = "windows"]   // ← uncomment for release
+// Crate-level native libs — needed by holes.rs externs. Placed at crate
+// root so LTO can't strip the linker directives (the M1-era externs proved
+// these two libs are required: Magnification for holes, user32 for windows).
+#[link(name = "Magnification")]
+extern "system" {}
+#[link(name = "user32")]
+extern "system" {}
 
+mod holes;
+use holes::{Holes, HoleSpec};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -509,6 +518,7 @@ struct AppState {
     #[allow(dead_code)]
     hwnd: HWND,
     tray_nid: NOTIFYICONDATAW,
+    holes: Holes,
 }
 
 impl AppState {
@@ -525,6 +535,9 @@ impl AppState {
         };
         let ok = magnification::set_fullscreen_effect(&matrix);
         tracing::info!("apply mode={:?} invert_on={} ok={}", mode, invert_on, ok);
+
+        // Holes only exist in Invert mode (v1.0 design: Dim = watch mode).
+        self.holes.set_active(invert_on && mode == ScreenMode::Invert);
     }
 
     fn cycle_mode(&mut self) {
@@ -701,6 +714,17 @@ fn main() {
             return;
         }
 
+        // Hole pool — creates its 16 windows on THIS thread (main runs
+        // the message loop that pumps them).
+        let holes = Holes::new();
+        let holes_for_state = holes.clone();
+
+        // STANDALONE TEST: one hardcoded true-color hole (Milestone 3
+        // validation — remove when the tracker feeds real rects).
+        holes_for_state.set_specs(vec![HoleSpec {
+            x: 100, y: 100, w: 300, h: 200, dynamic: true,
+        }]);
+
         let hinstance = HINSTANCE::from(GetModuleHandleW(None).unwrap());
         let class_name = windows::core::w!("InvertonatorClass");
 
@@ -756,6 +780,7 @@ fn main() {
             dim_level_milli: AtomicUsize::new(
                 (settings.features.dim_level * 1000.0) as usize
             ),
+            holes: holes_for_state,
             hwnd,
             tray_nid: NOTIFYICONDATAW::default(),
         }));
