@@ -6,10 +6,13 @@
 
 ![Invertonator](icon.svg)
 
-> **Status: v0.2.0-alpha** — the UIA detection layer is proven (1,152-node
-> cache-request walks, 164 media elements classified on live YouTube).
-> Media holes land in the next alpha. For the **fully-featured C# edition**,
-> see [Invertonator](https://github.com/Phoenix1504e/Invertonator).
+> **Status: v0.2.0-alpha.2** — the UIA detection layer **and** the
+> window-level Magnification APIs are proven from Rust (1,152-node
+> cache-request walks · 164 media elements classified ·
+> MagSetColorEffect/Source/Transform all verified on hardware).
+> True-color media holes land in the next release. For the
+> **fully-featured C# edition**, see
+> [Invertonator](https://github.com/Phoenix1504e/Invertonator).
 
 ## The problem
 
@@ -49,9 +52,13 @@ because the remaining bottlenecks are language-shaped:
   impractical; the `windows` crate makes it natural.
 - **No GC** — no generation-2 collection pauses during video.
 - **No COM marshaling tax** — direct `windows`-crate calls.
+- **Compile-time API safety** — the C# build once shipped with a
+  hallucinated Win32 function name that failed *silently at runtime* for a
+  week. In Rust, the linker refused to compile it in seconds. The mistakes
+  get caught before the product does.
 - **~2 MB binary, instant startup** — vs ~150 MB self-contained .NET.
 
-## Current status (v0.2.0-alpha)
+## Current status (v0.2.0-alpha.2)
 
 | Component | Status |
 |---|---|
@@ -60,10 +67,11 @@ because the remaining bottlenecks are language-shaped:
 | settings.json (C#-compatible) | ✅ working |
 | UIA cache-request tree walks | ✅ **proven** (1,152 nodes / 164 media on live YouTube) |
 | Live-walk fallback engine | ✅ working |
+| `MagSetWindowSource` / `SetTransform` / `SetColorEffect` | ✅ **verified from Rust** (F11 probe) |
 | Media classification gates | 🚧 in tracker module |
-| True-color media holes | 🚧 next alpha (Milestone 2 Step B) |
-| Browser-chrome preservation | 🚧 next alpha |
-| Scroll-actuated adaptive cadence | 🚧 next alpha |
+| True-color media holes | 🚧 next release — **all APIs verified, build is transcription** |
+| Browser-chrome preservation | 🚧 next release |
+| Scroll-actuated adaptive cadence | 🚧 next release |
 
 ## Setup
 
@@ -119,6 +127,7 @@ run (same format as the C# edition — delete to reset):
 | `Ctrl+Alt+F6` | Cycle screen mode (Invert → Dim → Off) |
 | `Ctrl+Alt+F2` | Quit (restores colors) |
 | `Ctrl+Alt+F10` | UIA probe (diagnostics → `%LOCALAPPDATA%\Invertonator\log.txt`) |
+| `Ctrl+Alt+F11` | Magnifier window probe (diagnostic — proves the hole APIs) |
 
 ## The architecture (why it can't be detected)
 
@@ -138,8 +147,8 @@ Tor Browser) cannot detect it — there is nothing in the web layer to detect.
 
 ## Roadmap
 
-- **v0.2.0-beta** — adaptive tracker (scroll-actuated discovery) + media
-  holes + browser-chrome preservation
+- **v0.2.0-beta** — adaptive tracker (scroll-actuated discovery) + true-color
+  media holes + browser-chrome preservation
 - **v0.3** — event-driven UIA (instant discovery), auto-Dim on video,
   Firefox support
 - **v2.0** — Linux/X11 backend (XRandR inversion, AT-SPI2 discovery)
@@ -153,7 +162,7 @@ Tor Browser) cannot detect it — there is nothing in the web layer to detect.
   the unsung hero
 - [NegativeScreen](https://github.com/mlaily/NegativeScreen) — the pioneer
 - [tracing](https://github.com/tokio-rs/tracing) — the diagnostics that
-  caught every bug
+  caught every bug, including one hallucinated API name
 - Apple — for Smart Invert, the target reconstructed from userland
 
 ## License
