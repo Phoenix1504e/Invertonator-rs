@@ -130,6 +130,8 @@ extern "system" {
 // =====================================================================
 
 mod uia {
+    use std::collections::HashMap;
+
     use windows::Win32::Foundation::HWND;
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER,
@@ -174,10 +176,11 @@ mod uia {
                 tracing::error!("uia-probe: warmup condition failed");
                 return (0, 0, Vec::new());
             };
+            let mut warm_n: i32 = 0;
             match root.FindAll(TreeScope_Descendants, &warm_cond) {
                 Ok(pre) => {
-                    let n = pre.Length().unwrap_or(0);
-                    tracing::info!("uia-probe: warm-up FindAll: {n} elements");
+                    warm_n = pre.Length().unwrap_or(0);
+                    tracing::info!("uia-probe: warm-up FindAll: {warm_n} elements");
                 }
                 Err(e) => tracing::warn!("uia-probe: warm-up failed: {e}"),
             }
@@ -201,27 +204,7 @@ mod uia {
                         "uia-probe: BuildUpdatedCache failed ({e}) — falling back to live walk"
                     );
                     // FALLBACK: live (non-cached) walk — proven C# technology.
-                    let Ok(true_cond) = automation.CreateTrueCondition() else {
-                        tracing::error!("uia-probe: CreateTrueCondition failed");
-                        return (0, 0, Vec::new());
-                    };
-                    let Ok(all) = root.FindAll(TreeScope_Descendants, &true_cond) else {
-                        tracing::error!("uia-probe: FindAll failed");
-                        return (0, 0, Vec::new());
-                    };
-                    let Ok(len) = all.Length() else { return (0, 0, Vec::new()); };
-                    tracing::info!("uia-probe fallback: FindAll returned {len} elements");
-                    let mut total: u32 = 0;
-                    let mut media: u32 = 0;
-                    let mut samples: Vec<String> = Vec::new();
-                    // The flat FindAll already enumerated ALL descendants —
-                    // classify each, no recursion needed.
-                    for i in 0..len {
-                        if let Ok(el) = all.GetElement(i) {
-                            classify_live(el, &mut total, &mut media, &mut samples);
-                        }
-                    }
-                    return (total, media, samples);
+                    return live_walk(&automation, &root);
                 }
             };
 
@@ -230,6 +213,63 @@ mod uia {
             let mut media: u32 = 0;
             let mut samples: Vec<String> = Vec::new();
             walk(cached_root, 0, &mut total, &mut media, &mut samples);
+
+            // GECKO GUARD: some providers (Firefox/LibreWolf) succeed at
+            // BuildUpdatedCache but never fill CachedChildren — the walk
+            // comes back with the root element and nothing else. The
+            // warm-up FindAll proves the tree is really there, so switch
+            // to the flat live walk instead of reporting a false empty.
+            if total <= 1 && warm_n > 1 {
+                tracing::warn!(
+                    "uia-probe: cached walk saw only {total} node(s) but warm-up saw {warm_n} — CachedChildren empty (Gecko) — switching to live walk"
+                );
+                return live_walk(&automation, &root);
+            }
+
+            (total, media, samples)
+        }
+    }
+
+    /// Flat live walk: FindAll(Descendants) + per-element Current* reads.
+    /// The one path that works on EVERY provider — Chromium, Gecko,
+    /// whatever — because it never relies on CachedChildren.
+    /// Also dumps a LocalizedControlType census so a single probe run
+    /// reveals exactly how a provider names its elements.
+    fn live_walk(
+        automation: &IUIAutomation,
+        root: &IUIAutomationElement,
+    ) -> (u32, u32, Vec<String>) {
+        unsafe {
+            let Ok(true_cond) = automation.CreateTrueCondition() else {
+                tracing::error!("uia-probe: CreateTrueCondition failed");
+                return (0, 0, Vec::new());
+            };
+            let Ok(all) = root.FindAll(TreeScope_Descendants, &true_cond) else {
+                tracing::error!("uia-probe: FindAll failed");
+                return (0, 0, Vec::new());
+            };
+            let Ok(len) = all.Length() else { return (0, 0, Vec::new()); };
+            tracing::info!("uia-probe live walk: FindAll returned {len} elements");
+
+            let mut total: u32 = 0;
+            let mut media: u32 = 0;
+            let mut samples: Vec<String> = Vec::new();
+            let mut hist: HashMap<String, u32> = HashMap::new();
+            // The flat FindAll already enumerated ALL descendants —
+            // classify each, no recursion needed.
+            for i in 0..len {
+                if let Ok(el) = all.GetElement(i) {
+                    classify_live(el, &mut total, &mut media, &mut samples, &mut hist);
+                }
+            }
+
+            // Naming census — tells us what strings this provider uses
+            // (Gecko and Chromium differ) in one probe run.
+            let mut census: Vec<(String, u32)> = hist.into_iter().collect();
+            census.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            for (lct, n) in census.iter().take(24) {
+                tracing::info!("uia-probe live census: \"{lct}\" x{n}");
+            }
 
             (total, media, samples)
         }
@@ -297,6 +337,7 @@ mod uia {
         total: &mut u32,
         media: &mut u32,
         samples: &mut Vec<String>,
+        hist: &mut HashMap<String, u32>,
     ) {
         unsafe {
             *total += 1;
@@ -307,6 +348,11 @@ mod uia {
                 .unwrap_or_default();
             let name = el.CurrentName().map(|s| s.to_string()).unwrap_or_default();
             let rect = el.CurrentBoundingRectangle().unwrap_or_default();
+
+            if !lct.is_empty() {
+                let e = hist.entry(lct.clone()).or_insert(0);
+                *e += 1;
+            }
 
             let lct_lower = lct.to_lowercase();
             if matches!(lct_lower.as_str(), "image" | "graphic" | "link" | "video") {
