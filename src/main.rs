@@ -19,7 +19,10 @@ extern "system" {}
 extern "system" {}
 
 mod holes;
-use holes::{Holes, HoleSpec};
+mod scrollhook;
+mod tracker;
+use holes::{HolePool, Holes};
+use tracker::Tracker;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -60,17 +63,23 @@ struct HotkeySettings {
     pub mode: String,
     pub pierce: String,
     pub quit: String,
-    pub dump: String,
+    pub probe: String,
+    pub magprobe: String,
 }
 
 impl Default for HotkeySettings {
     fn default() -> Self {
+        // THE SOURCE OF TRUTH IS register_hotkeys() — these defaults
+        // document the real bindings (the old C#-edition values here
+        // were aspirational: they said F8=quit while the binary has
+        // always quit on Ctrl+Alt+F2).
         Self {
             invert: "Ctrl+Alt+F5".into(),
             mode: "Ctrl+Alt+F6".into(),
             pierce: "Ctrl+Alt+F7".into(),
-            quit: "Ctrl+Alt+F8".into(),
-            dump: "Ctrl+Alt+F9".into(),
+            quit: "Ctrl+Alt+F2".into(),
+            probe: "Ctrl+Alt+F10".into(),
+            magprobe: "Ctrl+Alt+F11".into(),
         }
     }
 }
@@ -339,7 +348,7 @@ mod uia {
                 *media += 1;
                 if samples.len() < 8 {
                     let rect = el.CachedBoundingRectangle().unwrap_or_default();
-                    let n = if name.len() > 30 { name[..30].to_string() } else { name };
+                    let n = trunc(&name, 30);
                     samples.push(format!(
                         "[{lct}] \"{n}\" {}x{} @({},{})",
                         rect.right - rect.left, rect.bottom - rect.top,
@@ -358,6 +367,13 @@ mod uia {
                 }
             }
         }
+    }
+
+    /// Locale-safe truncation for logging. NEVER slice a String at a
+    /// byte offset — `name[..30]` panics when index 30 splits a
+    /// multi-byte UTF-8 char (any non-ASCII page title / alt text).
+    fn trunc(s: &str, max_chars: usize) -> String {
+        s.chars().take(max_chars).collect()
     }
 
     /// Classify ONE live element (the fallback's flat FindAll already
@@ -382,7 +398,7 @@ mod uia {
             if matches!(lct_lower.as_str(), "image" | "graphic" | "link" | "video") {
                 *media += 1;
                 if samples.len() < 8 {
-                    let n = if name.len() > 30 { name[..30].to_string() } else { name };
+                    let n = trunc(&name, 30);
                     samples.push(format!(
                         "[{lct}] \"{n}\" {}x{} @({},{})",
                         rect.right - rect.left, rect.bottom - rect.top,
@@ -515,13 +531,21 @@ struct AppState {
     mode: ScreenMode,
     invert_on: AtomicBool,
     dim_level_milli: AtomicUsize,
+    pierce_on: bool,
     #[allow(dead_code)]
     hwnd: HWND,
     tray_nid: NOTIFYICONDATAW,
     holes: Holes,
+    pool: HolePool,
+    tracker: Tracker,
 }
 
 impl AppState {
+    /// One pump pass — WM_TIMER on main, at holes::PUMP_MS cadence.
+    fn pump_tick(&mut self) {
+        self.pool.pump_tick(&self.holes.shared);
+    }
+
     fn apply_mode(&self) {
         let invert_on = self.invert_on.load(Ordering::Relaxed);
         let mode = self.mode;
@@ -538,6 +562,8 @@ impl AppState {
 
         // Holes only exist in Invert mode (v1.0 design: Dim = watch mode).
         self.holes.set_active(invert_on && mode == ScreenMode::Invert);
+        // Same rule for media discovery — the tracker idles in Dim/Off.
+        self.tracker.set_enabled(invert_on && mode == ScreenMode::Invert);
     }
 
     fn cycle_mode(&mut self) {
@@ -580,16 +606,19 @@ static QUIT_REQUEST: AtomicBool = AtomicBool::new(false);
 static CYCLE_REQUEST: AtomicBool = AtomicBool::new(false);
 static PROBE_REQUEST: AtomicBool = AtomicBool::new(false);
 static MAGPROBE_REQUEST: AtomicBool = AtomicBool::new(false);
+static PIERCE_REQUEST: AtomicBool = AtomicBool::new(false);
 
 const HOTKEY_TOGGLE: i32 = 1;
 const HOTKEY_QUIT: i32 = 2;
 const HOTKEY_CYCLE: i32 = 3;
 const HOTKEY_PROBE: i32 = 4;
 const HOTKEY_MAGPROBE: i32 = 5;
+const HOTKEY_PIERCE: i32 = 6;
 const HOTKEY_MODS: HOT_KEY_MODIFIERS = HOT_KEY_MODIFIERS(0x1 | 0x2 | 0x4000);
 const VK_F5: u32 = 0x74;
 const VK_F2: u32 = 0x71;
 const VK_F6: u32 = 0x75;
+const VK_F7: u32 = 0x76;
 const VK_F10: u32 = 0x79;
 const VK_F11: u32 = 0x7A;
 
@@ -608,7 +637,8 @@ unsafe fn register_hotkeys(hwnd: HWND) -> bool {
     let c = register(HOTKEY_QUIT, VK_F2, "quit");
     let d = register(HOTKEY_PROBE, VK_F10, "uia-probe");
     let e = register(HOTKEY_MAGPROBE, VK_F11, "mag-window-probe");
-    a && b && c && d && e
+    let f = register(HOTKEY_PIERCE, VK_F7, "pierce");
+    a && b && c && d && e && f
 }
 
 /// SAFE tray-tip write (the [u16;128] panic fix).
@@ -631,67 +661,124 @@ unsafe extern "system" fn wndproc(
 ) -> LRESULT {
     let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState;
 
-    if !state_ptr.is_null() {
-        let state = &mut *state_ptr;
+    // WM_DESTROY handled FIRST: clear the userdata slot so no later
+    // message (WM_NCDESTROY et al.) can touch the state again. The Box
+    // itself is freed by main after the loop exits — tray_nid is still
+    // needed there for Shell_NotifyIconW(NIM_DELETE).
+    if msg == WM_DESTROY {
+        if !state_ptr.is_null() {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        }
+        tracing::info!("window destroyed — quitting");
+        PostQuitMessage(0);
+        return LRESULT(0);
+    }
 
-        if msg == WM_TRAYICON && (lparam.0 & 0xFFFF) as usize == WM_LBUTTONUP_TRAY {
-            TOGGLE_REQUEST.store(true, Ordering::Relaxed);
-        }
+    if state_ptr.is_null() {
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
+    let state = &mut *state_ptr;
 
-        match msg {
-            0x0312 /* WM_HOTKEY */ => {
-                match wparam.0 as i32 {
-                    HOTKEY_TOGGLE => TOGGLE_REQUEST.store(true, Ordering::Relaxed),
-                    HOTKEY_CYCLE => CYCLE_REQUEST.store(true, Ordering::Relaxed),
-                    HOTKEY_PROBE => PROBE_REQUEST.store(true, Ordering::Relaxed),
-                    HOTKEY_MAGPROBE => MAGPROBE_REQUEST.store(true, Ordering::Relaxed),
-                    HOTKEY_QUIT => QUIT_REQUEST.store(true, Ordering::Relaxed),
-                    _ => {}
-                }
-            }
-            WM_DESTROY => {
-                tracing::info!("window destroyed — quitting");
-                PostQuitMessage(0);
-                return LRESULT(0);
-            }
-            _ => {}
-        }
+    if msg == WM_TRAYICON && (lparam.0 & 0xFFFF) as usize == WM_LBUTTONUP_TRAY {
+        TOGGLE_REQUEST.store(true, Ordering::Relaxed);
+    }
 
-        if TOGGLE_REQUEST.swap(false, Ordering::Relaxed) {
-            state.toggle();
-            let tip_text = format!("Invertonator — {}", state.mode_text());
-            update_tray_tip(&mut state.tray_nid, &tip_text);
-        }
-        if CYCLE_REQUEST.swap(false, Ordering::Relaxed) {
-            state.cycle_mode();
-            let tip_text = format!("Invertonator — {}", state.mode_text());
-            update_tray_tip(&mut state.tray_nid, &tip_text);
-        }
-        if PROBE_REQUEST.swap(false, Ordering::Relaxed) {
-            let target = GetForegroundWindow();
-            let (total, media, samples) = uia::probe(target);
-            tracing::info!("uia-probe: total={total} media={media}");
-            for s in &samples {
-                tracing::info!("  media sample: {s}");
+    match msg {
+        0x0312 /* WM_HOTKEY */ => {
+            match wparam.0 as i32 {
+                HOTKEY_TOGGLE => TOGGLE_REQUEST.store(true, Ordering::Relaxed),
+                HOTKEY_CYCLE => CYCLE_REQUEST.store(true, Ordering::Relaxed),
+                HOTKEY_PROBE => PROBE_REQUEST.store(true, Ordering::Relaxed),
+                HOTKEY_MAGPROBE => MAGPROBE_REQUEST.store(true, Ordering::Relaxed),
+                HOTKEY_PIERCE => PIERCE_REQUEST.store(true, Ordering::Relaxed),
+                HOTKEY_QUIT => QUIT_REQUEST.store(true, Ordering::Relaxed),
+                _ => {}
             }
         }
-        if MAGPROBE_REQUEST.swap(false, Ordering::Relaxed) {
-            magprobe::run();
+        windows::Win32::UI::WindowsAndMessaging::WM_TIMER
+            if wparam.0 == 1 =>
+        {
+            state.pump_tick();
         }
-        if QUIT_REQUEST.swap(false, Ordering::Relaxed) {
-            tracing::info!("quit requested");
-            DestroyWindow(hwnd).ok();
+        _ => {}
+    }
+
+    if TOGGLE_REQUEST.swap(false, Ordering::Relaxed) {
+        state.toggle();
+        let tip_text = format!("Invertonator — {}", state.mode_text());
+        update_tray_tip(&mut state.tray_nid, &tip_text);
+    }
+    if CYCLE_REQUEST.swap(false, Ordering::Relaxed) {
+        state.cycle_mode();
+        let tip_text = format!("Invertonator — {}", state.mode_text());
+        update_tray_tip(&mut state.tray_nid, &tip_text);
+    }
+    if PIERCE_REQUEST.swap(false, Ordering::Relaxed) {
+        state.pierce_on = !state.pierce_on;
+        state.holes.set_pierce(state.pierce_on);
+        tracing::info!("pierce {}", if state.pierce_on { "ON" } else { "OFF" });
+        let suffix = if state.pierce_on { " [pierced]" } else { "" };
+        let tip_text = format!("Invertonator — {}{suffix}", state.mode_text());
+        update_tray_tip(&mut state.tray_nid, &tip_text);
+    }
+    if PROBE_REQUEST.swap(false, Ordering::Relaxed) {
+        let target = GetForegroundWindow();
+        let (total, media, samples) = uia::probe(target);
+        tracing::info!("uia-probe: total={total} media={media}");
+        for s in &samples {
+            tracing::info!("  media sample: {s}");
         }
+    }
+    if MAGPROBE_REQUEST.swap(false, Ordering::Relaxed) {
+        magprobe::run();
+    }
+    if QUIT_REQUEST.swap(false, Ordering::Relaxed) {
+        tracing::info!("quit requested");
+        DestroyWindow(hwnd).ok();
     }
 
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
 // =====================================================================
-// main
+// DPI awareness — MUST run before any window / UIA / Magnifier work.
+//
+// Without it the process is DPI-unaware: Windows virtualizes every
+// coordinate we see into the 96-DPI world. UIA rects come back scaled
+// down, the DWM then scales our hole windows back up — holes land in
+// the wrong place with magnified content on any display above 100%.
+// PER_MONITOR_AWARE_V2 gives us physical pixels end to end.
 // =====================================================================
 
+fn set_dpi_awareness() {
+    use windows::Win32::UI::HiDpi::{
+        SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::SetProcessDPIAware;
+    unsafe {
+        // Win10 1703+. If unavailable, fall back; if even that fails,
+        // log loudly — holes WILL misplace on scaled displays.
+        if SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+            .is_err()
+        {
+            if !SetProcessDPIAware().as_bool() {
+                tracing::warn!(
+                    "dpi: awareness unavailable — holes will misplace on scaled displays"
+                );
+            } else {
+                tracing::info!("dpi: system-aware fallback (PMv2 unsupported)");
+            }
+        } else {
+            tracing::info!("dpi: per-monitor-v2 aware");
+        }
+    }
+}
+
 fn main() {
+    // DPI first — before logging, settings, windows, anything that
+    // touches coordinates.
+    set_dpi_awareness();
+
     // Logging: %LOCALAPPDATA%\Invertonator\log.txt
     let log_dir = dirs::data_local_dir()
         .unwrap_or_default()
@@ -703,7 +790,7 @@ fn main() {
         .with_ansi(false)
         .init();
 
-    tracing::info!("=== Invertonator-rs v0.2.0-stepA2 (UIA + Mag window probe) ===");
+    tracing::info!("=== Invertonator-rs v0.2.0-alpha.3 (tracker + scroll-hold) ===");
 
     let settings = Settings::load();
     tracing::info!("settings: dimLevel={}", settings.features.dim_level);
@@ -715,15 +802,17 @@ fn main() {
         }
 
         // Hole pool — creates its 16 windows on THIS thread (main runs
-        // the message loop that pumps them).
-        let holes = Holes::new();
-        let holes_for_state = holes.clone();
+        // the message loop that pumps them), and main also owns the
+        // pump: SetTimer drives HolePool::pump_tick from WM_TIMER below.
+        let (holes, pool) = Holes::new();
 
-        // STANDALONE TEST: one hardcoded true-color hole (Milestone 3
-        // validation — remove when the tracker feeds real rects).
-        holes_for_state.set_specs(vec![HoleSpec {
-            x: 100, y: 100, w: 300, h: 200, dynamic: true,
-        }]);
+        // Media tracker — discovers true-color hole targets on the
+        // foreground window. Enabled by apply_mode (Invert mode only).
+        let tracker = Tracker::spawn(holes.clone());
+
+        // Scroll-hold — wheel activity parks the holes for a short
+        // burst so they never invert stale coords mid-flick.
+        let _scroll_hook = scrollhook::spawn();
 
         let hinstance = HINSTANCE::from(GetModuleHandleW(None).unwrap());
         let class_name = windows::core::w!("InvertonatorClass");
@@ -780,7 +869,10 @@ fn main() {
             dim_level_milli: AtomicUsize::new(
                 (settings.features.dim_level * 1000.0) as usize
             ),
-            holes: holes_for_state,
+            pierce_on: false,
+            holes,
+            pool,
+            tracker,
             hwnd,
             tray_nid: NOTIFYICONDATAW::default(),
         }));
@@ -789,13 +881,15 @@ fn main() {
 
         state.apply_mode();
 
-        let mut nid = NOTIFYICONDATAW::default();
-        nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-        nid.hWnd = hwnd;
-        nid.uID = 1;
-        nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
-        nid.uCallbackMessage = WM_TRAYICON;
-        nid.hIcon = hicon;
+        let mut nid = NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: hwnd,
+            uID: 1,
+            uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
+            uCallbackMessage: WM_TRAYICON,
+            hIcon: hicon,
+            ..Default::default()
+        };
         update_tray_tip(&mut nid, &format!("Invertonator — {}", state.mode_text()));
         let _ = Shell_NotifyIconW(NIM_ADD, &nid);
         state.tray_nid = nid;
@@ -804,6 +898,12 @@ fn main() {
             tracing::warn!("some hotkeys failed");
         }
 
+        // Hole pump — 33Hz tick on main. All Mag*/window calls run on
+        // the thread that created the windows (the F11 rule).
+        let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(
+            Some(&hwnd), 1, holes::PUMP_MS, None,
+        );
+
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&msg);
@@ -811,6 +911,8 @@ fn main() {
         }
 
         let _ = Shell_NotifyIconW(NIM_DELETE, &state.tray_nid);
+        // Free the AppState box (leak fix — it used to live forever).
+        drop(Box::from_raw(state_ptr));
         magnification::uninitialize();
         tracing::info!("clean exit — colors restored");
     }
