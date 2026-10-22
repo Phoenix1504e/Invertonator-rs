@@ -20,7 +20,7 @@
 // native build-dependencies and runs on any desktop with X present.
 
 use std::ffi::CString;
-use std::os::raw::{c_int, c_long, c_uint, c_ushort};
+use std::os::raw::{c_char, c_int, c_long, c_uint, c_ushort};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use x11_dl::xlib::{self, Xlib};
@@ -98,6 +98,77 @@ struct SavedRamp {
     lut: Lut,
 }
 
+// ---------------------------------------------------------------------
+// Gamma I/O helpers — free functions so both the daemon (Session) and
+// the --self-test diagnostic share one code path.
+// ---------------------------------------------------------------------
+
+fn read_gamma(rr: &Xrandr, dpy: *mut xlib::Display, crtc: RRCrtc) -> Option<Lut> {
+    unsafe {
+        let g = (rr.XRRGetCrtcGamma)(dpy, crtc);
+        if g.is_null() {
+            return None;
+        }
+        let size = (*g).size.max(0) as usize;
+        let out = if size >= 2 {
+            Some(Lut {
+                red: std::slice::from_raw_parts((*g).red, size).to_vec(),
+                green: std::slice::from_raw_parts((*g).green, size).to_vec(),
+                blue: std::slice::from_raw_parts((*g).blue, size).to_vec(),
+            })
+        } else {
+            None
+        };
+        (rr.XRRFreeGamma)(g);
+        out
+    }
+}
+
+fn write_gamma(rr: &Xrandr, dpy: *mut xlib::Display, crtc: RRCrtc, lut: &Lut) -> bool {
+    unsafe {
+        let size = lut.red.len();
+        let g = (rr.XRRAllocGamma)(size as c_int);
+        if g.is_null() {
+            tracing::warn!("linux: XRRAllocGamma({size}) failed");
+            return false;
+        }
+        std::slice::from_raw_parts_mut((*g).red, size).copy_from_slice(&lut.red);
+        std::slice::from_raw_parts_mut((*g).green, size).copy_from_slice(&lut.green);
+        std::slice::from_raw_parts_mut((*g).blue, size).copy_from_slice(&lut.blue);
+        (rr.XRRSetCrtcGamma)(dpy, crtc, g);
+        (rr.XRRFreeGamma)(g);
+        true
+    }
+}
+
+/// True when the ramp reads back as a decreasing curve — i.e. the X
+/// server really accepted our inverted ramp. Quantization-tolerant:
+/// some DDuo/DDX paths store the LUT at 8-bit precision, so entries may
+/// wobble by one step without the shape changing.
+fn ramp_is_inverted(l: &Lut) -> bool {
+    let r = &l.red;
+    if r.len() < 8 {
+        return false;
+    }
+    let size = r.len();
+    let tol = 65535usize / (size - 1).max(1) + 300;
+    let monotonic = r.windows(2).all(|w| (w[1] as usize) <= (w[0] as usize) + tol);
+    let span = (r[0] as usize).saturating_sub(r[size - 1] as usize);
+    monotonic && span > 65535 / 2
+}
+
+/// Near-equality with 8-bit-quantization tolerance (restore verify).
+fn luts_near(a: &Lut, b: &Lut) -> bool {
+    fn near(x: &[c_ushort], y: &[c_ushort]) -> bool {
+        if x.len() != y.len() || x.is_empty() {
+            return false;
+        }
+        let tol = (65535usize / (x.len() - 1).max(1)) + 300;
+        x.iter().zip(y).all(|(p, q)| p.abs_diff(*q) as usize <= tol)
+    }
+    near(&a.red, &b.red) && near(&a.green, &b.green) && near(&a.blue, &b.blue)
+}
+
 // =====================================================================
 // Session — owns the display connection; Drop restores all ramps.
 // =====================================================================
@@ -171,19 +242,10 @@ impl Session {
                 if self.saved.iter().any(|s| s.crtc == crtc) {
                     continue;
                 }
-                let g = (self.rr.XRRGetCrtcGamma)(self.dpy, crtc);
-                if g.is_null() {
-                    continue;
-                }
-                let size = (*g).size.max(0) as usize;
-                if size >= 2 {
-                    let red = std::slice::from_raw_parts((*g).red, size).to_vec();
-                    let green = std::slice::from_raw_parts((*g).green, size).to_vec();
-                    let blue = std::slice::from_raw_parts((*g).blue, size).to_vec();
-                    self.saved.push(SavedRamp { crtc, lut: Lut { red, green, blue } });
+                if let Some(lut) = read_gamma(&self.rr, self.dpy, crtc) {
+                    self.saved.push(SavedRamp { crtc, lut });
                     fresh += 1;
                 }
-                (self.rr.XRRFreeGamma)(g);
             }
             (self.rr.XRRFreeScreenResources)(res);
             Ok(fresh)
@@ -191,19 +253,7 @@ impl Session {
     }
 
     fn push_lut(&self, crtc: RRCrtc, lut: &Lut) {
-        unsafe {
-            let size = lut.red.len();
-            let g = (self.rr.XRRAllocGamma)(size as c_int);
-            if g.is_null() {
-                tracing::warn!("linux: XRRAllocGamma({size}) failed");
-                return;
-            }
-            std::slice::from_raw_parts_mut((*g).red, size).copy_from_slice(&lut.red);
-            std::slice::from_raw_parts_mut((*g).green, size).copy_from_slice(&lut.green);
-            std::slice::from_raw_parts_mut((*g).blue, size).copy_from_slice(&lut.blue);
-            (self.rr.XRRSetCrtcGamma)(self.dpy, crtc, g);
-            (self.rr.XRRFreeGamma)(g);
-        }
+        write_gamma(&self.rr, self.dpy, crtc, lut);
     }
 
     fn push_all(&self, make: impl Fn(usize) -> Lut, what: &str) {
@@ -259,15 +309,10 @@ impl Session {
             let mut count = 0usize;
             for i in 0..n {
                 let crtc = *(*res).crtcs.add(i);
-                let g = (self.rr.XRRGetCrtcGamma)(self.dpy, crtc);
-                if g.is_null() {
-                    continue;
-                }
-                let size = (*g).size.max(0) as usize;
-                (self.rr.XRRFreeGamma)(g);
-                if size < 2 {
-                    continue;
-                }
+                let size = match read_gamma(&self.rr, self.dpy, crtc) {
+                    Some(lut) => lut.red.len(),
+                    None => continue,
+                };
                 self.push_lut(crtc, &Lut::identity(size));
                 count += 1;
             }
@@ -326,8 +371,9 @@ impl Session {
 fn print_usage() {
     println!("Invertonator-rs v{VERSION} — linux-x11 backend");
     println!();
-    println!("  invertonator            start inverted (Ctrl+Alt+I toggle, Ctrl+Alt+Q quit)");
-    println!("  invertonator --restore  push identity gamma ramps and exit (recovery)");
+    println!("  invertonator              start inverted (Ctrl+Alt+I toggle, Ctrl+Alt+Q quit)");
+    println!("  invertonator --restore    push identity gamma ramps and exit (recovery)");
+    println!("  invertonator --self-test  hardware diagnostic — prints a paste-back report");
 }
 
 pub fn run() {
@@ -335,6 +381,13 @@ pub fn run() {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         print_usage();
         return;
+    }
+    if args.iter().any(|a| a == "--self-test") {
+        init_logging();
+        tracing::info!("=== Invertonator-rs v{VERSION} self-test requested ===");
+        let code = self_test();
+        tracing::info!("self-test exit code: {code}");
+        std::process::exit(code);
     }
     let restore_only = args.iter().any(|a| a == "--restore");
 
@@ -412,6 +465,248 @@ fn x11_run(restore_only: bool) -> Result<(), String> {
     }
 
     Ok(()) // Drop(Session) restores the saved ramps
+}
+
+// =====================================================================
+// --self-test — one-shot hardware/driver diagnostic.
+//
+// Purpose: the maintainer develops on Windows; Linux confirmation has
+// to come from real machines. This prints EVERYTHING a remote tester
+// needs to send back in one paste: session type, X server identity,
+// outputs and their gamma hardware, a live invert/restore round-trip
+// (catches drivers that silently ignore SetCrtcGamma), and hotkey
+// availability. Exit code: 0 pass, 1 fail, 2 environment unavailable.
+// =====================================================================
+
+fn self_test() -> i32 {
+    println!("=== Invertonator-rs v{VERSION} — Linux self-test report ===");
+    println!();
+    println!("[environment]");
+    for key in ["DISPLAY", "WAYLAND_DISPLAY", "XDG_SESSION_TYPE", "XDG_CURRENT_DESKTOP", "DESKTOP_SESSION"] {
+        let val = std::env::var(key).unwrap_or_else(|_| "<unset>".into());
+        println!("  {key:19} = {val}");
+    }
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    println!("  (unix time {secs})");
+
+    println!();
+    println!("[libraries]");
+    let xlib = match Xlib::open() {
+        Ok(x) => {
+            println!("  libX11              : loaded");
+            x
+        }
+        Err(e) => {
+            println!("  libX11              : FAILED ({e})");
+            println!();
+            println!("[verdict]");
+            println!("  FAIL — X11 client libraries missing (install libx11-6 / libx11-dev).");
+            return 2;
+        }
+    };
+    let rr = match Xrandr::open() {
+        Ok(x) => {
+            println!("  libXrandr           : loaded");
+            x
+        }
+        Err(e) => {
+            println!("  libXrandr           : FAILED ({e})");
+            println!();
+            println!("[verdict]");
+            println!("  FAIL — libXrandr missing (install libxrandr2 / libxrandr-dev).");
+            return 2;
+        }
+    };
+
+    let mut tested = 0usize;
+    let mut inverted_ok = 0usize;
+    let mut restore_ok = 0usize;
+    let mut rejected = 0usize;
+
+    unsafe {
+        (xlib.XSetErrorHandler)(Some(x_err_handler));
+        let dpy = (xlib.XOpenDisplay)(std::ptr::null());
+        if dpy.is_null() {
+            println!();
+            println!("[X server]");
+            println!("  connection          : FAILED — $DISPLAY unset or no X server reachable");
+            println!();
+            println!("[verdict]");
+            println!("  ENV UNAVAILABLE — no X11 display. On a Wayland-only session (GNOME\n  default on modern distros) log out and pick the '… on Xorg' session type.");
+            return 2;
+        }
+        let scr = (xlib.XScreenCount)(dpy);
+        let root = (xlib.XDefaultRootWindow)(dpy);
+        let vendor = std::ffi::CStr::from_ptr((xlib.XServerVendor)(dpy) as *const c_char)
+            .to_string_lossy()
+            .into_owned();
+        println!();
+        println!("[X server]");
+        println!("  connection          : opened (screen 0 of {scr})");
+        println!("  server vendor       : {vendor}");
+        println!(
+            "  protocol version    : {}.{}",
+            (xlib.XProtocolVersion)(dpy),
+            (xlib.XProtocolRevision)(dpy)
+        );
+        let (mut rr_maj, mut rr_min) = (0 as c_int, 0 as c_int);
+        if (rr.XRRQueryVersion)(dpy, &mut rr_maj, &mut rr_min) == 0 {
+            println!("  XRandR version      : NOT AVAILABLE");
+            (xlib.XCloseDisplay)(dpy);
+            println!();
+            println!("[verdict]");
+            println!("  FAIL — XRandR extension missing; gamma control is impossible.");
+            return 2;
+        }
+        println!("  XRandR version      : {rr_maj}.{rr_min}");
+
+        // ---- outputs & gamma hardware ----
+        let res = (rr.XRRGetScreenResourcesCurrent)(dpy, root);
+        if res.is_null() {
+            (xlib.XCloseDisplay)(dpy);
+            println!();
+            println!("[verdict]");
+            println!("  FAIL — XRRGetScreenResourcesCurrent returned null.");
+            return 2;
+        }
+        let ncrtc = (*res).ncrtc.max(0) as usize;
+        println!();
+        println!("[outputs / gamma hardware]");
+        for i in 0..ncrtc {
+            let crtc = *(*res).crtcs.add(i);
+            let info = (rr.XRRGetCrtcInfo)(dpy, res, crtc);
+            if info.is_null() {
+                println!("  CRTC #{i}             : <unavailable>");
+                continue;
+            }
+            let nout = (*info).noutput.max(0) as usize;
+            let mut names: Vec<String> = Vec::new();
+            for o in 0..nout {
+                let out = *(*info).outputs.add(o);
+                let oi = (rr.XRRGetOutputInfo)(dpy, res, out);
+                if !oi.is_null() {
+                    names.push(
+                        std::ffi::CStr::from_ptr((*oi).name as *const c_char)
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                    (rr.XRRFreeOutputInfo)(oi);
+                }
+            }
+            (rr.XRRFreeCrtcInfo)(info);
+            let active = nout > 0;
+            let gsize = (rr.XRRGetCrtcGammaSize)(dpy, crtc).max(0) as usize;
+            let state = if active { "ACTIVE" } else { "idle  " };
+            let outs = if names.is_empty() { "-".to_string() } else { names.join("+") };
+            if !active || gsize < 2 {
+                println!("  CRTC #{i} ({state}) outputs={outs} gamma_size={gsize} — skipped");
+                continue;
+            }
+            let original = match read_gamma(&rr, dpy, crtc) {
+                Some(lut) => lut,
+                None => {
+                    println!("  CRTC #{i} ({state}) outputs={outs} gamma_size={gsize} — gamma unreadable, skipped");
+                    continue;
+                }
+            };
+
+            // Round-trip: push an inverted ramp, read it back, restore.
+            X_ERRORS.store(false, Ordering::Relaxed);
+            write_gamma(&rr, dpy, crtc, &Lut::inverted(gsize));
+            (xlib.XSync)(dpy, xlib::False);
+            let wrote = !X_ERRORS.load(Ordering::Relaxed);
+            let set_ok = wrote
+                && read_gamma(&rr, dpy, crtc)
+                    .map(|l| ramp_is_inverted(&l))
+                    .unwrap_or(false);
+
+            X_ERRORS.store(false, Ordering::Relaxed);
+            write_gamma(&rr, dpy, crtc, &original);
+            (xlib.XSync)(dpy, xlib::False);
+            let restored = !X_ERRORS.load(Ordering::Relaxed)
+                && read_gamma(&rr, dpy, crtc)
+                    .map(|l| luts_near(&l, &original))
+                    .unwrap_or(false);
+
+            let rt = if !wrote {
+                "REJECTED"
+            } else if !set_ok {
+                "RAMP-UNCHANGED"
+            } else if !restored {
+                "RESTORE-IMPRECISE"
+            } else {
+                "PASS"
+            };
+            println!("  CRTC #{i} ({state}) outputs={outs} gamma_size={gsize} round-trip={rt}");
+            tested += 1;
+            if set_ok { inverted_ok += 1; }
+            if restored { restore_ok += 1; }
+            if !wrote { rejected += 1; }
+        }
+        (rr.XRRFreeScreenResources)(res);
+
+        // ---- hotkey availability (grab + immediately ungrab) ----
+        println!();
+        println!("[hotkeys]");
+        let sym_t = (xlib.XStringToKeysym)(CString::new("i").unwrap().as_ptr());
+        let sym_q = (xlib.XStringToKeysym)(CString::new("q").unwrap().as_ptr());
+        let kc_t = (xlib.XKeysymToKeycode)(dpy, sym_t) as c_uint;
+        let kc_q = (xlib.XKeysymToKeycode)(dpy, sym_q) as c_uint;
+        if kc_t == 0 || kc_q == 0 {
+            println!("  keyboard mapping    : no plain 'i'/'q' keycode — hotkeys unavailable on this layout");
+        } else {
+            GRAB_CONFLICT.store(false, Ordering::Relaxed);
+            let base = (xlib::Mod1Mask | xlib::ControlMask) as c_uint;
+            let extras = [
+                0,
+                xlib::LockMask as c_uint,
+                xlib::Mod2Mask as c_uint,
+                (xlib::LockMask | xlib::Mod2Mask) as c_uint,
+            ];
+            for extra in extras {
+                (xlib.XGrabKey)(dpy, kc_t as c_int, base | extra, root, xlib::False,
+                                xlib::GrabModeAsync, xlib::GrabModeAsync);
+                (xlib.XGrabKey)(dpy, kc_q as c_int, base | extra, root, xlib::False,
+                                xlib::GrabModeAsync, xlib::GrabModeAsync);
+            }
+            (xlib.XSync)(dpy, xlib::False);
+            let conflict = GRAB_CONFLICT.load(Ordering::Relaxed);
+            for extra in extras {
+                (xlib.XUngrabKey)(dpy, kc_t as c_int, base | extra, root);
+                (xlib.XUngrabKey)(dpy, kc_q as c_int, base | extra, root);
+            }
+            (xlib.XSync)(dpy, xlib::False);
+            if conflict {
+                println!("  Ctrl+Alt+I / Q      : CONFLICT — another app owns these keys (app still\n  runs; close that tool or it will win the keys)");
+            } else {
+                println!("  Ctrl+Alt+I / Q      : OK — keys are free and grabbable (test grabs removed)");
+            }
+        }
+
+        (xlib.XCloseDisplay)(dpy);
+    }
+
+    println!();
+    println!("[verdict]");
+    let (line, code) = if tested == 0 {
+        ("FAIL — no output exposes a usable gamma LUT. If XDG_SESSION_TYPE above\n  says 'wayland', Invertonator needs an Xorg/X11 session for now.", 1)
+    } else if rejected == tested {
+        ("FAIL — the X server rejected every gamma write (driver/compositor\n  blocks CRTC gamma changes).", 1)
+    } else if inverted_ok == 0 {
+        ("FAIL — gamma writes were accepted but the ramp never changed\n  (typical for XWayland nested in a Wayland session). Run on a real\n  X11 session.", 1)
+    } else if restore_ok < inverted_ok {
+        ("PARTIAL PASS — inversion works; restore verification was imprecise\n  (usually 8-bit LUT quantization, visually harmless). App should work.", 0)
+    } else {
+        ("PASS — this machine supports XRandR gamma inversion. The full app\n  should work here.", 0)
+    };
+    println!("  {line}");
+    tracing::info!("self-test verdict: {line}");
+    println!();
+    println!(">>> Please copy this ENTIRE report (everything the command printed) and send it back. <<<");
+    code
 }
 
 // =====================================================================

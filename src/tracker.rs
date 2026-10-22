@@ -52,6 +52,11 @@ const MIN_LINK: i32 = 96;    // hyperlink min w and h (px)
 const MAX_NODES: u32 = 100_000;
 const MAX_DEPTH: u32 = 25;
 
+/// One-shot flag: the Gecko live-fallback notice is logged exactly once
+/// per process (discovery ticks every 400ms — per-tick logs would spam
+/// log.txt at 150 lines/minute).
+static FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
+
 // =====================================================================
 // Public API
 // =====================================================================
@@ -187,9 +192,21 @@ unsafe fn discover(automation: &IUIAutomation, fg: HWND) -> Vec<HoleSpec> {
         if let Ok(cached_root) = root.BuildUpdatedCache(&cache) {
             let mut ctx = WalkCtx { total: 0, docs: 0, candidates: Vec::new() };
             walk_cached(&cached_root, false, 0, &mut ctx);
-            return ctx_to_specs(ctx);
+            // GECKO GUARD: Gecko/LibreWolf succeed at BuildUpdatedCache
+            // but never fill CachedChildren — the walk sees only the
+            // root element. Don't hand back an empty hole set then;
+            // drop to the live walk, which works on every provider.
+            if ctx.total > 1 {
+                return ctx_to_specs(ctx);
+            }
+            if !FALLBACK_LOGGED.swap(true, Ordering::Relaxed) {
+                tracing::info!(
+                    "tracker: cached walk saw only {} node(s) — CachedChildren empty (Gecko) — permanent live fallback engaged",
+                    ctx.total
+                );
+            }
         }
-        // Cache failed → fall through to the live walk.
+        // Cache failed OR cached walk came back empty → live walk.
     }
 
     // FALLBACK: flat live FindAll (no document scoping possible cheaply

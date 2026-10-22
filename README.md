@@ -4,10 +4,11 @@
 
 ![Invertonator](icon.svg)
 
-> **Status: v0.3.0-alpha.1** — Windows: UIA media tracker + Magnifier-API
+> **Status: v0.3.0-alpha.3** — Windows: UIA media tracker + Magnifier-API
 > true-color holes proven on hardware (1,152-node cache-request walks ·
 > 164 media elements classified · MagSetColorEffect/Source/Transform all
-> verified). Linux (X11): global gamma-ramp inversion shipped — the
+> verified). Gecko browsers (Firefox/LibreWolf) supported via automatic
+> live-walk fallback when a provider leaves CachedChildren empty. Linux (X11): global gamma-ramp inversion shipped — the
 > XComposite true-color-hole overlay is the next milestone. For the
 > **fully-featured C# edition**, see
 > [Invertonator](https://github.com/Phoenix1504e/Invertonator).
@@ -23,6 +24,11 @@
 
 If a Linux run is killed while inverted, the ramp persists until you run
 `invertonator --restore` (pushes identity ramps and exits).
+
+No Linux box of your own? Run `invertonator --self-test` on any Linux
+machine — it prints a paste-back diagnostic report (session type, gamma
+hardware, live invert/restore round-trip, hotkey availability). Full
+tester runbook: [docs/LINUX-TESTING.md](docs/LINUX-TESTING.md).
 
 ## The problem
 
