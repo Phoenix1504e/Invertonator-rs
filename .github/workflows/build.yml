@@ -1,4 +1,4 @@
-name: Windows build
+name: Build
 
 on:
   push:
@@ -8,14 +8,26 @@ on:
 
 jobs:
   build:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            exe: invertonator.exe
+            artifact: Invertonator-rs-windows-x64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            exe: invertonator
+            artifact: Invertonator-rs-linux-x64
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-pc-windows-msvc
+          targets: ${{ matrix.target }}
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -26,16 +38,16 @@ jobs:
       - name: Build release
         run: cargo build --release --locked
 
-      - name: Upload exe
+      - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
-          name: Invertonator-rs-${{ github.sha }}
-          path: target/release/invertonator.exe
+          name: ${{ matrix.artifact }}-${{ github.sha }}
+          path: target/release/${{ matrix.exe }}
           if-no-files-found: error
 
-      - name: Upload exe (latest alias)
+      - name: Upload binary (latest alias)
         uses: actions/upload-artifact@v4
         with:
-          name: Invertonator-rs-latest
-          path: target/release/invertonator.exe
+          name: ${{ matrix.artifact }}-latest
+          path: target/release/${{ matrix.exe }}
           if-no-files-found: error

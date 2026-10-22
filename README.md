@@ -1,16 +1,28 @@
 # Invertonator-rs
 
-**System-wide dark mode for Windows that websites cannot see — now in Rust.**
+**System-wide dark mode that websites cannot see — Rust edition for Windows & Linux (X11).**
 
 ![Invertonator](icon.svg)
 
-> **Status: v0.2.0-alpha.2** — the UIA detection layer **and** the
-> window-level Magnification APIs are proven from Rust (1,152-node
-> cache-request walks · 164 media elements classified ·
-> MagSetColorEffect/Source/Transform all verified on hardware).
-> True-color media holes land in the next release. For the
+> **Status: v0.3.0-alpha.1** — Windows: UIA media tracker + Magnifier-API
+> true-color holes proven on hardware (1,152-node cache-request walks ·
+> 164 media elements classified · MagSetColorEffect/Source/Transform all
+> verified). Linux (X11): global gamma-ramp inversion shipped — the
+> XComposite true-color-hole overlay is the next milestone. For the
 > **fully-featured C# edition**, see
 > [Invertonator](https://github.com/Phoenix1504e/Invertonator).
+
+## Platform support
+
+| Platform | Inversion | True-color media holes | Hotkeys |
+|---|---|---|---|
+| Windows 10+ | Magnifier API (compositor) | ✅ UIA tracker | `Ctrl+Alt+F5` invert · `F6` mode · `F7` pierce · `F2` quit |
+| Linux (X11) | XRandR CRTC gamma | 🚧 v2 (XComposite overlay) — media inverts too for now | `Ctrl+Alt+I` toggle · `Ctrl+Alt+Q` quit |
+| Linux (Wayland) | needs compositor backends (KWin effect / GNOME ext) | ❌ | — |
+| macOS | ❌ unsupported | ❌ | — |
+
+If a Linux run is killed while inverted, the ramp persists until you run
+`invertonator --restore` (pushes identity ramps and exits).
 
 ## The problem
 
