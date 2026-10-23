@@ -4,7 +4,7 @@
 
 ![Invertonator](icon.svg)
 
-> **Status: v0.3.0-alpha.7** — Windows: UIA media tracker + Magnifier-API
+> **Status: v0.3.0-alpha.8** — Windows: UIA media tracker + Magnifier-API
 > true-color holes proven on hardware (1,152-node cache-request walks ·
 > 164 media elements classified · MagSetColorEffect/Source/Transform all
 > verified). Gecko browsers (Firefox/LibreWolf) supported via automatic
@@ -17,12 +17,20 @@
 > priority (a watch page gets exactly the player), dominance filter
 > kills avatar/icon swarms, GetPixel flatness probe drops uniform
 > rects, tightened overlap merge, DPI status + Mag failure logging.
-> alpha.7 video smoothness: MagSetWindowSource is no longer re-called
-> 33×/s on video holes (the Magnifier control updates live; re-source
-> only on move/show/failure + 3s watchdog), the UIA walk backs off
-> 400ms→1.6s while the hole set is stable, and the Gecko live fallback
-> builds its property cache in ONE cross-process pass instead of
-> ~30k per-second COM reads into the browser.
+> alpha.7 video smoothness: the UIA walk backs off 400ms→1.6s while the
+> hole set is stable, and the Gecko live fallback builds its property
+> cache in ONE cross-process pass instead of ~30k per-second COM reads
+> into the browser.
+> alpha.8 hole freshness + media recognition: the Magnifier control does
+> NOT live-track the screen — MagSetWindowSource IS the refresh
+> mechanism, so video holes re-source every pump tick (33Hz, the OS
+> sample's poll pattern) and static holes at ~1.7Hz, ending the
+> "video in the hole is very laggy" slideshow. The alpha.6 hard video
+> priority (any <video> → images get nothing) is replaced by per-kind
+> dominance: a YouTube watch page keeps the player AND its sidebar
+> thumbnails; a unified 80×80 gate (videos included) kills 1×1 ad
+> <video> anchors and avatar squares; hole cap raised 4→8; the tracker
+> summary now logs v/i/l candidate breakdowns.
 > Linux (X11): global gamma-ramp inversion shipped — the
 > XComposite true-color-hole overlay is the next milestone. For the
 > **fully-featured C# edition**, see

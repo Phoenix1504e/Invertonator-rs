@@ -25,15 +25,22 @@
 //   · "video" and "graphic" have no standard numeric type — Chromium
 //     reports them via LocalizedControlType, matched ASCII-case-
 //     insensitively.
-//   · Size gates: image/graphic ≥ 64×64 px (kills favicons, inline
-//     icons), hyperlink ≥ 96×96 px (thumbnail-sized links like the
-//     YouTube grid; text links stay inverted), video any size.
-//   · VIDEO PRIORITY: when the walk saw real <video> elements, they
-//     ARE what the user is watching — page thumbnails/icons around a
-//     player must not become holes. Watch page → exactly the player.
-//   · DOMINANCE: without videos, keep only candidates within 20% of
-//     the largest survivor's area. Kills the avatar/icon swarms (the
-//     "small squares scattered on UI elements" report).
+//   · Size gate (alpha.8, UNIFIED): every kind needs ≥ 80×80 px —
+//     kills favicons, inline icons, avatar squares AND the 1×1
+//     ad-tracking <video> elements (videos previously passed at ANY
+//     size, so a hidden ad clip could anchor a square hole); wide
+//     text links (short bounding boxes) stay inverted.
+//   · PER-KIND DOMINANCE (alpha.8): within each kind (video / image /
+//     link), keep only candidates within 20% of the largest candidate
+//     OF THAT KIND. The hard alpha.6 "video priority" — any <video>
+//     on the page meant images/links got NOTHING — is what the
+//     YouTube field report called "other media are not recognised":
+//     the watch page's player kept its hole while every sidebar
+//     thumbnail was dropped. Per-kind keeps the player AND its
+//     thumbnails, and still kills the avatar/icon swarms (they sit
+//     below the 80px gate or far below their kind's largest).
+//   · Videos sort FIRST before the hole cap, so a capped page keeps
+//     its player before its thumbnails.
 //   · FLATNESS PROBE: image candidates whose on-screen pixels are
 //     uniform (solid spacer / bogus rect parked on flat page area)
 //     get no hole — 5×5 GetPixel grid, inverted-desktop-safe.
@@ -83,13 +90,12 @@ const WHEEL_FAST_MS: u64 = 1_500;
 /// Backoff sleep granularity: the nap wakes early on foreground
 /// switches / wheel activity, so snappiness survives the backoff.
 const NAP_SLICE_MS: u64 = 100;
-const MIN_MEDIA: i32 = 64;   // image/graphic min w and h (px)
-const MIN_LINK: i32 = 96;    // hyperlink min w and h (px)
+const MIN_MEDIA: i32 = 80;   // unified min w and h for EVERY kind (px)
 const MAX_NODES: u32 = 100_000;
 const MAX_DEPTH: u32 = 25;
 const POKE_TOLERANCE: i32 = 8;   // pt beyond the window edge → bogus rect
 const KEEP_MIN_PCT: i64 = 20;    // dominance: ≥ 20% of largest survivor's area
-const MAX_KEEP: usize = 4;       // holes actually kept per tick (pool is 16)
+const MAX_KEEP: usize = 8;       // holes actually kept per tick (pool is 16)
 const SUMMARY_EVERY_MS: u64 = 2_000;  // state-change summary throttle
 const HEARTBEAT_MS: u64 = 10_000;     // unconditional liveness line
 
@@ -201,8 +207,8 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
             last_title = title.clone();
 
             let t0 = std::time::Instant::now();
-            let (specs, nodes, cands, docs_n) = if fg.is_invalid() {
-                (Vec::new(), 0, 0, 0)
+            let (specs, nodes, cands, docs_n, kinds) = if fg.is_invalid() {
+                (Vec::new(), 0, 0, 0, [0u32; 3])
             } else {
                 unsafe { discover(&automation, fg) }
             };
@@ -247,10 +253,13 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
                     })
                     .collect();
                 tracing::info!(
-                    "tracker: fg=\"{}\" nodes={} cands={} docs={} holes={} iv={}ms walk={}ms [{}]",
+                    "tracker: fg=\"{}\" nodes={} cands={} v={} i={} l={} docs={} holes={} iv={}ms walk={}ms [{}]",
                     title,
                     nodes,
                     cands,
+                    kinds[2],
+                    kinds[0],
+                    kinds[1],
                     docs_n,
                     specs.len(),
                     interval,
@@ -326,13 +335,24 @@ enum MediaKind {
     Video,
 }
 
+impl MediaKind {
+    /// Index into the per-kind dominance table / kind-count log.
+    fn slot(self) -> usize {
+        match self {
+            MediaKind::Image => 0,
+            MediaKind::Link => 1,
+            MediaKind::Video => 2,
+        }
+    }
+}
+
 struct Candidate {
     x: i32,
     y: i32,
     w: i32,
     h: i32,
     /// Size gate this candidate must keep passing after on-screen
-    /// clamping (MIN_MEDIA / MIN_LINK / 1 for video).
+    /// clamping (MIN_MEDIA for every kind).
     min: i32,
     kind: MediaKind,
 }
@@ -378,9 +398,12 @@ struct WalkCtx {
 
 /// Walk the foreground window and return the desired hole set plus
 /// walk counters for the summary log (specs, nodes, candidates, docs).
-unsafe fn discover(automation: &IUIAutomation, fg: HWND) -> (Vec<HoleSpec>, u32, u32, u32) {
+unsafe fn discover(
+    automation: &IUIAutomation,
+    fg: HWND,
+) -> (Vec<HoleSpec>, u32, u32, u32, [u32; 3]) {
     let Ok(root) = automation.ElementFromHandle(fg) else {
-        return (Vec::new(), 0, 0, 0);
+        return (Vec::new(), 0, 0, 0, [0; 3]);
     };
     // Hole rects are clamped to the foreground window ∩ virtual screen
     // (see clip_rect). Computed once per discovery tick.
@@ -423,8 +446,8 @@ unsafe fn discover(automation: &IUIAutomation, fg: HWND) -> (Vec<HoleSpec>, u32,
                 let nodes = ctx.total;
                 let cands = ctx.candidates.len() as u32;
                 let docs_n = ctx.docs;
-                let specs = ctx_to_specs(ctx, clip);
-                return (specs, nodes, cands, docs_n);
+                let (specs, kinds) = ctx_to_specs(ctx, clip);
+                return (specs, nodes, cands, docs_n, kinds);
             }
             if !FALLBACK_LOGGED.swap(true, Ordering::Relaxed) {
                 tracing::info!(
@@ -442,7 +465,7 @@ unsafe fn discover(automation: &IUIAutomation, fg: HWND) -> (Vec<HoleSpec>, u32,
     // clamp_candidate), and the size gates still apply.
     tracing::debug!("tracker: cached walk unavailable — live fallback");
     let Ok(true_cond) = automation.CreateTrueCondition() else {
-        return (Vec::new(), 0, 0, 0);
+        return (Vec::new(), 0, 0, 0, [0; 3]);
     };
     // Bulk cache build first; plain FindAll only if that fails
     // (classify_live then falls back to per-node Current* reads).
@@ -453,17 +476,17 @@ unsafe fn discover(automation: &IUIAutomation, fg: HWND) -> (Vec<HoleSpec>, u32,
                 tracing::debug!("tracker: FindAllBuildCache failed ({e}) — plain FindAll");
                 match root.FindAll(TreeScope_Descendants, &true_cond) {
                     Ok(a) => a,
-                    Err(_) => return (Vec::new(), 0, 0, 0),
+                    Err(_) => return (Vec::new(), 0, 0, 0, [0; 3]),
                 }
             }
         }
     } else {
         match root.FindAll(TreeScope_Descendants, &true_cond) {
             Ok(a) => a,
-            Err(_) => return (Vec::new(), 0, 0, 0),
+            Err(_) => return (Vec::new(), 0, 0, 0, [0; 3]),
         }
     };
-    let Ok(len) = all.Length() else { return (Vec::new(), 0, 0, 0) };
+    let Ok(len) = all.Length() else { return (Vec::new(), 0, 0, 0, [0; 3]) };
     let mut ctx = WalkCtx {
         total: 0,
         docs: 0,
@@ -481,7 +504,8 @@ unsafe fn discover(automation: &IUIAutomation, fg: HWND) -> (Vec<HoleSpec>, u32,
     let nodes = ctx.total;
     let cands = ctx.candidates.len() as u32;
     let docs_n = ctx.docs_rects.len() as u32;
-    (ctx_to_specs(ctx, clip), nodes, cands, docs_n)
+    let (specs, kinds) = ctx_to_specs(ctx, clip);
+    (specs, nodes, cands, docs_n, kinds)
 }
 
 /// Visible-area clip for hole rects. `win` = foreground window rect,
@@ -630,20 +654,14 @@ fn classify(ct: UIA_CONTROLTYPE_ID, lct: &str) -> Option<MediaKind> {
     None
 }
 
-/// Size gates + zero-rect rejection. Physical pixels.
+/// Size gate + zero-rect rejection. Physical pixels. One gate for all
+/// kinds (alpha.8): videos joined the 80px rule so hidden ad <video>
+/// elements can never anchor a hole.
 fn offer_candidate(kind: Option<MediaKind>, rect: &RECT, ctx: &mut WalkCtx) {
     let Some(kind) = kind else { return };
     let w = rect.right - rect.left;
     let h = rect.bottom - rect.top;
-    if w <= 0 || h <= 0 {
-        return;
-    }
-    let (passes, min) = match kind {
-        MediaKind::Image => (w >= MIN_MEDIA && h >= MIN_MEDIA, MIN_MEDIA),
-        MediaKind::Link => (w >= MIN_LINK && h >= MIN_LINK, MIN_LINK),
-        MediaKind::Video => (true, 1),
-    };
-    if !passes {
+    if w < MIN_MEDIA || h < MIN_MEDIA {
         return;
     }
     ctx.candidates.push(Candidate {
@@ -651,18 +669,19 @@ fn offer_candidate(kind: Option<MediaKind>, rect: &RECT, ctx: &mut WalkCtx) {
         y: rect.top,
         w,
         h,
-        min,
+        min: MIN_MEDIA,
         kind,
     });
 }
 
 // =====================================================================
-// Candidates → HoleSpecs (priority + dominance + merge + cap)
+// Candidates → HoleSpecs (per-kind dominance + flatness + merge + cap)
 // =====================================================================
 
-fn ctx_to_specs(ctx: WalkCtx, clip: Option<Clip>) -> Vec<HoleSpec> {
+fn ctx_to_specs(ctx: WalkCtx, clip: Option<Clip>) -> (Vec<HoleSpec>, [u32; 3]) {
     // Filter (bogus-rect + document-pane scoping) → clamp (final hole
-    // geometry) → video priority → dominance → flatness → merge → cap.
+    // geometry) → per-kind dominance → flatness → videos-first sort →
+    // merge → cap.
     let WalkCtx { candidates, docs_rects, .. } = ctx;
     let mut cands: Vec<Candidate> = match clip {
         Some(clip) => candidates
@@ -671,23 +690,29 @@ fn ctx_to_specs(ctx: WalkCtx, clip: Option<Clip>) -> Vec<HoleSpec> {
             .collect(),
         None => candidates,
     };
+    // Kind counts of the pool that entered selection — the summary
+    // log's v=/i=/l= (a zero here means the walk never SAW the media;
+    // a nonzero with holes=0 means selection dropped it).
+    let mut kinds = [0u32; 3];
+    for c in &cands {
+        kinds[c.kind.slot()] += 1;
+    }
     if cands.is_empty() {
-        return Vec::new();
+        return (Vec::new(), kinds);
     }
 
-    // VIDEO PRIORITY — a real <video> element dwarfs intent-wise
-    // everything else on the page. If any exist, ONLY they become
-    // holes: a watch page gets exactly the player, never a constellation
-    // of thumbnails around it.
-    if cands.iter().any(|c| c.is_video()) {
-        cands.retain(|c| c.is_video());
+    // PER-KIND DOMINANCE — keep, per kind, candidates within
+    // KEEP_MIN_PCT% of the largest candidate OF THAT KIND. The player
+    // and the sidebar thumbnails coexist (different kinds), while
+    // avatar/icon swarms still die (tiny next to their kind's largest).
+    let mut max_kind = [0i64; 3];
+    for c in &cands {
+        let a = c.area();
+        if a > max_kind[c.kind.slot()] {
+            max_kind[c.kind.slot()] = a;
+        }
     }
-
-    // DOMINANCE — keep only candidates within KEEP_MIN_PCT% of the
-    // largest survivor's area. Avatars/icons next to a big preview sit
-    // at 1–6% and die here; a uniform media grid keeps its peers.
-    let max_area = cands.iter().map(|c| c.area()).max().unwrap_or(0);
-    cands.retain(|c| c.area() * 100 >= max_area * KEEP_MIN_PCT);
+    cands.retain(|c| c.area() * 100 >= max_kind[c.kind.slot()] * KEEP_MIN_PCT);
 
     // FLATNESS — image candidates only: a rect whose on-screen pixels
     // are uniform (solid spacer, bogus scroll-offset rect parked on
@@ -698,11 +723,14 @@ fn ctx_to_specs(ctx: WalkCtx, clip: Option<Clip>) -> Vec<HoleSpec> {
         c.is_video() || unsafe { !screen_rect_is_flat(c.x, c.y, c.w, c.h) }
     });
     if cands.is_empty() {
-        return Vec::new();
+        return (Vec::new(), kinds);
     }
 
-    // Largest first.
-    cands.sort_by_key(|c| std::cmp::Reverse(c.area()));
+    // Videos first, then largest first — a capped page keeps its
+    // player before its thumbnails.
+    cands.sort_by_key(|c| {
+        (std::cmp::Reverse(c.is_video()), std::cmp::Reverse(c.area()))
+    });
 
     // Overlap merge (TIGHTENED) — an <img> inside an <a> is ONE
     // thumbnail (intersection ≥ 40% of the smaller), but rects that
@@ -733,7 +761,8 @@ fn ctx_to_specs(ctx: WalkCtx, clip: Option<Clip>) -> Vec<HoleSpec> {
         }
     }
 
-    kept.into_iter()
+    let specs = kept
+        .into_iter()
         .map(|k| HoleSpec {
             x: k.x,
             y: k.y,
@@ -742,7 +771,8 @@ fn ctx_to_specs(ctx: WalkCtx, clip: Option<Clip>) -> Vec<HoleSpec> {
             dynamic: k.is_video(),
             kind: k.kind_id(),
         })
-        .collect()
+        .collect();
+    (specs, kinds)
 }
 
 /// True when the on-screen pixels under the rect look uniform (solid

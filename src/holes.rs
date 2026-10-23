@@ -38,17 +38,20 @@
 //     Fix: show via SetWindowPos(HWND_TOPMOST, SWP_SHOWWINDOW |
 //     SWP_NOACTIVATE). Click-through is unaffected (WS_EX_TRANSPARENT
 //     + WM_NCHITTEST→HTTRANSPARENT still pass input through).
-//   · v0.3.0-alpha.7 — THE SOURCE-SET IS NOT A HEARTBEAT. Once
-//     MagSetWindowSource succeeds, the Magnifier control updates its
-//     content LIVE on its own (that is the whole point of the API —
-//     the OS magnifier works exactly this way). alpha.4–6 re-called
-//     it every 30ms tick on dynamic holes to "keep them fresh": every
-//     call tears down and rebuilds the capture pipeline, and with a
-//     hole parked on a video that is 33 capture resets per second —
-//     the "video is very laggy" field report. Re-source only when
-//     something actually requires it: rect moved, hole (re)shown,
-//     previous call failed, or the 3s watchdog (content-freeze
-//     insurance + topmost re-assert).
+//   · v0.3.0-alpha.8 — THE MAGNIFIER CONTROL DOES NOT LIVE-TRACK THE
+//     SCREEN. alpha.7 assumed that after MagSetWindowSource succeeds
+//     the control keeps updating itself; the field report ("the video
+//     in the hole is very laggy" — a playing video's rect never moves,
+//     so its hole content only advanced on the ~3s watchdog, a 0.33Hz
+//     slideshow) disproves it. The OS Magnifier sample itself re-calls
+//     MagSetWindowSource on EVERY timer tick — that call IS the
+//     API's refresh mechanism, not churn. The alpha.4–6 "video is very
+//     laggy" driver was the tracker's UIA COM storm (fixed in alpha.7:
+//     adaptive cadence + bulk cache), not the re-source cadence. So:
+//     dynamic (video) holes re-source EVERY pump tick (33Hz, the OS
+//     sample's poll pattern), static holes every ~1.7Hz (alpha.6's
+//     proven thumbnail-freshness cadence), plus re-source on move /
+//     show / failure. The topmost re-assert rides the static cadence.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -117,14 +120,12 @@ const LWA_ALPHA_FLAG: LAYERED_WINDOW_ATTRIBUTES_FLAGS =
     LAYERED_WINDOW_ATTRIBUTES_FLAGS(2);
 const SW_HIDE_CMD: SHOW_WINDOW_CMD = SHOW_WINDOW_CMD(0);
 pub const PUMP_MS: u32 = 30;      // pump cadence (SetTimer, ms)
-/// Watchdog cadence in pump ticks (~3.0s at 30ms/tick): one re-source
-/// and one topmost re-assert per visible hole — insurance against the
-/// content-freeze failure class, NOT the refresh mechanism.
-const WATCHDOG_EVERY: u64 = 100;
-/// Retry cadence for a FAILED MagSetWindowSource (~300ms). Failures
-/// must be retried promptly (stale content at the hole position) but
-/// never at the full pump rate.
-const RETRY_EVERY: u64 = 10;
+/// Static-hole refresh cadence in pump ticks (20 × 30ms ≈ 600ms):
+/// thumbnails re-source at ~1.7Hz so late image loads and hover
+/// states land; the topmost re-assert rides the same cadence.
+/// Dynamic (video) holes re-source EVERY tick — see the alpha.8
+/// header lesson: MagSetWindowSource IS the refresh mechanism.
+const STATIC_EVERY: u64 = 20;
 /// Component deltas ≤ this are UIA round-off jitter, not moves — a
 /// re-source for a 1px drift would only reset the capture pipeline.
 const MOVE_EPSILON: i32 = 1;
@@ -312,16 +313,18 @@ impl HolePool {
                     tracing::info!("holes: #{} hidden", i);
                 }
 
-                // alpha.7 re-source policy — see the header lesson: the
-                // magnifier content is LIVE, so re-source only on need.
-                //   · pending_src  — hole just became visible
-                //   · !src_ok      — retry a failed call ~3.3Hz
-                //   · watchdog     — ~0.33Hz freeze insurance; the
-                //     topmost re-assert rides along (recovered within
-                //     ~3s if another topmost popup slipped above us).
-                let due = h.pending_src
-                    || (!h.src_ok && tick.is_multiple_of(RETRY_EVERY))
-                    || tick.is_multiple_of(WATCHDOG_EVERY);
+                // alpha.8 re-source policy — see the header lesson: the
+                // Magnifier control does NOT track the screen on its
+                // own; MagSetWindowSource IS the refresh mechanism.
+                //   · dynamic (video) — every pump tick (33Hz; the OS
+                //     Magnifier sample polls the same way)
+                //   · static — every STATIC_EVERY ticks (~1.7Hz)
+                //   · pending_src — the hole just became visible
+                // A failed call retries on the next due tick, and its
+                // onset/recovery is edge-logged below.
+                let due = h.dynamic
+                    || h.pending_src
+                    || tick.is_multiple_of(STATIC_EVERY);
                 if want_visible && h.visible && due {
                     h.pending_src = false;
                     let ok = MagSetWindowSource(h.mag, h.source).as_bool();
@@ -339,14 +342,20 @@ impl HolePool {
                         }
                         h.src_ok = ok;
                     }
-                    if tick.is_multiple_of(WATCHDOG_EVERY) {
-                        let _ = SetWindowPos(
-                            h.host,
-                            HWND_TOPMOST,
-                            0, 0, 0, 0,
-                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                        );
-                    }
+                }
+                // Topmost re-assert on the static cadence — if another
+                // topmost popup slipped above us, the hole recovers
+                // within ~600ms without user action.
+                if want_visible
+                    && h.visible
+                    && tick.is_multiple_of(STATIC_EVERY)
+                {
+                    let _ = SetWindowPos(
+                        h.host,
+                        HWND_TOPMOST,
+                        0, 0, 0, 0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
                 }
             }
         }
@@ -375,7 +384,7 @@ struct PoolHole {
     visible: bool,
     dynamic: bool,
     /// Last MagSetWindowSource result — failures are logged on EDGE
-    /// (ok→fail / fail→ok) and retried at RETRY_EVERY, never per tick.
+    /// (ok→fail / fail→ok) and retried on the next due tick.
     src_ok: bool,
     /// Set when a hidden hole becomes visible — one re-source to flush
     /// whatever the magnifier child displayed while hidden.
