@@ -24,8 +24,8 @@ extern "system" {}
 use crate::common::{init_logging, Settings, VERSION};
 use crate::holes::{HolePool, Holes};
 use crate::tracker::Tracker;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, HOT_KEY_MODIFIERS};
 use windows::Win32::UI::Shell::{
@@ -33,9 +33,10 @@ use windows::Win32::UI::Shell::{
     NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow, GetMessageW, LoadCursorW,
-    LoadImageW, PostQuitMessage, RegisterClassW, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
-    CW_USEDEFAULT, HICON, IDC_ARROW, IMAGE_ICON, LR_DEFAULTSIZE, MSG, WM_DESTROY, WNDCLASSW,
+    DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow, GetMessageW,
+    GetWindowRect, LoadCursorW, LoadImageW, PostQuitMessage, RegisterClassW, TranslateMessage,
+    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, HICON, IDC_ARROW, IMAGE_ICON, LR_DEFAULTSIZE, MSG,
+    WM_DESTROY, WNDCLASSW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, SetWindowLongPtrW, GWLP_USERDATA,
@@ -579,6 +580,10 @@ static PROBE_REQUEST: AtomicBool = AtomicBool::new(false);
 static MAGPROBE_REQUEST: AtomicBool = AtomicBool::new(false);
 static PIERCE_REQUEST: AtomicBool = AtomicBool::new(false);
 
+/// DPI awareness outcome (for the F10 clipboard report): 0 unknown,
+/// 1 per-monitor-v2, 2 system-aware fallback, 3 unavailable.
+static DPI_MODE: AtomicU8 = AtomicU8::new(0);
+
 const HOTKEY_TOGGLE: i32 = 1;
 const HOTKEY_QUIT: i32 = 2;
 const HOTKEY_CYCLE: i32 = 3;
@@ -636,6 +641,131 @@ unsafe fn update_tray_tip(nid: &mut NOTIFYICONDATAW, text: &str) {
     nid.szTip[..wide.len()].copy_from_slice(&wide);
     nid.szTip[wide.len()] = 0;
     let _ = Shell_NotifyIconW(NIM_MODIFY, nid);
+}
+
+// =====================================================================
+// Clipboard diagnostics (alpha.7) — the feedback-loop fix.
+//
+//   Six test rounds produced ZERO log.txt paste-backs: the tester
+//   looks at the screen and reports one sentence. So F10 now copies
+//   the whole diagnostic report (window rect, media element rects,
+//   current hole rects) to the CLIPBOARD — the tester just presses
+//   Ctrl+V into the bug report. The report carries exactly the data
+//   every placement mystery needs: which UIA element produced which
+//   rect, and where the holes actually went.
+// =====================================================================
+
+fn dpi_text() -> &'static str {
+    match DPI_MODE.load(Ordering::Relaxed) {
+        1 => "per-monitor-v2",
+        2 => "system-aware (PMv2 unsupported)",
+        3 => "UNAVAILABLE — holes will misplace on scaled displays",
+        _ => "unknown",
+    }
+}
+
+/// Locale-safe foreground title (chars, never byte-sliced).
+fn fg_title(hwnd: HWND) -> String {
+    unsafe {
+        let mut buf = [0u16; 128];
+        let n =
+            windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(hwnd, &mut buf).max(0) as usize;
+        String::from_utf16_lossy(&buf[..n.min(buf.len())])
+            .chars()
+            .take(60)
+            .collect()
+    }
+}
+
+/// Assemble the human-readable diagnostic report for the clipboard.
+fn probe_report(
+    target: HWND,
+    total: u32,
+    media: u32,
+    samples: &[String],
+    holes: &[crate::holes::HoleSpec],
+) -> String {
+    let mut r = String::new();
+    let mut rect = RECT::default();
+    let rect_line = if unsafe { GetWindowRect(target, &mut rect) }.is_ok() {
+        format!(
+            "rect ({},{})-({},{}) {}x{}",
+            rect.left,
+            rect.top,
+            rect.right,
+            rect.bottom,
+            rect.right - rect.left,
+            rect.bottom - rect.top
+        )
+    } else {
+        "rect unavailable".into()
+    };
+    r.push_str(&format!("Invertonator v{} UIA probe\r\n", VERSION));
+    r.push_str(&format!(
+        "window: \"{}\" {}\r\n",
+        fg_title(target),
+        rect_line
+    ));
+    r.push_str(&format!("dpi: {}\r\n", dpi_text()));
+    r.push_str(&format!("uia: total={total} media={media}\r\n"));
+    if samples.is_empty() {
+        r.push_str("media elements: NONE seen\r\n");
+    } else {
+        r.push_str("media elements (type, name, size, position):\r\n");
+        for s in samples {
+            r.push_str(&format!("  {s}\r\n"));
+        }
+    }
+    r.push_str(&format!("current holes: {}\r\n", holes.len()));
+    for (i, s) in holes.iter().enumerate() {
+        r.push_str(&format!(
+            "  #{i} {}x{} @({},{}){}\r\n",
+            s.w,
+            s.h,
+            s.x,
+            s.y,
+            if s.dynamic { " dyn" } else { "" }
+        ));
+    }
+    r
+}
+
+/// CF_UNICODETEXT clipboard copy. Returns false (and frees the
+/// allocation) on any failure; on success the SYSTEM owns the memory.
+fn copy_to_clipboard(text: &str) -> bool {
+    use windows::Win32::Foundation::{GlobalFree, HANDLE};
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    };
+    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+    use windows::Win32::System::Ole::CF_UNICODETEXT;
+    unsafe {
+        let mut wide: Vec<u16> = text.encode_utf16().collect();
+        wide.push(0);
+        let bytes = wide.len() * 2;
+        let Ok(hg) = GlobalAlloc(GMEM_MOVEABLE, bytes) else {
+            return false;
+        };
+        let ptr = GlobalLock(hg);
+        if ptr.is_null() {
+            let _ = GlobalFree(hg);
+            return false;
+        }
+        std::ptr::copy_nonoverlapping(wide.as_ptr().cast::<u8>(), ptr.cast(), bytes);
+        let _ = GlobalUnlock(hg);
+        if OpenClipboard(None).is_err() {
+            let _ = GlobalFree(hg);
+            return false;
+        }
+        let ok = EmptyClipboard().is_ok()
+            && SetClipboardData(CF_UNICODETEXT.0 as u32, HANDLE(hg.0)).is_ok();
+        let _ = CloseClipboard();
+        if !ok {
+            // The system did NOT take ownership — free our allocation.
+            let _ = GlobalFree(hg);
+        }
+        ok
+    }
 }
 
 // =====================================================================
@@ -712,6 +842,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         for s in &samples {
             tracing::info!("  media sample: {s}");
         }
+        // alpha.7: the report goes to the CLIPBOARD — the tester
+        // pastes it straight into the bug report. The tray tip tells
+        // them it worked without ever opening log.txt.
+        let holes = state.holes.shared.specs.lock().unwrap().clone();
+        let report = probe_report(target, total, media, &samples, &holes);
+        let copied = copy_to_clipboard(&report);
+        tracing::info!(
+            "uia-probe: report {}",
+            if copied {
+                "COPIED to clipboard — paste it into the bug report"
+            } else {
+                "clipboard copy FAILED (report is in log.txt only)"
+            }
+        );
+        let tip = if copied {
+            "Invertonator — diagnostics COPIED (Ctrl+V pastes them)"
+        } else {
+            "Invertonator — diagnostics copy FAILED (see log.txt)"
+        };
+        update_tray_tip(&mut state.tray_nid, tip);
     }
     if MAGPROBE_REQUEST.swap(false, Ordering::Relaxed) {
         magprobe::run();
@@ -744,13 +894,16 @@ fn set_dpi_awareness() {
         // log loudly — holes WILL misplace on scaled displays.
         if SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2).is_err() {
             if !SetProcessDPIAware().as_bool() {
+                DPI_MODE.store(3, Ordering::Relaxed);
                 tracing::warn!(
                     "dpi: awareness unavailable — holes will misplace on scaled displays"
                 );
             } else {
+                DPI_MODE.store(2, Ordering::Relaxed);
                 tracing::info!("dpi: system-aware fallback (PMv2 unsupported)");
             }
         } else {
+            DPI_MODE.store(1, Ordering::Relaxed);
             tracing::info!("dpi: per-monitor-v2 aware");
         }
     }

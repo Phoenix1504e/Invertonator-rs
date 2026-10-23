@@ -40,12 +40,23 @@
 //   · Clamp to the foreground window + 4px quantize: off-screen
 //     garbage rects never become holes, and UIA's ±1-3px rect wobble
 //     no longer moves holes / re-arms captures every walk.
-//   · Merge = near (8px seam tolerance) AND growth ≤ 1.3× the larger
-//     fragment (alpha.6 guard): fragments of ONE media (element +
-//     overlay/canvas siblings, near-identical rects) still union into
-//     a single hole, but the YouTube thumbnail GRID — items ~8–12px
-//     apart — no longer chains into one mega-hole (a grid pair unions
-//     to 2.0×, blocked).
+//   · Merge (alpha.7 — the "player split into 3-4 holes" fix):
+//     transitive union-find clustering. Two candidates join when the
+//     gap between their rects is ≤ tolerance, where tolerance =
+//     max(8px, 6% of the SMALLER fragment's larger axis). Keying on
+//     the smaller fragment is the point: a 720p player's fragments
+//     (strips 20-40px apart) unify into the ONE big hole the user
+//     expects, while 168px grid thumbnails (tolerance 10px, gutters
+//     12px+) still stay separate — the big player never swallows the
+//     sidebar. alpha.6's fixed 8px seam + 1.3× union-growth cap did
+//     the opposite: any player reported as N fragments (union ≈ N×
+//     the largest fragment) was mathematically barred from ever
+//     merging — the "3-4 rectangles side by side with gaps" report.
+//     No growth cap: fragments of one media may union to any size;
+//     the gap rule alone keeps distinct media apart.
+//   · Final order is deterministic (top-to-bottom, left-to-right),
+//     so an unchanged hole set keeps its pump index mapping — no
+//     hole-window churn when two specs merely swap slots.
 //   · Cap at MAX_HOLES, largest first.
 //
 //   COORDINATES: screen physical pixels end to end (per-monitor-v2
@@ -74,8 +85,10 @@ const MAX_DISCOVERY_MS: u64 = 1500; // idle backoff cap (page stable)
 const MIN_MEDIA: i32 = 64; // image/graphic AND video min w and h (px)
 const MIN_LINK: i32 = 96; // hyperlink min w and h (px)
 const MIN_HOLE: i32 = 32; // final hole min — degenerate slivers out
-const MERGE_GAP: i32 = 8; // near-adjacent fragments of one media
-const MERGE_GROWTH: f64 = 1.3; // max union growth vs the larger fragment
+const MERGE_GAP: i32 = 8; // gap-tolerance floor (small media)
+                          // Above the floor the tolerance scales with the SMALLER fragment's
+                          // larger axis (÷16 ≈ 6.25%): big media get proportionally wider
+                          // seams, small grid items keep the tight alpha.5 floor.
 const QUANTUM: i32 = 4; // rect quantization grid (px)
 const MAX_NODES: u32 = 100_000;
 const MAX_DEPTH: u32 = 60; // alpha.4 capped at 25 — YouTube runs deeper
@@ -632,33 +645,32 @@ fn offer_candidate(kind: Option<MediaKind>, rect: &RECT, ctx: &mut WalkCtx) {
 // =====================================================================
 
 impl Candidate {
-    /// Gap-tolerant proximity: two rects whose edges come within
-    /// MERGE_GAP px belong to the same media. The video element, its
-    /// control overlay and its canvases are reported by the provider
-    /// as near-adjacent siblings with a 0-6px seam — strict overlap
-    /// merging left them as "multiple holes side by side on one
-    /// media" (alpha.4 user report).
-    fn near(&self, o: &Candidate) -> bool {
-        self.x - MERGE_GAP < o.x + o.w
-            && o.x < self.x + self.w + MERGE_GAP
-            && self.y - MERGE_GAP < o.y + o.h
-            && o.y < self.y + self.h + MERGE_GAP
+    /// Gap tolerance for the pair (alpha.7): max(8px, 6% of the
+    /// SMALLER fragment's larger axis). Keying on the smaller one is
+    /// what keeps the watch page honest — a 1280×720 player's
+    /// tolerance toward a 168px sidebar thumbnail is the thumbnail's
+    /// 10px, not the player's 80px, so the player can never swallow
+    /// the sidebar. Between fragments of one big media (strips,
+    /// poster+canvas layers) it scales up to 20-45px, which is where
+    /// provider-reported seams actually sit.
+    fn gap_tol(&self, o: &Candidate) -> i32 {
+        let smaller_max = self.w.max(self.h).min(o.w.max(o.h));
+        MERGE_GAP.max(smaller_max / 16)
     }
 
-    /// Proximity AND growth guard (alpha.6): merge only if the union
-    /// stays within MERGE_GROWTH (1.3×) of the larger fragment.
-    /// Fragments of one media (element + overlay + canvas, rects
-    /// near-identical or slightly offset) union to ~1.0–1.2× — they
-    /// merge. The YouTube thumbnail grid sits ~8–12px apart — a grid
-    /// pair unions to 2.0× — blocked, so the 8px proximity rule can
-    /// no longer chain the whole sidebar into one mega-hole.
-    fn same_media(&self, o: &Candidate) -> bool {
-        if !self.near(o) {
-            return false;
-        }
-        let u = self.union(*o);
-        let max_a = self.area().max(o.area()) as f64;
-        u.area() as f64 <= MERGE_GROWTH * max_a
+    /// Gap-tolerant proximity: two rects whose edges come within the
+    /// pair's gap tolerance belong to the same media. The video
+    /// element, its control overlay and its canvases are reported by
+    /// the provider as near-adjacent siblings; a player split into
+    /// strips sits 10-40px apart. Strict `<` keeps the floor honest:
+    /// a gap of exactly MERGE_GAP never merges (alpha.5 behavior for
+    /// small media is preserved bit-for-bit).
+    fn near(&self, o: &Candidate) -> bool {
+        let g = self.gap_tol(o);
+        self.x - g < o.x + o.w
+            && o.x < self.x + self.w + g
+            && self.y - g < o.y + o.h
+            && o.y < self.y + self.h + g
     }
 
     /// Union rect of two candidates (dynamic = either).
@@ -702,52 +714,58 @@ fn ctx_to_specs(ctx: WalkCtx) -> (Vec<HoleSpec>, String) {
         dump.push_str(&format!("+{}", ctx.candidates.len() - 12));
     }
 
-    // Largest first.
-    let mut cands = ctx.candidates;
-    cands.sort_by_key(|c| std::cmp::Reverse(c.area()));
-
-    // Overlap merge, pass one: an <img> inside an <a> is ONE thumbnail.
-    // A new candidate near a kept one grows that hole to the union.
-    let mut kept: Vec<Candidate> = Vec::with_capacity(MAX_HOLES);
-    for c in cands {
-        if kept.len() >= MAX_HOLES {
-            break;
+    // UNION-FIND CLUSTERING (alpha.7): every pair of candidates whose
+    // gap is within tolerance joins the same cluster; clusters are
+    // transitive (A~B, B~C ⇒ one media), so a player reported as any
+    // number of fragments with any seam up to the tolerance collapses
+    // into exactly ONE hole — the "3-4 rectangles side by side" fix.
+    // No union-growth cap: alpha.6's 1.3× guard barred N-fragment
+    // players (union ≈ N× the largest fragment) from merging — the
+    // exact geometry the user kept reporting. The gap rule alone
+    // keeps distinct media (grid thumbnails, 12px+ gutters) apart.
+    let cands = ctx.candidates;
+    let n = cands.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]]; // path halving
+            i = parent[i];
         }
-        let mut merged = false;
-        for k in kept.iter_mut() {
-            if k.same_media(&c) {
-                *k = k.union(c);
-                merged = true;
-                break;
-            }
-        }
-        if !merged {
-            kept.push(c);
-        }
+        i
     }
-
-    // FIXPOINT (alpha.5): a union can grow until it touches another
-    // kept hole — repeat pairwise merging until stable, so one media
-    // NEVER stays split across two holes. Same growth guard applies.
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for i in 0..kept.len() {
-            for j in ((i + 1)..kept.len()).rev() {
-                if kept[i].same_media(&kept[j]) {
-                    kept[i] = kept[i].union(kept[j]);
-                    kept.remove(j);
-                    changed = true;
-                }
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+            if ri != rj && cands[i].near(&cands[j]) {
+                parent[rj] = ri;
             }
         }
     }
+    let mut clusters: Vec<Option<Candidate>> = (0..n).map(|i| Some(cands[i])).collect();
+    for i in 0..n {
+        let r = find(&mut parent, i);
+        if r != i {
+            let frag = clusters[i].take();
+            if let Some(f) = frag {
+                clusters[r] = clusters[r].map(|acc| acc.union(f));
+            }
+        }
+    }
+    let mut kept: Vec<Candidate> = clusters.into_iter().flatten().collect();
 
-    // Degenerate slivers out; hard cap, largest first.
+    // Degenerate slivers out.
     kept.retain(|k| k.w >= MIN_HOLE && k.h >= MIN_HOLE);
+
+    // Deterministic order — top-to-bottom, left-to-right. An unchanged
+    // hole set therefore keeps its index mapping into the pump's
+    // window pool (no hole-window churn when specs merely swap slots).
+    kept.sort_by_key(|k| (k.y, k.x, k.w, k.h));
+
+    // Hard cap, largest first (order restored afterwards).
     if kept.len() > MAX_HOLES {
         kept.sort_by_key(|k| std::cmp::Reverse(k.area()));
         kept.truncate(MAX_HOLES);
+        kept.sort_by_key(|k| (k.y, k.x, k.w, k.h));
     }
 
     let specs = kept

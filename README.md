@@ -4,19 +4,23 @@
 
 ![Invertonator](icon.svg)
 
-> **Status: v0.3.0-alpha.6** — Windows: UIA media tracker + Magnifier-API
+> **Status: v0.3.0-alpha.7** — Windows: UIA media tracker + Magnifier-API
 > true-color holes proven on hardware (1,152-node cache-request walks ·
 > 164 media elements classified · MagSetColorEffect/Source/Transform all
 > verified). Gecko browsers (Firefox/LibreWolf) supported via automatic
 > live-walk fallback when a provider leaves CachedChildren empty.
-> alpha.6 refresh-model fix: the Magnifier control only re-captures when
-> its paint is poked (as Microsoft's own sample does every ~16ms) —
-> holes are now poked with InvalidateRect every tick (video ~33Hz),
-> so in-hole video is live without the laggy MagSetWindowSource reset
-> spam. Plus: per-window UIA warm-up (Chromium hands out a partial
-> tree — sidebar/watch media was never seen), 64px media gates
-> (kills holes on UI icons), merge-growth guard (thumbnail grids no
-> longer chain into one mega-hole), candidate-level hole logging.
+> alpha.7 hole-merge fix: candidates cluster transitively with a
+> size-aware gap tolerance (max 8px floor, 6% of the smaller
+> fragment's larger axis) — a player reported as several fragments
+> collapses into the ONE big hole it should be, while grid
+> thumbnails stay separate. alpha.6 refresh-model fix kept: holes
+> are poked with InvalidateRect every tick (video ~33Hz) so in-hole
+> video is live without the laggy MagSetWindowSource reset spam.
+> Plus: per-window UIA warm-up (Chromium hands out a partial tree —
+> sidebar/watch media was never seen), 64px media gates (kills holes
+> on UI icons), candidate-level hole logging, and F10 now copies the
+> whole diagnostic report to the CLIPBOARD (paste it into the bug
+> report — no log.txt hunting).
 > Linux (X11): global gamma-ramp inversion shipped — the
 > XComposite true-color-hole overlay is the next milestone. For the
 > **fully-featured C# edition**, see
