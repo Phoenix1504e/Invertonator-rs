@@ -4,15 +4,20 @@
 //   window's UIA tree (cached walk, live fallback) and turns media
 //   elements into HoleSpecs for the hole pump.
 //
-//   CADENCE (alpha.7 — adaptive): the walk starts at DISCOVERY_MS and
-//   doubles while the foreground window AND its hole set stay stable,
-//   capped at BACKOFF_MAX_MS. Every change — app switch, title change
-//   (navigation), different hole rects, recent wheel activity — snaps
-//   the cadence back to fast. A playing video holds a static rect, so
-//   steady-state re-scans drop 4×; that plus the FindAllBuildCache
-//   bulk walk below is what fixed the "video is very laggy" field
-//   report (the tracker used to hammer the browser's UI thread with
-//   tens of thousands of cross-process COM calls per second).
+//   CADENCE (alpha.9 — incremental steady state): a FULL tree walk
+//   (FindAllBuildCache over every node on the page — a serialization
+//   burst served by the BROWSER's UI thread) runs only on triggers:
+//   foreground switch, navigation (title change), window move/resize,
+//   a stale candidate element, or SLOW_WALK_MS age. Between full
+//   walks, a light refresh pass every REFRESH_MS re-reads ONLY the
+//   kept candidates' bounding rects (≤ 8 cross-process property
+//   reads) and re-runs the local selection pipeline. Steady-state
+//   cross-process traffic drops ~1000× vs alpha.8's full walk every
+//   400–1600ms — the browser renders video instead of serving a11y
+//   queries. (alpha.7's adaptive backoff was the first cut of this;
+//   the field report "still very laggy" showed even 1.6s full-walk
+//   bursts of a 4k-node tree are jank — the tree itself must stop
+//   being re-serialized.)
 //
 //   CLASSIFICATION GATES (the "what deserves a hole" rules):
 //   · Document-pane scoping — media is only collected INSIDE
@@ -66,10 +71,10 @@ use windows::Win32::System::Com::{
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationElement,
     TreeScope_Descendants, UIA_BoundingRectanglePropertyId,
-    UIA_ControlTypePropertyId, UIA_DocumentControlTypeId,
-    UIA_HyperlinkControlTypeId, UIA_ImageControlTypeId,
-    UIA_LocalizedControlTypePropertyId, UIA_NamePropertyId,
-    UIA_CONTROLTYPE_ID,
+    UIA_ClassNamePropertyId, UIA_ControlTypePropertyId,
+    UIA_DocumentControlTypeId, UIA_HyperlinkControlTypeId,
+    UIA_ImageControlTypeId, UIA_LocalizedControlTypePropertyId,
+    UIA_NamePropertyId, UIA_CONTROLTYPE_ID,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetSystemMetrics, GetWindowTextW, GetWindowRect,
@@ -79,12 +84,17 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::holes::{HoleSpec, Holes, KIND_IMG, KIND_LINK, KIND_VIDEO};
 
-const DISCOVERY_MS: u64 = 400;  // fast floor after any change
-/// Steady-state cap: while fg window + hole set are stable, the walk
-/// interval doubles each tick up to this (4× fewer UIA passes over a
-/// playing video).
-const BACKOFF_MAX_MS: u64 = 1_600;
-/// Wheel activity within this window forces the fast cadence — scroll
+/// Steady-state rect-refresh cadence: between full walks, ONLY the
+/// kept candidates' CurrentBoundingRectangle is re-read (≤ 8 light
+/// cross-process property reads) and the local selection pipeline
+/// re-runs. The heavy full-tree walk runs ONLY on triggers (see the
+/// CADENCE header note).
+const REFRESH_MS: u64 = 250;
+/// Age of the last full walk after which one is forced even on a
+/// completely stable foreground — catches media the incremental pass
+/// cannot see (new players/thumbnails mounted on an unchanged page).
+const SLOW_WALK_MS: u64 = 5_000;
+/// Wheel activity within this window short-cuts the nap — scroll
 /// moves every media rect on screen (scrollhook::ms_since_wheel).
 const WHEEL_FAST_MS: u64 = 1_500;
 /// Backoff sleep granularity: the nap wakes early on foreground
@@ -177,17 +187,25 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
         }
     };
     tracing::info!(
-        "tracker: alive (discovery {DISCOVERY_MS}ms → backoff {BACKOFF_MAX_MS}ms on stable state)"
+        "tracker: alive (rect refresh {REFRESH_MS}ms; full walk on change or {SLOW_WALK_MS}ms age)"
     );
 
     let mut had_specs = false;
     let mut last_log = std::time::Instant::now();
     let mut last_key = String::new();
-    // Adaptive cadence state — see the cadence constants above.
-    let mut interval = DISCOVERY_MS;
-    let mut last_sig = String::new();
     let mut last_fg: isize = 0;
     let mut last_title = String::new();
+    let mut last_win = (0i32, 0i32, 0i32, 0i32);
+    // Incremental steady state — see REFRESH_MS. `tracked` holds the
+    // kept candidates' live UIA elements: a full walk replaces the
+    // whole set, every refresh pass just re-reads their rects.
+    let mut tracked: Vec<TrackedEl> = Vec::new();
+    let mut docs_rects: Vec<RECT> = Vec::new();
+    let mut last_nodes: u32 = 0;
+    let mut last_cands: u32 = 0;
+    let mut last_kinds = [0u32; 3];
+    let mut last_full = std::time::Instant::now();
+    let mut need_full = true;
 
     while !stop.load(Ordering::Relaxed) {
         if enabled.load(Ordering::Relaxed) {
@@ -199,45 +217,73 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
                 // SAFETY: fg valid, plain HWND read (GetWindowTextW).
                 unsafe { window_title(fg) }
             };
-            // A foreground switch — or even a title change, which is
-            // how browsers announce navigation — makes the old hole
-            // set suspect: snap back to the fast cadence.
-            let fg_changed = fg_raw != last_fg || title != last_title;
+            let win = if fg.is_invalid() {
+                (0, 0, 0, 0)
+            } else {
+                // SAFETY: fg valid, plain HWND read (GetWindowRect).
+                unsafe { window_rect(fg) }
+            };
+            // Foreground switch, navigation (title), or window
+            // move/resize — each invalidates either the tracked
+            // element set or the stored document scoping rects.
+            let fg_changed =
+                fg_raw != last_fg || title != last_title || win != last_win;
             last_fg = fg_raw;
             last_title = title.clone();
+            last_win = win;
 
             let t0 = std::time::Instant::now();
-            let (specs, nodes, cands, docs_n, kinds) = if fg.is_invalid() {
-                (Vec::new(), 0, 0, 0, [0u32; 3])
+            let mut mode = "idle";
+            let mut stale = false;
+            let specs: Vec<HoleSpec>;
+
+            if fg.is_invalid() {
+                specs = Vec::new();
+                holes.set_specs(Vec::new());
+                tracked.clear();
+                docs_rects.clear();
+                last_nodes = 0;
+                last_cands = 0;
+                last_kinds = [0; 3];
+                need_full = true;
+            } else if need_full
+                || fg_changed
+                || tracked.is_empty()
+                || t0.duration_since(last_full).as_millis() as u64 >= SLOW_WALK_MS
+            {
+                let fw = unsafe { discover(&automation, fg) };
+                holes.set_specs(fw.specs.clone());
+                tracked = fw.tracked;
+                docs_rects = fw.docs_rects;
+                last_nodes = fw.nodes;
+                last_cands = fw.cands;
+                last_kinds = fw.kinds;
+                last_full = std::time::Instant::now();
+                need_full = false;
+                mode = "full";
+                specs = fw.specs;
             } else {
-                unsafe { discover(&automation, fg) }
-            };
-            let walk_ms = t0.elapsed().as_millis() as u64;
+                let clip = unsafe { clip_rect(fg) };
+                let (s, st, _ms) = refresh_specs(&tracked, clip, &docs_rects);
+                holes.set_specs(s.clone());
+                stale = st;
+                if st {
+                    need_full = true;
+                }
+                mode = "incr";
+                specs = s;
+            }
             had_specs = !specs.is_empty();
-            holes.set_specs(specs.clone());
 
-            // Cadence: identical hole set on an unchanged foreground →
-            // double the interval (cap BACKOFF_MAX_MS); any change →
-            // back to DISCOVERY_MS. UIA round-off is absorbed by the
-            // 2px signature quantization.
-            let sig = specs_sig(&specs);
-            let stable = !fg_changed && sig == last_sig;
-            last_sig = sig;
-            interval = if stable {
-                (interval * 2).min(BACKOFF_MAX_MS)
-            } else {
-                DISCOVERY_MS
-            };
-
-            // Throttled discovery summary — the alpha.3 log proved the
-            // PROBE sees media but said nothing about what the TRACKER
-            // produced. This line closes that observability gap: one
-            // line per state change, plus a 10s heartbeat. iv=/walk=
-            // expose the cadence and per-walk cost in the field log
-            // (alpha.7 lag triage).
+            // Throttled discovery summary — one line per state change,
+            // plus a 10s heartbeat. In 'incr' lines nodes/cands/v=i=l=
+            // are the LAST FULL walk's numbers (the incremental pass
+            // only re-reads the kept candidates' rects); holes= is the
+            // live set. mode= tells the two passes apart in the field
+            // log.
             let now = std::time::Instant::now();
             let elapsed = now.duration_since(last_log).as_millis() as u64;
-            let key = format!("{}\u{1}{}", title, specs.len());
+            let key = format!("{}\u{1}{}{}", title, mode, specs.len());
             if elapsed >= HEARTBEAT_MS || (elapsed >= SUMMARY_EVERY_MS && key != last_key) {
                 last_log = now;
                 last_key = key;
@@ -252,27 +298,40 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
                         )
                     })
                     .collect();
-                tracing::info!(
-                    "tracker: fg=\"{}\" nodes={} cands={} v={} i={} l={} docs={} holes={} iv={}ms walk={}ms [{}]",
-                    title,
-                    nodes,
-                    cands,
-                    kinds[2],
-                    kinds[0],
-                    kinds[1],
-                    docs_n,
-                    specs.len(),
-                    interval,
-                    walk_ms,
-                    rects.join(" ")
-                );
+                if mode == "full" {
+                    tracing::info!(
+                        "tracker: fg=\"{}\" mode=full nodes={} cands={} v={} i={} l={} docs={} holes={} walk={}ms [{}]",
+                        title,
+                        last_nodes,
+                        last_cands,
+                        last_kinds[2],
+                        last_kinds[0],
+                        last_kinds[1],
+                        docs_rects.len(),
+                        specs.len(),
+                        t0.elapsed().as_millis() as u64,
+                        rects.join(" ")
+                    );
+                } else if mode == "incr" {
+                    tracing::info!(
+                        "tracker: fg=\"{}\" mode=incr holes={} refresh={}ms stale={} v={} i={} l={} (last full) [{}]",
+                        title,
+                        specs.len(),
+                        t0.elapsed().as_millis() as u64,
+                        stale,
+                        last_kinds[2],
+                        last_kinds[0],
+                        last_kinds[1],
+                        rects.join(" ")
+                    );
+                }
             }
         } else if had_specs {
             // Disabled while holes were out — clear once.
             holes.set_specs(Vec::new());
             had_specs = false;
         }
-        nap(&stop, &enabled, interval, last_fg);
+        nap(&stop, &enabled, REFRESH_MS, last_fg);
     }
     tracing::info!("tracker: stopped");
 }
@@ -307,26 +366,27 @@ fn nap(stop: &AtomicBool, enabled: &AtomicBool, ms: u64, fg: isize) {
     }
 }
 
-/// Change signature of a hole set — rects quantized to 2px (UIA
-/// round-off must not read as a state change) plus the kind letter.
-fn specs_sig(specs: &[HoleSpec]) -> String {
-    let mut s = String::new();
-    for sp in specs {
-        s.push_str(&format!(
-            "{},{},{},{},{};",
-            sp.x / 2,
-            sp.y / 2,
-            sp.w / 2,
-            sp.h / 2,
-            sp.kind_char()
-        ));
+/// Foreground window rect tuple for change detection — a move/resize
+/// invalidates the stored document scoping rects → full walk.
+unsafe fn window_rect(hwnd: HWND) -> (i32, i32, i32, i32) {
+    let mut r = RECT::default();
+    if GetWindowRect(hwnd, &mut r).is_err() {
+        return (0, 0, 0, 0);
     }
-    s
+    (r.left, r.top, r.right, r.bottom)
 }
 
 // =====================================================================
 // Tree walk
 // =====================================================================
+
+/// A kept candidate's live UIA element — the incremental pass re-reads
+/// its bounding rect between full walks (≤ 8 light property reads per
+/// pass vs the full-tree serialization burst; see REFRESH_MS).
+struct TrackedEl {
+    el: IUIAutomationElement,
+    kind: MediaKind,
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum MediaKind {
@@ -355,6 +415,9 @@ struct Candidate {
     /// clamping (MIN_MEDIA for every kind).
     min: i32,
     kind: MediaKind,
+    /// Live UIA element behind this candidate. None on the incremental
+    /// refresh path — there the elements already live in `tracked`.
+    el: Option<IUIAutomationElement>,
 }
 
 impl Candidate {
@@ -389,21 +452,60 @@ fn overlap_ratio(a: &Candidate, b: &Candidate) -> f32 {
 
 struct WalkCtx {
     total: u32,
-    docs: u32,
     /// Screen rects of every Document element seen this walk — the
-    /// live walk's document-pane scoping (browser page area).
+    /// document-pane scoping (browser page area). Harvested on BOTH
+    /// walk paths as of alpha.9 (the cached path used to skip this,
+    /// leaving its candidates window-scoped only).
     docs_rects: Vec<RECT>,
     candidates: Vec<Candidate>,
 }
 
+/// One full walk's result: the desired hole set plus everything the
+/// discovery loop needs for its incremental steady state.
+struct FullWalk {
+    specs: Vec<HoleSpec>,
+    tracked: Vec<TrackedEl>,
+    docs_rects: Vec<RECT>,
+    nodes: u32,
+    cands: u32,
+    kinds: [u32; 3],
+}
+
+impl FullWalk {
+    fn empty() -> Self {
+        FullWalk {
+            specs: Vec::new(),
+            tracked: Vec::new(),
+            docs_rects: Vec::new(),
+            nodes: 0,
+            cands: 0,
+            kinds: [0; 3],
+        }
+    }
+}
+
+/// Selection pipeline tail shared by both walk paths (and by the
+/// incremental refresh pass) — folds a WalkCtx into FullWalk.
+fn finish_walk(ctx: WalkCtx, clip: Option<Clip>) -> FullWalk {
+    let nodes = ctx.total;
+    let cands = ctx.candidates.len() as u32;
+    let docs_rects = ctx.docs_rects;
+    let (specs, tracked, kinds) = finish_selection(ctx.candidates, clip, &docs_rects);
+    FullWalk {
+        specs,
+        tracked,
+        docs_rects,
+        nodes,
+        cands,
+        kinds,
+    }
+}
+
 /// Walk the foreground window and return the desired hole set plus
-/// walk counters for the summary log (specs, nodes, candidates, docs).
-unsafe fn discover(
-    automation: &IUIAutomation,
-    fg: HWND,
-) -> (Vec<HoleSpec>, u32, u32, u32, [u32; 3]) {
+/// the full-walk counters for the summary log.
+unsafe fn discover(automation: &IUIAutomation, fg: HWND) -> FullWalk {
     let Ok(root) = automation.ElementFromHandle(fg) else {
-        return (Vec::new(), 0, 0, 0, [0; 3]);
+        return FullWalk::empty();
     };
     // Hole rects are clamped to the foreground window ∩ virtual screen
     // (see clip_rect). Computed once per discovery tick.
@@ -416,12 +518,15 @@ unsafe fn discover(
     // (LibreWolf: ~4k nodes × 4 reads at the old 400ms cadence ≈ tens
     // of thousands of COM calls per second straight into the browser's
     // UI thread — the video-lag driver).
+    // alpha.9: ClassName joined the request — the classifier's tag-name
+    // fallback reads it (Chromium reports HTML tag names there).
     let cache = automation.CreateCacheRequest().ok();
     if let Some(c) = &cache {
         for p in [
             UIA_ControlTypePropertyId,
             UIA_NamePropertyId,
             UIA_LocalizedControlTypePropertyId,
+            UIA_ClassNamePropertyId,
             UIA_BoundingRectanglePropertyId,
         ] {
             let _ = c.AddProperty(p);
@@ -433,7 +538,6 @@ unsafe fn discover(
         if let Ok(cached_root) = root.BuildUpdatedCache(cache_req) {
             let mut ctx = WalkCtx {
                 total: 0,
-                docs: 0,
                 docs_rects: Vec::new(),
                 candidates: Vec::new(),
             };
@@ -443,11 +547,7 @@ unsafe fn discover(
             // root element. Don't hand back an empty hole set then;
             // drop to the live walk, which works on every provider.
             if ctx.total > 1 {
-                let nodes = ctx.total;
-                let cands = ctx.candidates.len() as u32;
-                let docs_n = ctx.docs;
-                let (specs, kinds) = ctx_to_specs(ctx, clip);
-                return (specs, nodes, cands, docs_n, kinds);
+                return finish_walk(ctx, clip);
             }
             if !FALLBACK_LOGGED.swap(true, Ordering::Relaxed) {
                 tracing::info!(
@@ -465,7 +565,7 @@ unsafe fn discover(
     // clamp_candidate), and the size gates still apply.
     tracing::debug!("tracker: cached walk unavailable — live fallback");
     let Ok(true_cond) = automation.CreateTrueCondition() else {
-        return (Vec::new(), 0, 0, 0, [0; 3]);
+        return FullWalk::empty();
     };
     // Bulk cache build first; plain FindAll only if that fails
     // (classify_live then falls back to per-node Current* reads).
@@ -476,20 +576,19 @@ unsafe fn discover(
                 tracing::debug!("tracker: FindAllBuildCache failed ({e}) — plain FindAll");
                 match root.FindAll(TreeScope_Descendants, &true_cond) {
                     Ok(a) => a,
-                    Err(_) => return (Vec::new(), 0, 0, 0, [0; 3]),
+                    Err(_) => return FullWalk::empty(),
                 }
             }
         }
     } else {
         match root.FindAll(TreeScope_Descendants, &true_cond) {
             Ok(a) => a,
-            Err(_) => return (Vec::new(), 0, 0, 0, [0; 3]),
+            Err(_) => return FullWalk::empty(),
         }
     };
-    let Ok(len) = all.Length() else { return (Vec::new(), 0, 0, 0, [0; 3]) };
+    let Ok(len) = all.Length() else { return FullWalk::empty() };
     let mut ctx = WalkCtx {
         total: 0,
-        docs: 0,
         docs_rects: Vec::new(),
         candidates: Vec::new(),
     };
@@ -501,11 +600,7 @@ unsafe fn discover(
             classify_live(&el, &mut ctx);
         }
     }
-    let nodes = ctx.total;
-    let cands = ctx.candidates.len() as u32;
-    let docs_n = ctx.docs_rects.len() as u32;
-    let (specs, kinds) = ctx_to_specs(ctx, clip);
-    (specs, nodes, cands, docs_n, kinds)
+    finish_walk(ctx, clip)
 }
 
 /// Visible-area clip for hole rects. `win` = foreground window rect,
@@ -561,7 +656,13 @@ fn walk_cached(el: &IUIAutomationElement, in_doc: bool, depth: u32, ctx: &mut Wa
         let ct = el.CachedControlType().unwrap_or(UIA_CONTROLTYPE_ID(0));
         let is_doc = ct == UIA_DocumentControlTypeId;
         if is_doc {
-            ctx.docs += 1;
+            // Document scoping anchors — harvested on the cached path
+            // too as of alpha.9 (this path used to leave candidates
+            // window-scoped only).
+            let drect = el.CachedBoundingRectangle().unwrap_or_default();
+            if drect.right > drect.left && drect.bottom > drect.top {
+                ctx.docs_rects.push(drect);
+            }
         }
         let in_doc_child = in_doc || is_doc;
 
@@ -570,8 +671,12 @@ fn walk_cached(el: &IUIAutomationElement, in_doc: bool, depth: u32, ctx: &mut Wa
                 .CachedLocalizedControlType()
                 .map(|s| s.to_string())
                 .unwrap_or_default();
+            let class = el
+                .CachedClassName()
+                .map(|s| s.to_string())
+                .unwrap_or_default();
             let rect = el.CachedBoundingRectangle().unwrap_or_default();
-            offer_candidate(classify(ct, &lct), &rect, ctx);
+            offer_candidate(classify(ct, &lct, &class), &rect, Some(el), ctx);
         }
 
         if ctx.total < MAX_NODES {
@@ -623,33 +728,47 @@ fn classify_live(el: &IUIAutomationElement, ctx: &mut WalkCtx) {
             .or_else(|_| el.CurrentLocalizedControlType())
             .map(|s| s.to_string())
             .unwrap_or_default();
-        offer_candidate(classify(ct, &lct), &rect, ctx);
+        let class = el
+            .CachedClassName()
+            .or_else(|_| el.CurrentClassName())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        offer_candidate(classify(ct, &lct, &class), &rect, Some(el), ctx);
     }
 }
 
 /// Locale-proof classification: numeric control types first, localized
-/// string only for types UIA has no number for (video, graphic).
-fn classify(ct: UIA_CONTROLTYPE_ID, lct: &str) -> Option<MediaKind> {
+/// strings for the types providers name inconsistently, and the
+/// ClassName tag as the last fallback.
+///
+/// alpha.9 breadth — the "media outside the player" fix:
+/// · "thumbnail" localized type — the dedicated grid-thumbnail control
+///   type's string form (some providers expose media grids through
+///   it; windows-rs 0.58 ships no numeric constant for it).
+/// · "movie"/"media"/"animation" localized types — providers that
+///   expose players/motion media under non-"video" strings.
+/// · ClassName fallback — Chromium reports the HTML TAG NAME as
+///   ClassName for web nodes, so a <video> whose provider skips the
+///   localized string still classifies via class "Video".
+fn classify(ct: UIA_CONTROLTYPE_ID, lct: &str, class: &str) -> Option<MediaKind> {
     if ct == UIA_ImageControlTypeId {
         return Some(MediaKind::Image);
     }
     if ct == UIA_HyperlinkControlTypeId {
         return Some(MediaKind::Link);
     }
-    let l = lct.to_ascii_lowercase();
-    if l == "video" {
-        return Some(MediaKind::Video);
-    }
-    if l == "graphic" {
+    match lct.to_ascii_lowercase().as_str() {
+        "video" | "movie" | "media" | "animation" => return Some(MediaKind::Video),
         // Chromium reports <svg> & co. as "graphic" — behaves like image.
-        return Some(MediaKind::Image);
+        "graphic" | "image" | "thumbnail" | "picture" | "photo" => {
+            return Some(MediaKind::Image)
+        }
+        "link" | "hyperlink" => return Some(MediaKind::Link),
+        _ => {}
     }
-    // Some providers only fill the localized string ("image"/"link").
-    if l == "image" {
-        return Some(MediaKind::Image);
-    }
-    if l == "link" {
-        return Some(MediaKind::Link);
+    let c = class.to_ascii_lowercase();
+    if c.contains("video") || c.contains("movie") {
+        return Some(MediaKind::Video);
     }
     None
 }
@@ -657,7 +776,12 @@ fn classify(ct: UIA_CONTROLTYPE_ID, lct: &str) -> Option<MediaKind> {
 /// Size gate + zero-rect rejection. Physical pixels. One gate for all
 /// kinds (alpha.8): videos joined the 80px rule so hidden ad <video>
 /// elements can never anchor a hole.
-fn offer_candidate(kind: Option<MediaKind>, rect: &RECT, ctx: &mut WalkCtx) {
+fn offer_candidate(
+    kind: Option<MediaKind>,
+    rect: &RECT,
+    el: Option<&IUIAutomationElement>,
+    ctx: &mut WalkCtx,
+) {
     let Some(kind) = kind else { return };
     let w = rect.right - rect.left;
     let h = rect.bottom - rect.top;
@@ -671,6 +795,7 @@ fn offer_candidate(kind: Option<MediaKind>, rect: &RECT, ctx: &mut WalkCtx) {
         h,
         min: MIN_MEDIA,
         kind,
+        el: el.cloned(),
     });
 }
 
@@ -678,15 +803,18 @@ fn offer_candidate(kind: Option<MediaKind>, rect: &RECT, ctx: &mut WalkCtx) {
 // Candidates → HoleSpecs (per-kind dominance + flatness + merge + cap)
 // =====================================================================
 
-fn ctx_to_specs(ctx: WalkCtx, clip: Option<Clip>) -> (Vec<HoleSpec>, [u32; 3]) {
+fn finish_selection(
+    candidates: Vec<Candidate>,
+    clip: Option<Clip>,
+    docs: &[RECT],
+) -> (Vec<HoleSpec>, Vec<TrackedEl>, [u32; 3]) {
     // Filter (bogus-rect + document-pane scoping) → clamp (final hole
     // geometry) → per-kind dominance → flatness → videos-first sort →
     // merge → cap.
-    let WalkCtx { candidates, docs_rects, .. } = ctx;
     let mut cands: Vec<Candidate> = match clip {
         Some(clip) => candidates
             .into_iter()
-            .filter_map(|c| clamp_candidate(c, &clip, &docs_rects))
+            .filter_map(|c| clamp_candidate(c, &clip, docs))
             .collect(),
         None => candidates,
     };
@@ -698,7 +826,7 @@ fn ctx_to_specs(ctx: WalkCtx, clip: Option<Clip>) -> (Vec<HoleSpec>, [u32; 3]) {
         kinds[c.kind.slot()] += 1;
     }
     if cands.is_empty() {
-        return (Vec::new(), kinds);
+        return (Vec::new(), Vec::new(), kinds);
     }
 
     // PER-KIND DOMINANCE — keep, per kind, candidates within
@@ -723,7 +851,7 @@ fn ctx_to_specs(ctx: WalkCtx, clip: Option<Clip>) -> (Vec<HoleSpec>, [u32; 3]) {
         c.is_video() || unsafe { !screen_rect_is_flat(c.x, c.y, c.w, c.h) }
     });
     if cands.is_empty() {
-        return (Vec::new(), kinds);
+        return (Vec::new(), Vec::new(), kinds);
     }
 
     // Videos first, then largest first — a capped page keeps its
@@ -761,18 +889,66 @@ fn ctx_to_specs(ctx: WalkCtx, clip: Option<Clip>) -> (Vec<HoleSpec>, [u32; 3]) {
         }
     }
 
-    let specs = kept
-        .into_iter()
-        .map(|k| HoleSpec {
+    let mut specs = Vec::with_capacity(kept.len());
+    let mut tracked = Vec::with_capacity(kept.len());
+    for k in kept {
+        specs.push(HoleSpec {
             x: k.x,
             y: k.y,
             w: k.w,
             h: k.h,
             dynamic: k.is_video(),
             kind: k.kind_id(),
-        })
-        .collect();
-    (specs, kinds)
+        });
+        // A merged candidate keeps its (larger, earlier-sorted)
+        // element; None (the incremental pass) contributes nothing —
+        // there the caller already holds the elements in `tracked`.
+        if let Some(el) = k.el {
+            tracked.push(TrackedEl { el, kind: k.kind });
+        }
+    }
+    (specs, tracked, kinds)
+}
+
+/// Incremental pass (alpha.9 — see REFRESH_MS): re-read the kept
+/// candidates' rects and re-run the local selection pipeline. NO tree
+/// enumeration — each element read is one light cross-process property
+/// fetch (≤ MAX_KEEP per pass), so the browser's UI thread finally
+/// renders video instead of serving full-tree a11y serialization.
+/// Returns (specs, stale, elapsed_ms); stale = at least one element
+/// could not be read (the page changed underneath us) → the caller
+/// forces a full walk.
+fn refresh_specs(
+    tracked: &[TrackedEl],
+    clip: Option<Clip>,
+    docs: &[RECT],
+) -> (Vec<HoleSpec>, bool, u64) {
+    let t0 = std::time::Instant::now();
+    let mut stale = false;
+    let mut cands: Vec<Candidate> = Vec::with_capacity(tracked.len());
+    for t in tracked {
+        // SAFETY: plain COM property read on the tracker thread (the
+        // thread that created these objects).
+        unsafe {
+            match t.el.CurrentBoundingRectangle() {
+                Ok(rect) => cands.push(Candidate {
+                    x: rect.left,
+                    y: rect.top,
+                    w: rect.right - rect.left,
+                    h: rect.bottom - rect.top,
+                    min: MIN_MEDIA,
+                    kind: t.kind,
+                    el: None,
+                }),
+                Err(_) => stale = true,
+            }
+        }
+    }
+    if stale {
+        return (Vec::new(), true, t0.elapsed().as_millis() as u64);
+    }
+    let (specs, _, _) = finish_selection(cands, clip, docs);
+    (specs, false, t0.elapsed().as_millis() as u64)
 }
 
 /// True when the on-screen pixels under the rect look uniform (solid

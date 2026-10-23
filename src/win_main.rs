@@ -20,6 +20,9 @@ extern "system" {}
 #[cfg(windows)]
 #[link(name = "user32")]
 extern "system" {}
+#[cfg(windows)]
+#[link(name = "winmm")]
+extern "system" {}
 
 use crate::common::{init_logging, Settings, VERSION};
 use crate::holes::{HolePool, Holes};
@@ -42,6 +45,21 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, SetWindowLongPtrW, GWLP_USERDATA,
 };
+
+// =====================================================================
+// Timer resolution — the hole pump's 15ms SetTimer is only as steady
+// as the scheduler allows. Windows defaults to a 15.6ms timer
+// resolution: a 15/30ms WM_TIMER drifts on that grid and the pump
+// effectively stutters between 21–32Hz. timeBeginPeriod(1) requests
+// 1ms resolution for the lifetime of the process; timeEndPeriod(1)
+// releases it on exit.
+// =====================================================================
+
+#[link(name = "winmm")]
+extern "system" {
+    fn timeBeginPeriod(ms: u32) -> u32;
+    fn timeEndPeriod(ms: u32) -> u32;
+}
 
 // =====================================================================
 // Magnification engine (Milestone 1)
@@ -141,8 +159,26 @@ mod uia {
         CUIAutomation, IUIAutomation, IUIAutomationElement,
         TreeScope_Descendants,
         UIA_BoundingRectanglePropertyId, UIA_ControlTypePropertyId,
+        UIA_HyperlinkControlTypeId, UIA_ImageControlTypeId,
         UIA_LocalizedControlTypePropertyId, UIA_NamePropertyId,
+        UIA_CONTROLTYPE_ID,
     };
+
+    /// The probe's media census must MATCH the tracker's classifier —
+    /// a probe that sees media the tracker ignores is the worst kind
+    /// of lie. alpha.9: the movie/media/animation/thumbnail localized
+    /// strings joined the match set (see tracker::classify — windows-rs
+    /// 0.58 ships no numeric Thumbnail constant).
+    fn is_media(ct: UIA_CONTROLTYPE_ID, lct_lower: &str) -> bool {
+        if ct == UIA_ImageControlTypeId || ct == UIA_HyperlinkControlTypeId {
+            return true;
+        }
+        matches!(
+            lct_lower,
+            "image" | "graphic" | "link" | "video" | "thumbnail" | "movie"
+                | "media" | "animation" | "picture" | "photo"
+        )
+    }
 
     /// Probe the given window: returns (total_nodes, media_count, samples).
     pub fn probe(hwnd: HWND) -> (u32, u32, Vec<String>) {
@@ -298,9 +334,10 @@ mod uia {
                 .unwrap_or_default();
 
             let lct_lower = lct.to_lowercase();
-            if matches!(lct_lower.as_str(), "image" | "graphic" | "link" | "video") {
+            let ct = el.CachedControlType().unwrap_or(UIA_CONTROLTYPE_ID(0));
+            if is_media(ct, &lct_lower) {
                 *media += 1;
-                if samples.len() < 8 {
+                if samples.len() < 12 {
                     let rect = el.CachedBoundingRectangle().unwrap_or_default();
                     let n = trunc(&name, 30);
                     samples.push(format!(
@@ -355,9 +392,10 @@ mod uia {
             }
 
             let lct_lower = lct.to_lowercase();
-            if matches!(lct_lower.as_str(), "image" | "graphic" | "link" | "video") {
+            let ct = el.CurrentControlType().unwrap_or(UIA_CONTROLTYPE_ID(0));
+            if is_media(ct, &lct_lower) {
                 *media += 1;
-                if samples.len() < 8 {
+                if samples.len() < 12 {
                     let n = trunc(&name, 30);
                     samples.push(format!(
                         "[{lct}] \"{n}\" {}x{} @({},{})",
@@ -748,6 +786,11 @@ pub fn run() {
     // runs before the logger exists; its lines used to vanish.
     tracing::info!("dpi: {dpi_status}");
 
+    // alpha.9: 1ms scheduler resolution — the hole pump's 15ms SetTimer
+    // is unreliable on the default 15.6ms grid (see the header note).
+    let tbr = unsafe { timeBeginPeriod(1) };
+    tracing::info!("timer: timeBeginPeriod(1) -> {tbr} (0 = ok)");
+
     let settings = Settings::load();
     tracing::info!("settings: dimLevel={}", settings.features.dim_level);
 
@@ -866,8 +909,9 @@ pub fn run() {
             tracing::warn!("some hotkeys failed");
         }
 
-        // Hole pump — 33Hz tick on main. All Mag*/window calls run on
-        // the thread that created the windows (the F11 rule).
+        // Hole pump — ~66Hz tick on main (15ms + timeBeginPeriod(1)).
+        // All Mag*/window calls run on the thread that created the
+        // windows (the F11 rule).
         let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(
             Some(&hwnd), 1, crate::holes::PUMP_MS, None,
         );
@@ -881,6 +925,7 @@ pub fn run() {
         let _ = Shell_NotifyIconW(NIM_DELETE, &state.tray_nid);
         // Free the AppState box (leak fix — it used to live forever).
         drop(Box::from_raw(state_ptr));
+        timeEndPeriod(1);
         magnification::uninitialize();
         tracing::info!("clean exit — colors restored");
     }

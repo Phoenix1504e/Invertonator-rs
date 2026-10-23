@@ -4,7 +4,7 @@
 
 ![Invertonator](icon.svg)
 
-> **Status: v0.3.0-alpha.8** — Windows: UIA media tracker + Magnifier-API
+> **Status: v0.3.0-alpha.9** — Windows: UIA media tracker + Magnifier-API
 > true-color holes proven on hardware (1,152-node cache-request walks ·
 > 164 media elements classified · MagSetColorEffect/Source/Transform all
 > verified). Gecko browsers (Firefox/LibreWolf) supported via automatic
@@ -23,14 +23,24 @@
 > into the browser.
 > alpha.8 hole freshness + media recognition: the Magnifier control does
 > NOT live-track the screen — MagSetWindowSource IS the refresh
-> mechanism, so video holes re-source every pump tick (33Hz, the OS
-> sample's poll pattern) and static holes at ~1.7Hz, ending the
-> "video in the hole is very laggy" slideshow. The alpha.6 hard video
-> priority (any <video> → images get nothing) is replaced by per-kind
-> dominance: a YouTube watch page keeps the player AND its sidebar
-> thumbnails; a unified 80×80 gate (videos included) kills 1×1 ad
-> <video> anchors and avatar squares; hole cap raised 4→8; the tracker
-> summary now logs v/i/l candidate breakdowns.
+> mechanism, so video holes re-source every pump tick and static holes
+> at ~1.7Hz, ending the "video in the hole is very laggy" slideshow. The
+> alpha.6 hard video priority (any <video> → images get nothing) is
+> replaced by per-kind dominance: a YouTube watch page keeps the player
+> AND its sidebar thumbnails; a unified 80×80 gate (videos included)
+> kills 1×1 ad <video> anchors and avatar squares; hole cap raised 4→8.
+> alpha.9 smoothness triage round two + recognition breadth: the
+> tracker's incremental rect-refresh collapses steady-state UIA traffic
+> ~1000× (full-tree walks only on app switch / navigation / stale
+> element / 5s age — between them just the kept candidates' rects are
+> re-read), the hole pump runs at 15ms with timeBeginPeriod(1) (~66Hz
+> video re-source, per-frame on 60Hz displays), hosts are no longer
+> WS_EX_LAYERED (opaque layered windows force DWM redirection on every
+> magnifier repaint), and every 10s a `holes: stat` telemetry line
+> measures the actual tick rate and per-call MagSetWindowSource cost.
+> Recognition widens: thumbnail/movie/media/animation localized types
+> and a ClassName tag fallback (Chromium exposes HTML tag names) —
+> media outside the player no longer depends on a single string.
 > Linux (X11): global gamma-ramp inversion shipped — the
 > XComposite true-color-hole overlay is the next milestone. For the
 > **fully-featured C# edition**, see

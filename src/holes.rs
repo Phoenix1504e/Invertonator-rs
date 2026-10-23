@@ -1,9 +1,14 @@
 // Invertonator-rs — holes: the true-color hole pool + main-thread pump
 //
-//   Each hole = a layered topmost host window hosting a Magnifier-class
+//   Each hole = a plain topmost host window hosting a Magnifier-class
 //   child. The child re-captures its source region and applies the
 //   INVERT color effect — media under a hole passes through the OS
-//   inversion twice and renders in TRUE colors.
+//   inversion twice and renders in TRUE colors. (alpha.9: the host is
+//   deliberately NOT WS_EX_LAYERED — an opaque alpha-255 layered
+//   window forces every magnifier repaint through DWM redirection
+//   composition, a real smoothness tax. The proven F11 probe host was
+//   never layered; click-through comes from WS_EX_TRANSPARENT +
+//   WM_NCHITTEST→HTTRANSPARENT + WS_DISABLED, which need no layering.)
 //
 //   THREADING MODEL (v0.2.0-alpha.3 — the "F11 rule"):
 //   · Hole windows are created on the MAIN thread and stay there.
@@ -52,19 +57,35 @@
 //     sample's poll pattern), static holes every ~1.7Hz (alpha.6's
 //     proven thumbnail-freshness cadence), plus re-source on move /
 //     show / failure. The topmost re-assert rides the static cadence.
+//   · v0.3.0-alpha.9 — SMOOTHNESS TRIAGE ROUND TWO. Three compounding
+//     steady-state costs removed:
+//     (1) hosts are no longer layered (see above);
+//     (2) the pump runs at 15ms WITH timeBeginPeriod(1) (win_main) —
+//         without it a 30ms SetTimer drifts on the 15.6ms scheduler
+//         grid, so the old "33Hz" actually stuttered between 21–32Hz;
+//         15ms + 1ms resolution ≈ 66Hz re-source for video holes —
+//         per-frame on a 60Hz display;
+//     (3) the tracker's incremental rect-refresh (tracker.rs) cuts
+//         steady-state UIA traffic ~1000×, so the browser stops
+//         serving a11y serialization bursts mid-video.
+//     Every 10s the pump logs a `holes: stat` line — actual tick rate
+//     plus MagSetWindowSource call count / avg / max cost / failures.
+//     The next field log answers "is the re-source itself heavy on
+//     this machine?" in one round.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{
-    BOOL, COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+    BOOL, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, DestroyWindow, MoveWindow, RegisterClassW,
-    SetLayeredWindowAttributes, SetWindowPos, ShowWindow, HWND_TOPMOST,
-    LAYERED_WINDOW_ATTRIBUTES_FLAGS, SHOW_WINDOW_CMD, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, WNDCLASSW,
+    DefWindowProcW, DestroyWindow, GetWindowLongPtrW, GWL_EXSTYLE,
+    MoveWindow, RegisterClassW, SetWindowPos, ShowWindow, HWND_TOPMOST,
+    SHOW_WINDOW_CMD, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_SHOWWINDOW, WNDCLASSW,
 };
 use windows::core::{w, PCWSTR};
 
@@ -112,20 +133,32 @@ const WS_CHILD: u32 = 0x4000_0000;
 const WS_VISIBLE: u32 = 0x1000_0000;
 const WS_DISABLED: u32 = 0x0800_0000;
 const WS_EX_TOPMOST: u32 = 0x0000_0001;
-const WS_EX_LAYERED: u32 = 0x0008_0000;
 const WS_EX_TRANSPARENT: u32 = 0x0000_0020;
 const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
 const WS_EX_NOACTIVATE: u32 = 0x0800_0000;
-const LWA_ALPHA_FLAG: LAYERED_WINDOW_ATTRIBUTES_FLAGS =
-    LAYERED_WINDOW_ATTRIBUTES_FLAGS(2);
 const SW_HIDE_CMD: SHOW_WINDOW_CMD = SHOW_WINDOW_CMD(0);
-pub const PUMP_MS: u32 = 30;      // pump cadence (SetTimer, ms)
-/// Static-hole refresh cadence in pump ticks (20 × 30ms ≈ 600ms):
+/// Pump cadence (SetTimer, ms). alpha.9: 15ms ≈ 66Hz re-source for
+/// video holes — per-frame on a 60Hz display. Reliable ONLY together
+/// with timeBeginPeriod(1) (win_main): without it a 15/30ms SetTimer
+/// drifts on the 15.6ms scheduler grid and the effective rate
+/// stutters between 21–32Hz.
+pub const PUMP_MS: u32 = 15;
+/// Static-hole refresh cadence in pump ticks (40 × 15ms ≈ 600ms):
 /// thumbnails re-source at ~1.7Hz so late image loads and hover
-/// states land; the topmost re-assert rides the same cadence.
-/// Dynamic (video) holes re-source EVERY tick — see the alpha.8
-/// header lesson: MagSetWindowSource IS the refresh mechanism.
-const STATIC_EVERY: u64 = 20;
+/// states land. Dynamic (video) holes re-source EVERY tick — see the
+/// alpha.8 header lesson: MagSetWindowSource IS the refresh mechanism.
+const STATIC_EVERY: u64 = 40;
+/// Topmost hygiene (alpha.9): the WS_EX_TOPMOST bit is CHECKED every
+/// 40 ticks and restored immediately when missing; the unconditional
+/// z-order re-assert (a no-op SetWindowPos still wakes DWM) drops to
+/// every 120 ticks (~1.8s) — just enough that an always-on-top popup
+/// which raised itself above the holes recovers without user action.
+const TOPMOST_CHECK_EVERY: u64 = 40;
+const TOPMOST_REASSERT_EVERY: u64 = 120;
+/// Pump telemetry window (ms): actual tick rate + MagSetWindowSource
+/// call count / avg / max cost / failures, one `holes: stat` line per
+/// window (alpha.9 — see the header note).
+const STAT_EVERY_MS: u64 = 10_000;
 /// Component deltas ≤ this are UIA round-off jitter, not moves — a
 /// re-source for a 1px drift would only reset the capture pipeline.
 const MOVE_EPSILON: i32 = 1;
@@ -230,6 +263,36 @@ impl Holes {
 pub struct HolePool {
     pool: Vec<PoolHole>,
     tick: u64,
+    /// MagSetWindowSource cost accumulator — see SrcStat.
+    stat: SrcStat,
+    stat_ticks: u32,
+    stat_start: Instant,
+}
+
+/// MagSetWindowSource cost accumulator (one 10s window). The avg/max
+/// per-call μs in the field log answer whether the re-source itself
+/// is heavy on a given machine (alpha.9 telemetry).
+#[derive(Default)]
+struct SrcStat {
+    calls: u32,
+    us_total: u64,
+    us_max: u32,
+    fails: u32,
+}
+
+/// One timed MagSetWindowSource call — the pump telemetry's raw feed.
+/// SAFETY: caller guarantees main-thread context (the F11 rule).
+unsafe fn timed_source(mag: HWND, src: RECT, stat: &mut SrcStat) -> bool {
+    let t0 = Instant::now();
+    let ok = MagSetWindowSource(mag, src).as_bool();
+    let us = t0.elapsed().as_micros() as u64;
+    stat.calls += 1;
+    stat.us_total += us;
+    stat.us_max = stat.us_max.max(us.min(u32::MAX as u64) as u32);
+    if !ok {
+        stat.fails += 1;
+    }
+    ok
 }
 
 impl HolePool {
@@ -237,6 +300,7 @@ impl HolePool {
     /// windows. Runs on main at PUMP_MS cadence (SetTimer → WM_TIMER).
     pub fn pump_tick(&mut self, shared: &HolesShared) {
         self.tick += 1;
+        self.stat_ticks += 1;
         let tick = self.tick;
 
         // want_visible — the pump is the SINGLE writer of hole visibility.
@@ -268,7 +332,7 @@ impl HolePool {
                 unsafe {
                     let ok_host = MoveWindow(h.host, spec.x, spec.y, spec.w, spec.h, true).is_ok();
                     let ok_mag = MoveWindow(h.mag, 0, 0, spec.w, spec.h, true).is_ok();
-                    let ok_src = MagSetWindowSource(h.mag, src).as_bool();
+                    let ok_src = timed_source(h.mag, src, &mut self.stat);
                     h.src_ok = ok_src;
                     // alpha.6: these were silent — a failed source-set
                     // leaves the PREVIOUS region's content displayed at
@@ -327,7 +391,7 @@ impl HolePool {
                     || tick.is_multiple_of(STATIC_EVERY);
                 if want_visible && h.visible && due {
                     h.pending_src = false;
-                    let ok = MagSetWindowSource(h.mag, h.source).as_bool();
+                    let ok = timed_source(h.mag, h.source, &mut self.stat);
                     if ok != h.src_ok {
                         // Edge-logged: one line per failure onset / recovery.
                         if ok {
@@ -343,19 +407,30 @@ impl HolePool {
                         h.src_ok = ok;
                     }
                 }
-                // Topmost re-assert on the static cadence — if another
-                // topmost popup slipped above us, the hole recovers
-                // within ~600ms without user action.
+                // alpha.9 topmost hygiene: CHECK the bit, don't churn
+                // the z-order. A lost WS_EX_TOPMOST bit is restored
+                // immediately; the belt-and-suspenders re-assert (a
+                // no-op SetWindowPos still wakes DWM) rides the 1.8s
+                // cadence — enough that an always-on-top popup which
+                // raised itself above the holes recovers unattended.
                 if want_visible
                     && h.visible
-                    && tick.is_multiple_of(STATIC_EVERY)
+                    && tick.is_multiple_of(TOPMOST_CHECK_EVERY)
                 {
-                    let _ = SetWindowPos(
-                        h.host,
-                        HWND_TOPMOST,
-                        0, 0, 0, 0,
-                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                    );
+                    // SAFETY: plain style read on the owning thread.
+                    let ex = GetWindowLongPtrW(h.host, GWL_EXSTYLE) as u32;
+                    let lost = ex & WS_EX_TOPMOST == 0;
+                    if lost || tick.is_multiple_of(TOPMOST_REASSERT_EVERY) {
+                        let _ = SetWindowPos(
+                            h.host,
+                            HWND_TOPMOST,
+                            0, 0, 0, 0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                        );
+                        if lost {
+                            tracing::warn!("holes: #{} topmost bit lost — restored", i);
+                        }
+                    }
                 }
             }
         }
@@ -368,6 +443,32 @@ impl HolePool {
                 }
                 h.visible = false;
             }
+        }
+
+        // alpha.9 pump telemetry — one line per 10s window: the ACTUAL
+        // tick rate (is WM_TIMER starving?) plus how many re-source
+        // calls fired and what each cost (is the capture pipeline the
+        // bottleneck on this machine?).
+        let stat_elapsed = self.stat_start.elapsed();
+        if stat_elapsed >= Duration::from_millis(STAT_EVERY_MS) {
+            let win_ms = stat_elapsed.as_millis().max(1);
+            let hz = self.stat_ticks as u64 * 1000 / win_ms as u64;
+            let avg = if self.stat.calls > 0 {
+                self.stat.us_total / self.stat.calls as u64
+            } else {
+                0
+            };
+            tracing::info!(
+                "holes: stat hz={} src={} avg={}us max={}us fail={}",
+                hz,
+                self.stat.calls,
+                avg,
+                self.stat.us_max,
+                self.stat.fails
+            );
+            self.stat = SrcStat::default();
+            self.stat_ticks = 0;
+            self.stat_start = Instant::now();
         }
     }
 }
@@ -434,7 +535,7 @@ unsafe fn create_pool() -> HolePool {
     let mut pool: Vec<PoolHole> = Vec::with_capacity(MAX_HOLES);
     for _ in 0..MAX_HOLES {
         let host = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW
+            WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW
                 | WS_EX_NOACTIVATE,
             HOST_CLASS.as_ptr(),
             w!("Invertonator hole").as_ptr(),
@@ -452,12 +553,6 @@ unsafe fn create_pool() -> HolePool {
             );
             break;
         }
-        let _ = SetLayeredWindowAttributes(
-            host,
-            COLORREF(0),
-            255,
-            LWA_ALPHA_FLAG,
-        );
 
         let mag = CreateWindowExW(
             0,
@@ -495,5 +590,11 @@ unsafe fn create_pool() -> HolePool {
         });
     }
 
-    HolePool { pool, tick: 0 }
+    HolePool {
+        pool,
+        tick: 0,
+        stat: SrcStat::default(),
+        stat_ticks: 0,
+        stat_start: Instant::now(),
+    }
 }

@@ -1,4 +1,4 @@
-# Invertonator-rs — Full Source Package (v0.3.0-alpha.8, cross-platform)
+# Invertonator-rs — Full Source Package (v0.3.0-alpha.9, cross-platform)
 
 Complete repo at a fixed state — extract over your clone, commit, push.
 No `.git` inside, your history is untouched.
@@ -13,7 +13,7 @@ Easiest path (clone already on disk at `C:\Users\admin\invertonator-push`):
 cd C:\Users\admin\invertonator-push
 Expand-Archive -Path "$env:USERPROFILE\Downloads\Invertonator-rs-full-source.zip" -DestinationPath . -Force
 git add -A
-git commit -m "v0.3.0-alpha.8: hole freshness (MagSetWindowSource IS the refresh) + per-kind media selection"
+git commit -m "v0.3.0-alpha.9: incremental UIA refresh + 66Hz unlayered hole pump + classifier breadth"
 git push origin HEAD
 ```
 
@@ -22,122 +22,135 @@ binary). Keep the `.gitignore` this package ships (`/target`, `*.exe`) —
 without it, `git add -A` after a local build would sweep thousands of
 `target/` build artifacts into your GitHub repo.
 
----
-
-## What alpha.8 fixes (your alpha.7 report)
-
-> "the video in the hole is very laggy and other media are not
-> recognised in the youtube app"
-
-Two separate root causes, both fixed:
-
-### 1. The hole-content slideshow ("video in the hole is very laggy")
-
-alpha.7 stopped refreshing hole content except on moves/shows/failures
-plus a 3s watchdog, based on a wrong assumption: that the Magnifier
-control live-tracks the screen after one `MagSetWindowSource` call.
-Your report disproved it — a playing video's rect never moves, so its
-hole only advanced once per watchdog tick (~0.33Hz = a slideshow).
-The OS Magnifier sample itself re-calls `MagSetWindowSource` on every
-timer tick; that call IS the API's refresh mechanism, not churn.
-(The real alpha.4–6 lag driver was the tracker's UIA COM storm, which
-alpha.7 genuinely fixed — adaptive cadence + one-pass bulk cache.)
-
-**Fix — corrected freshness policy in the hole pump:**
-- video holes: re-source EVERY pump tick (33Hz — the OS sample's poll
-  pattern; one small region, cheap),
-- static holes: every ~600ms (1.7Hz — keeps thumbnails fresh when
-  images load late or hovers change them),
-- plus re-source on move / show, failure edge-logging unchanged,
-- topmost re-assert rides the static cadence.
-
-### 2. "Other media are not recognised" on YouTube
-
-alpha.6 had a hard VIDEO PRIORITY: when ANY `<video>` element existed
-on the page, ALL image/link candidates were discarded. On a YouTube
-watch page the player is a `<video>` → the player kept its hole while
-every sidebar video-thumbnail got nothing. Exactly what you saw.
-
-**Fix — per-kind selection replaces hard priority:**
-- per-kind dominance: within each kind (video / image / link),
-  candidates keep a hole when they are ≥ 20% of the largest candidate
-  OF THAT KIND. Watch page = player AND its sidebar thumbnails; a
-  uniform thumbnail grid keeps its peers.
-- unified 80×80px gate for ALL kinds including video: 1×1 ad-tracking
-  `<video>` elements and 40–64px avatar/icon squares can never anchor
-  a hole (this is what keeps the "small squares" bug dead).
-- videos sort first before the hole cap — a capped page keeps its
-  player before its thumbnails.
-- hole cap raised 4 → 8 (pool is 16; static holes are cheap).
-
-Also: the `tracker:` summary line now includes `v=/i=/l=` — the video/
-image/link candidate counts that entered selection. A zero there means
-the walk never SAW that kind; a nonzero with `holes=0` means selection
-dropped it. One log round now pinpoints any remaining recognition gap.
+**IMPORTANT — verify you are running the new build:** the FIRST line of
+`%LOCALAPPDATA%\Invertonator\log.txt` must read
+`=== Invertonator-rs v0.3.0-alpha.9 ===`. If it says alpha.8, the old exe
+ran — re-download the CI artifact and start that one.
 
 ---
+
+## What alpha.9 fixes (your alpha.8 report)
+
+> "still very laggy and still doesnt recognises the media outside
+> the player"
+
+Two separate root causes attacked, plus a telemetry line that makes the
+next round one-log-diagnosable either way.
+
+### 1. "Still very laggy" — the browser was drowning in a11y queries
+
+alpha.7/8 fixed the COM-per-node storm, but the tracker still did a FULL
+tree walk (one `FindAllBuildCache` over every node on the page) every
+400ms–1.6s. On a YouTube-sized page (~4k nodes) that is a huge
+serialization burst served by the **browser's UI thread** — the thread
+that renders the video. Even at 1.6s intervals that's recurring jank
+exactly where you see it: in the video.
+
+**Fix — incremental rect-refresh steady state:**
+- The heavy full walk now runs ONLY on real triggers: app switch,
+  navigation (title change), window move/resize, a stale element, or
+  every 5s.
+- Between full walks, a light pass every 250ms re-reads ONLY the kept
+  holes' rectangles (≤ 8 tiny cross-process reads) and re-runs the local
+  selection math. Steady-state UIA traffic drops ~1000×.
+- The `tracker:` summary line now carries `mode=full` / `mode=incr` and
+  `refresh=Nms` so the log shows both passes.
+
+**Plus three hole-rendering fixes:**
+- The pump now runs at **15ms with timeBeginPeriod(1)** — without that
+  call a 30ms timer drifts on the 15.6ms scheduler grid, so the old
+  "33Hz" actually stuttered between 21–32Hz. Now video holes re-source
+  at ~66Hz = per-frame on a 60Hz display.
+- Hole hosts are **no longer WS_EX_LAYERED** — an opaque alpha-255
+  layered window forces every magnifier repaint through DWM redirection
+  composition. The proven F11 probe host was never layered; nothing
+  needed layering. Pure overhead, gone.
+- Topmost hygiene is now bit-gated (the WS_EX_TOPMOST style is checked
+  and restored only when actually lost; the unconditional z-order
+  re-assert dropped from every 600ms to every ~1.8s).
+
+**New telemetry — the `holes: stat` line, every 10s:**
+`holes: stat hz=66 src=66 avg=180us max=900us fail=0`
+- `hz` = the pump's ACTUAL tick rate (timer starvation check)
+- `src` / `avg` / `max` = how many `MagSetWindowSource` refreshes fired
+  and what each cost on YOUR machine
+- `fail` = failed refresh calls
+If video is still not smooth, this one line says whether the re-source
+itself is the bottleneck (high avg/max) or something else (low avg).
+
+### 2. "Doesn't recognise media outside the player" — classifier was too narrow
+
+alpha.8's per-kind selection fixed the DROPPING side, but the SEEING
+side still only knew four localized strings ("video", "graphic",
+"image", "link") plus two numeric types. Media exposed under any other
+name never even became a candidate.
+
+**Fix — wider net at the SEEING stage:**
+- `thumbnail` / `movie` / `media` / `animation` / `picture` / `photo`
+  localized control types now classify (video-ish → video kind, the
+  rest → image kind).
+- **ClassName fallback**: Chromium reports the HTML tag name as the UIA
+  ClassName — so a `<video>` whose provider skips the localized string
+  still classifies via class name "Video".
+- The cache request now also fetches ClassName (one extra property in
+  the same single cross-process pass — no extra traffic).
+- The F10 probe census matches the same rules, so a probe in the
+  YouTube app shows exactly what the tracker CAN see.
+- alpha.9 also unifies document-pane scoping onto the cached walk path
+  (it previously only applied to the live-fallback path) — browser
+  chrome can no longer produce holes on either path.
+
+Still not recognized after this? The log now pins down WHERE it dies:
+`v=/i=/l=` = how many video/image/link candidates entered selection;
+`holes=` = how many survived. A zero count = the walk never saw it (send
+the F10 census — it prints the provider's LocalizedControlType
+inventory); nonzero with `holes=` too low = selection dropped it.
+
+---
+
+## Test checklist (copy into your reply)
+
+1. First log line says `v0.3.0-alpha.9`? (yes/no)
+2. `dpi:` line says "per-monitor-v2 aware"? `dpi: system=?/window=?`
+3. Play a YouTube video ~30s, then send the WHOLE log.txt. It should
+   contain `holes: stat` lines (every ~10s) and `tracker:` lines with
+   `mode=full` / `mode=incr`.
+4. In the YouTube app (the page where media outside the player is
+   missing), press **F10 once**, then **F2 to quit** (flushes the log),
+   restart the app if you want, and send log.txt. The `uia-probe live
+   census` lines list every control-type string the app exposes — that
+   inventory decides the next classifier widening if needed.
+5. Smoothness verdict: smoother / same / worse than alpha.8.
 
 ## File map (14 files, latest state)
 
-| # | File | Status | What it is |
-|---|------|--------|-----------|
-| 1 | `src/main.rs` | unchanged | Thin per-OS dispatcher |
-| 2 | `src/win_main.rs` | unchanged | Windows backend — Magnifier API, UIA probe, tray, hotkeys, DPI |
-| 3 | `src/common.rs` | **alpha.8** | Settings, logging — version 0.3.0-alpha.8 |
-| 4 | `src/linux.rs` | unchanged | Linux X11 backend: XRandR gamma + `--self-test` |
-| 5 | `src/holes.rs` | **alpha.8** | Freshness policy: video holes 33Hz, static 1.7Hz, topmost re-assert |
-| 6 | `src/tracker.rs` | **alpha.8** | Per-kind dominance, unified 80px gate, videos-first cap, v/i/l log |
-| 7 | `src/scrollhook.rs` | unchanged | Wheel-recency signal (alpha.7) |
-| 8 | `Cargo.toml` | **EDITED** | v0.3.0-alpha.8 |
-| 9 | `Cargo.lock` | **EDITED** | regenerated to match |
-| 10 | `.github/workflows/build.yml` | unchanged | windows-latest + ubuntu-latest matrix |
-| 11 | `README.md` | **EDITED** | alpha.8 status note |
-| 12 | `docs/LINUX-TESTING.md` | unchanged | Linux tester runbook |
-| 13 | `APPLY.md` | **EDITED** | this file |
-| 14 | `.gitignore` | unchanged | `/target`, `*.exe` — keep it |
+```
+Cargo.toml            0.3.0-alpha.9 (windows+linux deps, lto release)
+Cargo.lock            pinned
+.gitignore            /target, *.exe — keep, protects your clone
+README.md             status + build matrix + hotkeys
+APPLY.md              this file
+docs/LINUX-TESTING.md X11 runbook (--self-test + live checklist)
+src/main.rs           cross-platform entry
+src/common.rs         settings.json + logging + VERSION
+src/win_main.rs       Windows backend (tray, hotkeys, UIA probe,
+                      mag probe, DPI, timeBeginPeriod)
+src/holes.rs          hole pool + main-thread pump (15ms, telemetry)
+src/tracker.rs        UIA media discovery (full walk + incremental
+                      refresh, classifier, selection pipeline)
+src/scrollhook.rs     low-level wheel hook (scroll-hold, wake signals)
+src/linux.rs          X11 XRandR gamma-ramp inversion + --self-test
+icon.svg              logo (README)
+```
 
----
+## After testing
 
-## Linux (X11) — unchanged from alpha.3
+Send back:
+1. the full `%LOCALAPPDATA%\Invertonator\log.txt` (quit with **F2**
+   first so everything is flushed to disk),
+2. your test checklist answers,
+3. what you saw (holes where? laggy? which app/page?).
 
-- XRandR CRTC gamma ramps: `[0..255] → [255..0]` at scanout — below the
-  web layer, so sites still can't see it.
-- Starts INVERTED. `Ctrl+Alt+I` toggles, `Ctrl+Alt+Q` quits (both
-  restore your original ramps; Drop does it even on panic).
-- `invertonator --restore` — recovery after a SIGKILL while inverted.
-- `invertonator --self-test` — one-command diagnostic; exit 0 =
-  machine supported.
-- Media is inverted too for now (true-color holes = v2, XComposite).
-- Wayland sessions are detected and refused with a clear message.
-
----
-
-## Validation status of this package
-
-- `cargo check` + `cargo clippy`: ZERO warnings on both
-  `x86_64-pc-windows-msvc` and `x86_64-unknown-linux-gnu`.
-- Linux release build + `--self-test` runs clean.
-- CI builds both artifacts after your push.
-
----
-
-## Test checklist (Windows, alpha.8)
-
-1. Quit any running instance: `Ctrl+Alt+F2`.
-2. Optional clean log: delete `%LOCALAPPDATA%\Invertonator\log.txt`.
-3. Start the new exe → screen inverts.
-4. YouTube WATCH page (Chrome or LibreWolf) → the player hole's video
-   should now advance smoothly (this is the main fix — alpha.7 updated
-   it once per ~3s).
-5. Same watch page → the sidebar video thumbnails should NOW get holes
-   too (per-kind dominance). Expect roughly: 1 video hole + a few
-   thumbnail holes, up to 8 total.
-6. YouTube HOME grid → up to 8 thumbnail holes, still no tiny squares
-   (80px gate) and no giant Frankenstein rects.
-7. Let it sit ~1 minute, then check `tracker:` lines: the `v= i= l=`
-   counts should be nonzero on YouTube (e.g. `v=1 i=7 l=0` on a watch
-   page), and `iv=` should climb to 1600ms while idle.
-8. Confirm nothing regressed: holes still topmost after clicking into
-   the browser; scrolling still hides holes during the flick.
-9. Send the whole `log.txt` either way — the `v=/i=/l=` breakdown plus
-   the `holes:` lines answer "saw vs kept" in one round.
+The log's `mode=full|incr`, `holes: stat`, `v=/i=/l=`, and the probe
+census together pinpoint any remaining issue in ONE round — no more
+guessing.
