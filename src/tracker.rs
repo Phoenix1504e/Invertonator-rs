@@ -58,13 +58,18 @@
 //       chain across a real page gutter — this keeps the alpha.7
 //       mega-hole dead: grid thumbnails carry distinct video
 //       titles, so no transitive chain can cross a gutter.
-//   · Walk-tax discipline (alpha.9 — the "video is still laggy"
-//     half): every walk makes the provider (Chromium) serialize its
-//     a11y tree, and that tax competes with the video renderer. So:
-//     while a DYNAMIC hole is live the cadence floor is 1000ms and
-//     the stable backoff cap is 3000ms (a playing video's layout is
-//     static — 2.5Hz re-discovery bought nothing and stuttered the
-//     page), and the starvation live-walk cooldown widened 2s → 5s.
+//   · Walk-tax discipline (alpha.9, tightened in alpha.10): every
+//     walk makes the provider (Chromium) serialize its a11y tree, and
+//     that tax competes with the video renderer. While a DYNAMIC hole
+//     is live the cadence floor is 800ms; the stable backoff cap is
+//     1500ms — alpha.9's 3000ms cap let holes go STALE for seconds
+//     after every scroll (the "too many rectangles and on random
+//     places" regression). Freshness is enforced by the WAKE LOOP
+//     (alpha.10): the discovery nap is sliced into 50ms steps and cut
+//     short the moment a scroll burst ends, a wheel fires, or the
+//     foreground window moves/resizes/changes — the next walk happens
+//     ~50ms later, whatever the backoff was. The starvation live-walk
+//     cooldown stays widened 2s → 5s (alpha.9).
 //   · Giant filter: a NON-dynamic candidate covering ≥ 85% of the
 //     foreground window is clamped garbage or a page wrapper — it
 //     would absorb the entire clustering. Dropped.
@@ -97,10 +102,15 @@ use crate::holes::{HoleSpec, Holes, MAX_HOLES};
 const DISCOVERY_MS: u64 = 400; // active cadence (page changing)
 const MAX_DISCOVERY_MS: u64 = 1500; // idle backoff cap (page stable)
                                     // alpha.9 — while a DYNAMIC hole is live (video playing) the walk tax
-                                    // lands on the browser's renderer. The player's layout does not change
-                                    // while it plays, so discovery can breathe: 1s floor, 3s backoff cap.
-const DISCOVERY_PLAYING_MS: u64 = 1000;
-const MAX_DISCOVERY_PLAYING_MS: u64 = 3000;
+                                    // lands on the browser's renderer, so discovery breathes. alpha.10 —
+                                    // the CAP stays at 1500ms: the pump re-shows holes ~350ms after a
+                                    // scroll ends with whatever specs are published, so a longer backoff
+                                    // means visible holes at STALE coordinates (the alpha.9 "too many
+                                    // rectangles and on random places" regression). Moment-to-moment
+                                    // freshness is the WAKE LOOP's job; the backoff only saves tax while
+                                    // nothing changes.
+const DISCOVERY_PLAYING_MS: u64 = 800;
+const MAX_DISCOVERY_PLAYING_MS: u64 = 1500;
 const MIN_MEDIA: i32 = 64; // image/graphic AND video min w and h (px)
 const MIN_LINK: i32 = 96; // hyperlink min w and h (px)
 const MIN_HOLE: i32 = 32; // final hole min — degenerate slivers out
@@ -116,11 +126,17 @@ const MAX_DEPTH: u32 = 60; // alpha.4 capped at 25 — YouTube runs deeper
 const LIVE_COOLDOWN_MS: u64 = 5000; // starvation live-walk throttle
                                     // (alpha.9: was 2s — the live FindAll is the
                                     // HEAVIEST walk; every 2s it stuttered the video)
+const SLEEP_SLICE_MS: u64 = 50; // wake-loop nap slice (alpha.10)
 
 /// One-shot flag: the Gecko live-fallback notice is logged exactly once
 /// per process (discovery ticks every 400ms — per-tick logs would spam
 /// log.txt at 150 lines/minute).
 static FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// alpha.10 — wake signal: the discovery nap ends early whenever this
+/// is set. Raised by set_enabled(true) so F5-ON produces holes in ~50ms
+/// instead of after one full interval sleep.
+static WAKE: AtomicBool = AtomicBool::new(false);
 
 // =====================================================================
 // Public API
@@ -161,7 +177,11 @@ impl Tracker {
     /// and idle. Called from apply_mode (holes exist in Invert only).
     pub fn set_enabled(&self, on: bool) {
         self.enabled.store(on, Ordering::Relaxed);
-        if !on {
+        if on {
+            // alpha.10: don't wait out the current nap — walk now, so
+            // F5-ON puts holes on screen in ~50ms.
+            WAKE.store(true, Ordering::Relaxed);
+        } else {
             // Immediate clear — don't wait for the discovery tick.
             self.holes.set_specs(Vec::new());
         }
@@ -207,6 +227,13 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
     let mut last_fg: usize = 0;
     let mut interval = DISCOVERY_MS;
     let mut last_beat = std::time::Instant::now();
+    // alpha.10 wake-loop state: the fg window rect as of the last walk
+    // (a moved/resized fg window invalidates every hole — they are
+    // absolute-screen rects) and the previous hold_active() sample
+    // (a scroll burst ENDING is the moment holes reappear and MUST be
+    // re-synced immediately).
+    let mut last_fg_rect = RECT::default();
+    let mut was_hold = false;
     // Warm-up + live-walk state (alpha.6): the warm-up runs once per
     // foreground window; the starvation live-walk is throttled.
     let mut warm_fg: usize = 0;
@@ -307,6 +334,10 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
             }
             last_fg = fg.0 as usize;
             last_rects = rects;
+            let mut fr = RECT::default();
+            if unsafe { GetWindowRect(fg, &mut fr) }.is_ok() {
+                last_fg_rect = fr;
+            }
 
             // OBSERVABILITY (alpha.4): log on foreground change, on
             // holes appearing/vanishing, or every 10s as a heartbeat.
@@ -327,7 +358,65 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
             holes.set_specs(Vec::new());
             had_specs = false;
         }
-        std::thread::sleep(Duration::from_millis(interval));
+        // WAKE LOOP (alpha.10 — the "random places" fix): nap in 50ms
+        // slices instead of one long sleep, and cut the nap short the
+        // moment the published hole set may have gone stale:
+        //   · a scroll burst ENDED (hold true→false) — the pump is
+        //     about to re-show holes that still sit at pre-scroll
+        //     coordinates; walking now re-syncs them within ~50ms;
+        //   · a wheel fired with no hold live (belt-and-suspenders —
+        //     the scroll hook sets the dirty flag alongside the hold);
+        //   · the foreground window moved / resized / changed — holes
+        //     are absolute-screen rects, a moved window invalidates
+        //     every one of them;
+        //   · set_enabled(true) raised WAKE — F5-ON shows holes fast.
+        // alpha.9 slept straight through all of this (backoff up to
+        // 3s), so after each scroll the pump re-showed STALE holes —
+        // "too many rectangles and on random places". While a burst is
+        // LIVE the checks stay quiet: holes are hidden anyway and a
+        // walk mid-flick is pure browser tax.
+        let mut remaining = interval;
+        while remaining > 0 && !stop.load(Ordering::Relaxed) {
+            let enabled_now = enabled.load(Ordering::Relaxed);
+            let mut wake = WAKE.swap(false, Ordering::Relaxed);
+            if enabled_now && !wake {
+                let holding = crate::scrollhook::hold_active();
+                if holding {
+                    // Mid-burst: swallow the dirty flag, wait for the
+                    // burst-end transition to do the walk.
+                    was_hold = true;
+                    let _ = crate::scrollhook::take_page_dirty();
+                } else {
+                    if was_hold || crate::scrollhook::take_page_dirty() {
+                        wake = true;
+                    }
+                    was_hold = false;
+                }
+                if !wake {
+                    let w = unsafe { GetForegroundWindow() };
+                    let wu = w.0 as usize;
+                    if last_fg != 0 && wu != last_fg {
+                        wake = true;
+                    } else if wu == last_fg && !w.is_invalid() {
+                        let mut r = RECT::default();
+                        if unsafe { GetWindowRect(w, &mut r) }.is_ok()
+                            && (r.left != last_fg_rect.left
+                                || r.top != last_fg_rect.top
+                                || r.right != last_fg_rect.right
+                                || r.bottom != last_fg_rect.bottom)
+                        {
+                            wake = true;
+                        }
+                    }
+                }
+            }
+            if wake {
+                break;
+            }
+            let step = remaining.min(SLEEP_SLICE_MS);
+            std::thread::sleep(Duration::from_millis(step));
+            remaining -= step;
+        }
     }
     tracing::info!("tracker: stopped");
 }

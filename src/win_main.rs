@@ -798,11 +798,15 @@ fn write_diag_file(report: &str) -> Option<String> {
 /// file. F10 and the F5 auto-dump share this path.
 fn run_diagnostics(hwnd: HWND, holes: &Holes) {
     let target = unsafe { GetForegroundWindow() };
+    // Snapshot the hole set NOW, on the calling thread — the probe
+    // takes seconds and the tracker may re-walk meanwhile (the user
+    // may alt-tab / scroll); the report must describe the holes the
+    // user is looking at at request time.
+    let hole_specs = holes.shared.specs.lock().unwrap().clone();
     // HWND wraps a raw pointer (not Send) — cross the thread boundary
     // as usize and rebuild the wrappers inside.
     let hwnd_raw = hwnd.0 as usize;
     let target_raw = target.0 as usize;
-    let holes = holes.clone();
     let _ = std::thread::Builder::new()
         .name("diagnostics".into())
         .spawn(move || {
@@ -813,7 +817,6 @@ fn run_diagnostics(hwnd: HWND, holes: &Holes) {
             for s in &samples {
                 tracing::info!("  media sample: {s}");
             }
-            let hole_specs = holes.shared.specs.lock().unwrap().clone();
             let report = probe_report(target, total, media, &samples, &hole_specs);
             let copied = copy_to_clipboard(&report);
             let file = write_diag_file(&report);
@@ -1084,6 +1087,12 @@ pub fn run() {
         let state = &mut *state_ptr;
 
         state.apply_mode();
+
+        // alpha.10: diagnostics deliver themselves on FIRST launch too
+        // — 10s in (enough time to switch to the browser), no keypress
+        // needed. Every F5-ON re-arms the 3s timer; F10 re-dumps at
+        // will. The report goes to clipboard + Desktop file.
+        let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(&hwnd), 2, 10_000, None);
 
         let mut nid = NOTIFYICONDATAW {
             cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,

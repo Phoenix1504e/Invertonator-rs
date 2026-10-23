@@ -13,10 +13,11 @@
 //   system-wide).
 //
 //   This covers wheel scrolling. Scrollbar dragging and keyboard
-//   (PgDn/Space) scrolling are NOT hooked — adaptive cadence (v0.2
-//   roadmap) is the general answer there.
+//   (PgDn/Space) scrolling are NOT hooked — the tracker's wake-on-
+//   demand loop (alpha.10) plus fg-rect polling is the general answer
+//   there.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
@@ -32,6 +33,18 @@ use windows::Win32::UI::WindowsAndMessaging::{
 pub const HOLD_BURST_MS: u64 = 350;
 
 static HOLD_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+
+/// alpha.10 — set on EVERY wheel event: the page content under the
+/// holes is about to move, so the hole set is going stale. The tracker
+/// consumes this flag and re-walks the moment the scroll burst ends
+/// (walking DURING the burst is wasted browser tax — the pump keeps
+/// the holes hidden anyway).
+static PAGE_DIRTY: AtomicBool = AtomicBool::new(false);
+
+/// True (once) if a wheel event fired since the last call.
+pub fn take_page_dirty() -> bool {
+    PAGE_DIRTY.swap(false, Ordering::Relaxed)
+}
 
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -50,6 +63,7 @@ unsafe extern "system" fn hook_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) 
         let msg = wparam.0 as u32;
         if msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL {
             HOLD_UNTIL_MS.store(now_ms().saturating_add(HOLD_BURST_MS), Ordering::Relaxed);
+            PAGE_DIRTY.store(true, Ordering::Relaxed);
         }
     }
     CallNextHookEx(None, ncode, wparam, lparam)
