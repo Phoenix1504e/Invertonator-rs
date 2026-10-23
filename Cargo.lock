@@ -72,7 +72,7 @@ dependencies = [
 
 [[package]]
 name = "invertonator"
-version = "0.3.0-alpha.10"
+version = "0.3.0-alpha.11"
 dependencies = [
  "dirs",
  "serde",

@@ -18,6 +18,14 @@
 //   MagSetWindowSource (expensive pipeline rebuild) is reserved for
 //   rect changes, re-shows and the rare static self-heal.
 //
+//   EVIDENCE RULE (alpha.11): specs are TRUSTED ONLY WHILE FRESH —
+//   the pump hides every hole whose spec set has not been
+//   re-confirmed by a completed walk within STALE_SPEC_AGE. A hole
+//   can therefore never outlive its evidence, whatever happens to
+//   the tracker thread (a UIA walk wedged in a tearing-down browser
+//   provider is the classic case — it used to freeze the last hole
+//   set on screen forever).
+//
 //   THREADING MODEL (v0.2.0-alpha.3 — the "F11 rule"):
 //   · Hole windows are created on the MAIN thread and stay there.
 //     Windows cannot move between threads: the OS ties every HWND to
@@ -45,6 +53,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{BOOL, COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -111,6 +120,19 @@ const STATIC_EVERY: u64 = 600; // static-hole self-heal ~18s (was ~6s —
                                // a pipeline reset on a misclassified
                                // video hole is a visible 6s stutter)
 pub const MAX_HOLES: usize = 16;
+// EVIDENCE TTL (alpha.11): a published hole set is only trusted for
+// this long since the LAST completed walk re-confirmed it. Normal
+// publish gaps are ≤1.5s (backoff cap) + walk time; a wedged provider
+// (tab teardown is the classic case — cross-process UIA calls into a
+// browser that is destroying/rebuilding its accessibility tree can
+// block for a very long time) stops publishes entirely, and the pump
+// would otherwise keep showing the last spec set FOREVER — the
+// "holes are permanent even after shifting tabs" report. With the TTL
+// a hole can never outlive its evidence: 8s after the last completed
+// walk every hole hides until fresh specs arrive. 8s sits well above
+// the worst legitimate gap (1.5s backoff + a pathological ~3s walk)
+// yet caps the damage of a wedged walk.
+const STALE_SPEC_AGE: Duration = Duration::from_millis(8000);
 
 // CAPTURE MODEL (alpha.6 — measured, not assumed):
 // the "Magnifier" control does NOT stream its source region on its
@@ -163,6 +185,14 @@ pub struct Holes {
 pub struct HolesShared {
     // The desired hole set — written by the tracker, read by the pump.
     pub specs: Mutex<Vec<HoleSpec>>,
+    /// Wall-clock stamp of the last publish (alpha.11). set_specs is
+    /// called exactly once per COMPLETED walk — empty results count —
+    /// so this is the pump's independent evidence clock: it advances
+    /// only while the tracker thread is alive AND its walks complete.
+    /// The pump expires the whole hole set when the stamp ages past
+    /// STALE_SPEC_AGE, whatever wedged the tracker (hung provider,
+    /// panicking thread — both freeze specs without it).
+    pub published_at: Mutex<Instant>,
     pub active: AtomicBool, // false = holes hidden (Dim/Off)
     pub pierce: AtomicBool, // manual hide-all (F7)
     pub hold: AtomicBool,   // scroll-hold (holes hidden during flicks)
@@ -179,6 +209,7 @@ impl Holes {
 
         let shared = Arc::new(HolesShared {
             specs: Mutex::new(Vec::new()),
+            published_at: Mutex::new(Instant::now()),
             active: AtomicBool::new(true),
             pierce: AtomicBool::new(false),
             hold: AtomicBool::new(false),
@@ -189,8 +220,12 @@ impl Holes {
 
     /// Replace the desired hole set (screen physical px). Call at
     /// discovery cadence. Surplus holes are hidden automatically.
+    /// ALSO re-stamps the evidence clock — every completed walk (even
+    /// one that found nothing) is fresh evidence that the tracker is
+    /// alive and its view of the screen is current.
     pub fn set_specs(&self, specs: Vec<HoleSpec>) {
         *self.shared.specs.lock().unwrap() = specs;
+        *self.shared.published_at.lock().unwrap() = Instant::now();
     }
 
     /// Scroll-hold: holes vanish while set (manual API; the automatic
@@ -216,6 +251,9 @@ impl Holes {
 pub struct HolePool {
     pool: Vec<PoolHole>,
     tick: u64,
+    /// alpha.11 — logs the stale-latch and recovery transitions once
+    /// each instead of every 30ms tick.
+    stale_latched: bool,
 }
 
 impl HolePool {
@@ -225,12 +263,33 @@ impl HolePool {
         self.tick += 1;
         let tick = self.tick;
 
+        // EVIDENCE TTL (alpha.11): the pump never trusts a spec set
+        // older than STALE_SPEC_AGE. This is deliberately judged HERE,
+        // on the main thread, from its own wall clock — independent of
+        // the tracker thread's health. A wedged tracker (cross-process
+        // UIA call into a tearing-down browser blocks indefinitely; a
+        // panicking thread) freezes the last specs, and without this
+        // check the pump would show them forever — the "holes are
+        // permanent even after shifting tabs" report.
+        let fresh = shared.published_at.lock().unwrap().elapsed() < STALE_SPEC_AGE;
+        if !fresh && !self.stale_latched {
+            self.stale_latched = true;
+            tracing::warn!(
+                "holes: spec evidence stale (no completed walk in {}s) — hiding all holes until the tracker publishes fresh evidence",
+                STALE_SPEC_AGE.as_secs()
+            );
+        } else if fresh && self.stale_latched {
+            self.stale_latched = false;
+            tracing::info!("holes: fresh spec evidence — holes re-enabled");
+        }
+
         // want_visible — the pump is the SINGLE writer of hole visibility.
         // Scroll-hold fires from the WH_MOUSE_LL hook (see scrollhook).
         let want_visible = shared.active.load(Ordering::Relaxed)
             && !shared.pierce.load(Ordering::Relaxed)
             && !shared.hold.load(Ordering::Relaxed)
-            && !crate::scrollhook::hold_active();
+            && !crate::scrollhook::hold_active()
+            && fresh;
 
         let specs = shared.specs.lock().unwrap().clone();
 
@@ -416,5 +475,9 @@ unsafe fn create_pool() -> HolePool {
         });
     }
 
-    HolePool { pool, tick: 0 }
+    HolePool {
+        pool,
+        tick: 0,
+        stale_latched: false,
+    }
 }

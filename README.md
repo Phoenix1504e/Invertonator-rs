@@ -4,27 +4,33 @@
 
 ![Invertonator](icon.svg)
 
-> **Status: v0.3.0-alpha.10** — Windows: UIA media tracker + Magnifier-API
+> **Status: v0.3.0-alpha.11** — Windows: UIA media tracker + Magnifier-API
 > true-color holes proven on hardware (1,152-node cache-request walks ·
 > 164 media elements classified · MagSetColorEffect/Source/Transform all
 > verified). Gecko browsers (Firefox/LibreWolf) supported via automatic
 > live-walk fallback when a provider leaves CachedChildren empty.
-> alpha.9 fixes the two alpha.8 symptoms: (1) hole-merge is SAME-NAME
-> gated — unnamed fragments AND fragments sharing one accessible name
-> merge across seams up to ~6% of their size (alpha.8's named→8px floor
-> fragmented the player again), while differently-named media keeps the
-> 8px floor so grid thumbnails can never chain into a mega-hole; (2)
-> lag is gone by construction — every hole is poked ~33Hz regardless of
-> classification (a video fragment mislabeled as image/graphic used to
-> refresh at 6.6Hz), the static self-heal moved 6s → 18s, discovery
-> breathes at 1–3s while a video hole is live, and the starvation
-> live-walk cooldown widened 2s → 5s.
-> Diagnostics now deliver THEMSELVES: 3s after inversion comes ON (or
-> on F10) the full report goes to the clipboard AND a Desktop file
-> (invertonator-diagnostics.txt) — paste it into the bug report.
-> alpha.6-8 fixes kept: per-window UIA warm-up (Chromium hands out a
-> partial tree), 64px media gates, deterministic hole ordering, giant
-> candidate filter, F10 clipboard reports.
+> alpha.11 makes stale holes structurally impossible: (1) EVIDENCE TTL —
+> the pump hides every hole whose spec set was not re-confirmed by a
+> completed walk within 8s, so a walk wedged inside a browser that is
+> tearing down its accessibility provider (classic after a tab switch)
+> degrades to "no holes" and self-recovers instead of freezing the last
+> holes on screen forever; (2) tab-switch wake — switching tabs changes
+> the window title but fires no wheel event, so the tracker now polls
+> the fg title in its 50ms wake loop and re-walks within ~50ms; (3)
+> completed walks slower than 1s log a warning (the wedged-provider
+> signature, visible in log.txt without any user diagnosis).
+> alpha.10 kept: wake-on-demand discovery (scroll burst end / wheel /
+> fg move-resize → walk in ~50ms), 800/1500ms playing cadence, startup
+> auto-diagnostics.
+> alpha.9 kept: SAME-NAME hole merge (unnamed fragments AND fragments
+> sharing one accessible name merge across seams up to ~6% of their
+> size; differently-named media keeps the 8px floor so grid thumbnails
+> can never chain into a mega-hole) and every-hole ~33Hz poke (a video
+> fragment mislabeled as image/graphic used to refresh at 6.6Hz).
+> Diagnostics deliver THEMSELVES: 10s after launch, 3s after inversion
+> comes ON (or on F10) the full report goes to the clipboard AND a
+> Desktop file (invertonator-diagnostics.txt) — paste it into the bug
+> report.
 > Linux (X11): global gamma-ramp inversion shipped — the
 > XComposite true-color-hole overlay is the next milestone. For the
 > **fully-featured C# edition**, see

@@ -66,10 +66,22 @@
 //     after every scroll (the "too many rectangles and on random
 //     places" regression). Freshness is enforced by the WAKE LOOP
 //     (alpha.10): the discovery nap is sliced into 50ms steps and cut
-//     short the moment a scroll burst ends, a wheel fires, or the
-//     foreground window moves/resizes/changes — the next walk happens
-//     ~50ms later, whatever the backoff was. The starvation live-walk
-//     cooldown stays widened 2s → 5s (alpha.9).
+//     short the moment a scroll burst ends, a wheel fires, the
+//     foreground window moves/resizes/changes, or its TITLE changes
+//     (alpha.11 — a tab switch changes the title and fires NO wheel
+//     event, so the old tab's holes used to linger; and if the walk
+//     then wedged in the tearing-down provider they lingered FOREVER
+//     — the "holes are permanent even after shifting tabs" report).
+//     The next walk happens ~50ms after any of these, whatever the
+//     backoff was. The starvation live-walk cooldown stays widened
+//     2s → 5s (alpha.9).
+//   · EVIDENCE (alpha.11 — see holes.rs STALE_SPEC_AGE): the pump
+//     hides every hole not re-confirmed by a completed walk within
+//     8s, so a wedged/panicked tracker degrades to "no holes" and
+//     recovers automatically instead of freezing stale holes on
+//     screen forever. Walks slower than 1s are logged as warnings —
+//     the wedged-provider signature, visible in log.txt without any
+//     user diagnosis.
 //   · Giant filter: a NON-dynamic candidate covering ≥ 85% of the
 //     foreground window is clamped garbage or a page wrapper — it
 //     would absorb the entire clustering. Dropped.
@@ -234,6 +246,12 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
     // re-synced immediately).
     let mut last_fg_rect = RECT::default();
     let mut was_hold = false;
+    // alpha.11 tab-switch wake: the fg window's title as of the last
+    // walk. A tab switch changes it and fires NO wheel event and NO
+    // fg-rect change — without this signal the walk kept the old tab's
+    // holes until the backoff expired (and forever, when the next walk
+    // wedged inside the tearing-down provider).
+    let mut last_title = String::new();
     // Warm-up + live-walk state (alpha.6): the warm-up runs once per
     // foreground window; the starvation live-walk is throttled.
     let mut warm_fg: usize = 0;
@@ -273,6 +291,16 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
                 (s, dump)
             };
             let walk_ms = t0.elapsed().as_millis();
+            // SLOW-WALK SIGNATURE (alpha.11): a completed-but-slow walk
+            // means the provider was busy or half-torn-down (tab switch,
+            // heavy page). One warn line per offense — this is what the
+            // "holes froze/wrong for a while" reports look like in the
+            // log, no user diagnosis needed.
+            if walk_ms > 1000 {
+                tracing::warn!(
+                    "tracker: SLOW walk {walk_ms}ms — provider busy or wedged (tab teardown?)"
+                );
+            }
             let n_holes = specs.len();
 
             // CANDIDATE OBSERVABILITY (alpha.6): every gated candidate
@@ -344,11 +372,12 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
             // If this line goes silent for >10s while inversion is on,
             // the walk is stuck inside a hung provider — that is the
             // "holes vanish and never come back" signature.
+            let title = window_title(fg);
+            last_title = title.clone();
             let sig = format!("{}:{had_specs}", fg.0 as usize);
             if sig != last_sig || last_beat.elapsed() >= std::time::Duration::from_secs(10) {
                 tracing::info!(
-                    "tracker: fg=\"{}\" holes={n_holes} walk={walk_ms}ms cadence={interval}ms",
-                    window_title(fg)
+                    "tracker: fg=\"{title}\" holes={n_holes} walk={walk_ms}ms cadence={interval}ms"
                 );
                 last_sig = sig;
                 last_beat = std::time::Instant::now();
@@ -369,6 +398,13 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
         //   · the foreground window moved / resized / changed — holes
         //     are absolute-screen rects, a moved window invalidates
         //     every one of them;
+        //   · the fg window's TITLE changed (alpha.11) — a tab switch
+        //     (Ctrl+Tab, tab click) fires NO wheel event and keeps the
+        //     same HWND and rect; the title is the one cheap signal the
+        //     tracker can see. Without it the old tab's holes lingered
+        //     until the backoff expired — and if the walk into the
+        //     tearing-down provider then wedged, FOREVER (the pump now
+        //     also self-defends with the holes.rs evidence TTL).
         //   · set_enabled(true) raised WAKE — F5-ON shows holes fast.
         // alpha.9 slept straight through all of this (backoff up to
         // 3s), so after each scroll the pump re-showed STALE holes —
@@ -405,6 +441,15 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
                                 || r.right != last_fg_rect.right
                                 || r.bottom != last_fg_rect.bottom)
                         {
+                            wake = true;
+                        }
+                        // TAB SWITCH (alpha.11): same window, same rect,
+                        // no wheel — the title is the only cheap signal
+                        // that the page content just changed wholesale.
+                        // Cross-process GetWindowTextW reads the cached
+                        // caption (no message sent); cheap enough for a
+                        // 50ms-slice poll.
+                        if !wake && !last_title.is_empty() && window_title(w) != last_title {
                             wake = true;
                         }
                     }
