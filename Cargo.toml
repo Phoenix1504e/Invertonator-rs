@@ -1,6 +1,6 @@
 [package]
 name = "invertonator"
-version = "0.3.0-alpha.11"
+version = "0.3.0-alpha.12"
 edition = "2021"
 description = "System-wide dark mode that websites cannot see."
 license = "MIT"
@@ -27,6 +27,7 @@ windows = { version = "0.58", features = [
     "Win32_System_DataExchange",
     "Win32_System_Memory",
     "Win32_System_Ole",
+    "Win32_Media",
 ]}
 
 [target.'cfg(unix)'.dependencies]

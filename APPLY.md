@@ -1,4 +1,4 @@
-# Invertonator-rs — Full Source Package (v0.3.0-alpha.11, cross-platform)
+# Invertonator-rs — Full Source Package (v0.3.0-alpha.12, cross-platform)
 
 Complete repo at a fixed state — extract over your clone, commit, push.
 No `.git` inside, your history is untouched.
@@ -13,7 +13,7 @@ Easiest path (clone already on disk at `C:\Users\admin\invertonator-push`):
 cd C:\Users\admin\invertonator-push
 Expand-Archive -Path "$env:USERPROFILE\Downloads\Invertonator-rs-full-source.zip" -DestinationPath . -Force
 git add -A
-git commit -m "alpha.11: evidence TTL (stale holes self-hide) + tab-switch title wake + slow-walk warnings"
+git commit -m "alpha.12: 64Hz unlayered pump + offscreen/starved-rect filters (smoothness + precision)"
 git push origin HEAD
 ```
 
@@ -24,71 +24,74 @@ without it, `git add -A` after a local build would sweep thousands of
 
 **IMPORTANT — verify you are running the new build:** the FIRST line of
 `%LOCALAPPDATA%\Invertonator\log.txt` must read
-`=== Invertonator-rs v0.3.0-alpha.11 ===`. If it says alpha.10, the old
+`=== Invertonator-rs v0.3.0-alpha.12 ===`. If it says alpha.11, the old
 exe ran — re-download the CI artifact and start that one.
 
 ---
 
-## What alpha.11 fixes (your alpha.10 report)
+## What alpha.12 fixes (your alpha.11 report)
 
-> "holes are permanent even after shifting tabs"
+> "video is a little slow in the hole and radom holes still appear"
 
-Root cause, code-proven: a hole lives exactly as long as the tracker's
-last published spec set, and the tracker re-publishes ONLY when a walk
-completes. A tab switch (Ctrl+Tab, tab click) fires **no wheel event**,
-keeps the **same window** and the **same rect** — none of the alpha.10
-wake signals fire — and worse, the walk issued right after the switch
-talks to a browser that is tearing down and rebuilding its
-accessibility provider. Such a cross-process walk can block for a very
-long time. While it blocks, the last hole set sits on screen FOREVER
-(the pump re-draws it at 33Hz from stale specs). If the walk even
-panics the tracker thread, same freeze.
+Two separate root causes, both code-proven.
 
-Three changes make that failure mode structurally impossible:
+### 1. "Video is a little slow in the hole" — the pump was slower than advertised
 
-### 1. Evidence TTL — no hole outlives its evidence (holes.rs)
+- The 30ms pump timer ran WITHOUT timer-resolution help: WM_TIMER fires
+  on the ~15.6ms scheduler grid, so the "33Hz" poke actually landed
+  every 31–46ms — an effective, wobbling 22–32Hz — while the page
+  itself ran at 60fps. **Fix:** pump at 15ms + `timeBeginPeriod(1)`
+  (undone on quit) → hole content now refreshes at ~64Hz, matching the
+  display. This is the same rate Microsoft's own windowed-magnifier
+  sample uses.
+- Hole host windows were opaque WS_EX_LAYERED: every magnifier repaint
+  was routed through the layered-window redirection surface — pure
+  composition overhead. **Fix:** hosts are no longer layered (the
+  proven probe config).
+- New telemetry: once per 10s the log gets
+  `holes: pump 63.9Hz ticks=639 holes=2` — the ACTUAL delivery rate on
+  your machine. If video in the hole ever looks slow again, this line
+  says whether the pump is the bottleneck.
 
-Every completed walk re-stamps an evidence clock (even a walk that
-found nothing). The pump — which runs on the main thread, fully
-independent of the tracker thread — now **hides every hole** whose
-spec set has not been re-confirmed within **8 seconds**. Whatever
-wedged the tracker (hung provider, crashed thread), the worst case is
-"holes hide after 8s and come back when the walk unblocks" — never
-"permanent holes". The log gets one `holes: spec evidence stale —
-hiding all holes` warning when this fires, and a
-`fresh spec evidence — holes re-enabled` line on recovery.
+### 2. "Random holes still appear" — two garbage-rect generators
 
-### 2. Tab-switch wake — the tracker now SEES tab switches (tracker.rs)
+- **Offscreen elements**: elements with `IsOffscreen=true`
+  (display:none, scrolled out of view, virtualized list placeholders)
+  carry stale or huge rectangles. A huge rect clamped into the window
+  pins a hole to a random place. **Fix:** offscreen elements are now
+  filtered on BOTH walk paths before they can become candidates.
+- **Half-built trees**: right after a tab switch or page load, the
+  browser hands out a PARTIAL accessibility tree; the walk that sees
+  less than half the expected element count used to publish whatever
+  placeholder rectangles it had. **Fix:** a starved walk publishes
+  NOTHING — holes hide for a tick or two until a trustworthy walk
+  completes (a full live walk or the finished materialization).
+- The warm-up that measures the tree size now re-runs when the window
+  title changes (tab switch / navigation), so a smaller next page is
+  no longer mistaken for a half-built tree.
 
-The 50ms wake loop now also compares the foreground window's TITLE.
-Switching tabs changes the title (almost always) and costs the tracker
-one cheap caption read per slice — no UIA traffic. Title changed →
-walk within ~50ms → new tab's holes (or no holes) replace the old set
-in under a tenth of a second, scroll-fast.
-
-### 3. Slow-walk warnings — the wedge leaves a fingerprint (tracker.rs)
-
-Any completed walk slower than 1s logs
-`tracker: SLOW walk NNNNms — provider busy or wedged (tab teardown?)`.
-If holes ever feel frozen/laggy again, log.txt now says whether the
-browser's accessibility provider was the bottleneck — no guessing.
+alpha.11 kept: evidence TTL (no completed walk in 8s → holes hide —
+permanent holes remain structurally impossible) and tab-switch wake.
 
 ---
 
 ## Test protocol (2 minutes)
 
-1. Start the new exe, confirm log line 1 = `v0.3.0-alpha.11`.
-2. Open two YouTube tabs (one playing). Press **F5** → holes appear.
-3. **Ctrl+Tab / click to the other tab** → the old holes must move or
-   clear almost immediately (~0.1s). Switch back and forth a few times,
-   also try switching to a page with NO video (holes should clear).
-4. Leave the video tab alone for 30s — holes must stay correct and the
-   video smooth (alpha.9/10 behavior unchanged).
-5. If ANYTHING is still off: the diagnostics file already exists on
-   your Desktop (`invertonator-diagnostics.txt`, written 10s after
-   launch and 3s after every F5) — **drag that file straight into the
-   chat**, no copying needed. It contains the dpi line, window rect,
-   named candidate list, and the exact holes the tracker published.
+1. Start the new exe, confirm log line 1 = `v0.3.0-alpha.12` and the
+   line `timer: timeBeginPeriod(1) -> NO_ERROR` right under it.
+2. Play a YouTube video, F5. The video in the hole should now be as
+   smooth as the page around it (~64Hz vs the old wobbling ~25Hz).
+3. Switch tabs (Ctrl+Tab / click): holes must follow within ~0.1s and
+   NO random rectangles may appear during or after the switch.
+4. Scroll the page: no random rectangles from below-the-fold content.
+5. After ~10s of inverted playback, log.txt contains a
+   `holes: pump NN.NHz` line — if you ever report smoothness again,
+   that number is the whole story.
+6. If ANYTHING is still off: **drag the Desktop
+   `invertonator-diagnostics.txt` straight into the chat** (auto-written
+   10s after launch and 3s after every F5). It contains the dpi line,
+   window rect, named candidate list, and the exact holes published —
+   one paste replaces a whole round of guessing.
 
 ## File map (18 files, latest state)
 
@@ -96,7 +99,7 @@ browser's accessibility provider was the bottleneck — no guessing.
 .github/workflows/build.yml  CI: windows+ubuntu artifacts per push
 .gitignore                   /target, *.exe — keep, protects your clone
 APPLY.md                     this file
-Cargo.toml                   0.3.0-alpha.11 (windows+linux deps)
+Cargo.toml                   0.3.0-alpha.12 (windows+linux deps)
 Cargo.lock                   pinned
 Invertonator-rs-v0.2.0-alpha.2.exe  legacy artifact (safe to git rm)
 LICENSE                      MIT
@@ -106,19 +109,20 @@ icon.ico / icon.svg          logo (tray + README)
 src/main.rs                  cross-platform entry (cfg dispatcher)
 src/common.rs                settings.json + logging + VERSION
 src/win_main.rs              Windows backend (tray, hotkeys, probe, DPI,
-                             auto-diagnostics)
-src/holes.rs                 hole pool + main-thread pump (30ms, ~33Hz
-                             poke, evidence TTL)
+                             auto-diagnostics, timer resolution)
+src/holes.rs                 hole pool + main-thread pump (15ms ≈64Hz,
+                             unlayered hosts, evidence TTL, pump heartbeat)
 src/tracker.rs               UIA media discovery (cached+live walks,
-                             same-name merge, wake loop, tab-switch wake)
+                             same-name merge, wake loop, offscreen +
+                             starved-rect filters)
 src/scrollhook.rs            low-level wheel hook (scroll-hold, page-dirty)
 src/linux.rs                 X11 XRandR gamma-ramp inversion + --self-test
 ```
 
 ## After testing
 
-Reply with what you saw (one line is enough — e.g. "holes now follow
-tab switches, video smooth" or "still X on tab Y"), and if anything is
-off, drag the Desktop `invertonator-diagnostics.txt` into the chat.
-That file plus log.txt's `SLOW walk` / `spec evidence stale` lines
+Reply with what you saw (one line is enough — e.g. "video smooth,
+random holes gone" or "still X"), and if anything is off, drag the
+Desktop `invertonator-diagnostics.txt` into the chat. That file plus
+the log's `holes: pump` / `SLOW walk` / `spec evidence stale` lines
 pinpoint any remaining issue in ONE round.

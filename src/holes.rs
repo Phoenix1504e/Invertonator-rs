@@ -26,6 +26,16 @@
 //   provider is the classic case — it used to freeze the last hole
 //   set on screen forever).
 //
+//   REFRESH RATE (alpha.12): the pump runs at 15ms (≈64Hz with
+//   timeBeginPeriod(1)) and hole hosts are NOT layered. The 30ms
+//   pump relied on WM_TIMER without timer-resolution help — it
+//   actually fired every 31–46ms on the 15.6ms scheduler grid, so
+//   hole content refreshed at an effective 22–32Hz while the page
+//   itself ran at 60fps ("video is a little slow in the hole"). The
+//   opaque WS_EX_LAYERED host (alpha 255) additionally forced every
+//   magnifier repaint through DWM redirection composition — pure
+//   overhead the proven F11 probe host never had. Both gone.
+//
 //   THREADING MODEL (v0.2.0-alpha.3 — the "F11 rule"):
 //   · Hole windows are created on the MAIN thread and stay there.
 //     Windows cannot move between threads: the OS ties every HWND to
@@ -56,12 +66,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{BOOL, COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::InvalidateRect;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, DestroyWindow, MoveWindow, RegisterClassW, SetLayeredWindowAttributes,
-    ShowWindow, LAYERED_WINDOW_ATTRIBUTES_FLAGS, SHOW_WINDOW_CMD, WNDCLASSW,
+    DefWindowProcW, DestroyWindow, MoveWindow, RegisterClassW, ShowWindow, SHOW_WINDOW_CMD,
+    WNDCLASSW,
 };
 
 // ---- Magnification window-level externs (proven via F11 probe) ----
@@ -107,18 +117,25 @@ const WS_POPUP: u32 = 0x8000_0000;
 const WS_CHILD: u32 = 0x4000_0000;
 const WS_VISIBLE: u32 = 0x1000_0000;
 const WS_DISABLED: u32 = 0x0800_0000;
-const WS_EX_LAYERED: u32 = 0x0008_0000;
 const WS_EX_TOPMOST: u32 = 0x0000_0008;
 const WS_EX_TRANSPARENT: u32 = 0x0000_0020;
 const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
 const WS_EX_NOACTIVATE: u32 = 0x0800_0000;
-const LWA_ALPHA_FLAG: LAYERED_WINDOW_ATTRIBUTES_FLAGS = LAYERED_WINDOW_ATTRIBUTES_FLAGS(2);
 const SW_HIDE_CMD: SHOW_WINDOW_CMD = SHOW_WINDOW_CMD(0);
 const SW_SHOWNOACTIVATE_CMD: SHOW_WINDOW_CMD = SHOW_WINDOW_CMD(4);
-pub const PUMP_MS: u32 = 30; // pump cadence (SetTimer, ms)
-const STATIC_EVERY: u64 = 600; // static-hole self-heal ~18s (was ~6s —
-                               // a pipeline reset on a misclassified
-                               // video hole is a visible 6s stutter)
+pub const PUMP_MS: u32 = 15; // pump cadence (SetTimer, ms) — with
+                             // timeBeginPeriod(1) this lands at ~64Hz;
+                             // without it a 30ms timer drifted on the
+                             // 15.6ms scheduler grid and actually fired
+                             // every 31–46ms (~22–32Hz, wobbling) — the
+                             // "video is a little slow in the hole"
+                             // report. Same rate as Microsoft's own
+                             // windowed-magnifier sample (~16ms).
+const STATIC_EVERY: u64 = 1200; // static-hole self-heal, in ticks
+                                // (1200 × 15ms ≈ 18s — kept at the
+                                // alpha.9 interval when the pump doubled;
+                                // a pipeline reset on a misclassified
+                                // video hole is a visible stutter)
 pub const MAX_HOLES: usize = 16;
 // EVIDENCE TTL (alpha.11): a published hole set is only trusted for
 // this long since the LAST completed walk re-confirmed it. Normal
@@ -254,6 +271,11 @@ pub struct HolePool {
     /// alpha.11 — logs the stale-latch and recovery transitions once
     /// each instead of every 30ms tick.
     stale_latched: bool,
+    /// alpha.12 — pump-rate heartbeat window (actual delivery Hz is
+    /// the number that decides whether video in the hole looks
+    /// smooth; a sagging rate = the main thread is starved).
+    beat_tick: u64,
+    beat_at: std::time::Instant,
 }
 
 impl HolePool {
@@ -365,6 +387,24 @@ impl HolePool {
                 h.visible = false;
             }
         }
+
+        // PUMP-RATE HEARTBEAT (alpha.12): once per 10s while holes
+        // should be showing, log the ACTUAL tick rate. The design rate
+        // is ~64Hz; a sagging number means the main thread is starved
+        // (timer resolution lost, system load) — the measurable form
+        // of "video looks a little slow in the hole".
+        if want_visible && self.beat_at.elapsed() >= Duration::from_secs(10) {
+            let dt = self.beat_at.elapsed().as_secs_f64();
+            let ticks = self.tick - self.beat_tick;
+            let vis = self.pool.iter().filter(|h| h.visible).count();
+            tracing::info!(
+                "holes: pump {:.1}Hz ticks={} holes={vis}",
+                ticks as f64 / dt,
+                ticks
+            );
+            self.beat_tick = self.tick;
+            self.beat_at = Instant::now();
+        }
     }
 }
 
@@ -415,8 +455,11 @@ unsafe fn create_pool() -> HolePool {
         // WS_EX_TOPMOST: holes live in the topmost band FOREVER — the
         // foreground app (browser playing video) can never cover them,
         // no matter how often the user clicks around.
+        // NOT layered (alpha.12): an opaque layered host forces every
+        // magnifier repaint through DWM redirection composition — pure
+        // overhead. The proven F11 probe host was never layered.
         let host = CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             HOST_CLASS.as_ptr(),
             w!("Invertonator hole").as_ptr(),
             WS_POPUP | WS_DISABLED, // disabled → skipped in hit-testing
@@ -436,7 +479,6 @@ unsafe fn create_pool() -> HolePool {
             );
             break;
         }
-        let _ = SetLayeredWindowAttributes(host, COLORREF(0), 255, LWA_ALPHA_FLAG);
 
         let mag = CreateWindowExW(
             0,
@@ -479,5 +521,7 @@ unsafe fn create_pool() -> HolePool {
         pool,
         tick: 0,
         stale_latched: false,
+        beat_tick: 0,
+        beat_at: Instant::now(),
     }
 }

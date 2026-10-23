@@ -82,6 +82,25 @@
 //     screen forever. Walks slower than 1s are logged as warnings —
 //     the wedged-provider signature, visible in log.txt without any
 //     user diagnosis.
+//   · SMOOTHNESS (alpha.12 — the "video is a little slow in the
+//     hole" fix, holes.rs side): pump 15ms + timeBeginPeriod(1) —
+//     the old 30ms pump actually fired at 22–32Hz on the 15.6ms
+//     scheduler grid — and UNLAYERED hosts (an opaque layered host
+//     pushed every repaint through DWM redirection composition). The
+//     pump heartbeat now logs the ACTUAL delivery Hz every 10s.
+//   · PRECISION (alpha.12 — the "random holes still appear" fix):
+//     two garbage-rect generators removed. (1) OFFSCREEN FILTER:
+//     IsOffscreen=true elements (display:none, scrolled-out,
+//     virtualized placeholders) never become candidates — their rects
+//     are stale or huge, and clamping a huge rect into the fg window
+//     pins a hole to a random place. (2) STARVED PUBLISH GUARD: a
+//     cached walk that sees less than half the warm-up population is
+//     a half-built tree — its placeholder rects are no longer
+//     published; holes hide until a trustworthy walk completes. The
+//     warm-up now re-runs when the fg TITLE changes (tab switch /
+//     navigation), so the starvation baseline describes the CURRENT
+//     page (a smaller next tab used to read as chronic starvation),
+//     and every live walk re-baselines it from the real population.
 //   · Giant filter: a NON-dynamic candidate covering ≥ 85% of the
 //     foreground window is clamped garbage or a page wrapper — it
 //     would absorb the entire clustering. Dropped.
@@ -104,8 +123,8 @@ use windows::Win32::System::Com::{
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationElement, TreeScope_Descendants,
     UIA_BoundingRectanglePropertyId, UIA_ControlTypePropertyId, UIA_DocumentControlTypeId,
-    UIA_HyperlinkControlTypeId, UIA_ImageControlTypeId, UIA_LocalizedControlTypePropertyId,
-    UIA_NamePropertyId, UIA_CONTROLTYPE_ID,
+    UIA_HyperlinkControlTypeId, UIA_ImageControlTypeId, UIA_IsOffscreenPropertyId,
+    UIA_LocalizedControlTypePropertyId, UIA_NamePropertyId, UIA_CONTROLTYPE_ID,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowRect, GetWindowTextW};
 
@@ -144,6 +163,9 @@ const SLEEP_SLICE_MS: u64 = 50; // wake-loop nap slice (alpha.10)
 /// per process (discovery ticks every 400ms — per-tick logs would spam
 /// log.txt at 150 lines/minute).
 static FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// alpha.12 — starvation-suppression transition logger (see discover).
+static STARVED_QUIET: AtomicBool = AtomicBool::new(false);
 
 /// alpha.10 — wake signal: the discovery nap ends early whenever this
 /// is set. Raised by set_enabled(true) so F5-ON produces holes in ~50ms
@@ -253,14 +275,18 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
     // wedged inside the tearing-down provider).
     let mut last_title = String::new();
     // Warm-up + live-walk state (alpha.6): the warm-up runs once per
-    // foreground window; the starvation live-walk is throttled.
-    let mut warm_fg: usize = 0;
+    // (window, TITLE) pair since alpha.12 — a tab switch or navigation
+    // changes the content behind the same HWND, and the starvation
+    // baseline must describe the CURRENT page. The starvation
+    // live-walk is throttled.
+    let mut warm_key_last = String::new();
     let mut warm_total: u32 = 0;
     let mut last_live = std::time::Instant::now();
     while !stop.load(Ordering::Relaxed) {
         if enabled.load(Ordering::Relaxed) {
             let fg = unsafe { GetForegroundWindow() };
             let t0 = std::time::Instant::now();
+            let title = window_title(fg);
             let (specs, cand_dump) = if fg.is_invalid() {
                 (Vec::new(), String::new())
             } else {
@@ -270,8 +296,12 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
                 // Chromium hands out a PARTIAL tree otherwise, and the
                 // tracker then only ever saw the player-adjacent part
                 // ("media outside the player is not recognised").
-                if fg.0 as usize != warm_fg {
-                    warm_fg = fg.0 as usize;
+                // alpha.12: keyed on (HWND, TITLE) — a tab switch or
+                // navigation keeps the HWND but swaps the content, and
+                // a smaller next page must not read as "half a tree".
+                let warm_key = format!("{:x}|{title}", fg.0 as usize);
+                if warm_key != warm_key_last {
+                    warm_key_last = warm_key;
                     let (n, rect_line) = unsafe { warmup(&automation, fg) };
                     warm_total = n;
                     if !rect_line.is_empty() {
@@ -284,7 +314,7 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
                 let allow_live =
                     last_live.elapsed() >= std::time::Duration::from_millis(LIVE_COOLDOWN_MS);
                 let (s, dump, went_live) =
-                    unsafe { discover(&automation, fg, warm_total, allow_live) };
+                    unsafe { discover(&automation, fg, &mut warm_total, allow_live) };
                 if went_live {
                     last_live = std::time::Instant::now();
                 }
@@ -372,8 +402,9 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
             // If this line goes silent for >10s while inversion is on,
             // the walk is stuck inside a hung provider — that is the
             // "holes vanish and never come back" signature.
-            let title = window_title(fg);
-            last_title = title.clone();
+            // last_title tracks EVERY walk (the wake loop compares it);
+            // the log line is conditional — so move `title` into
+            // last_title after the log.
             let sig = format!("{}:{had_specs}", fg.0 as usize);
             if sig != last_sig || last_beat.elapsed() >= std::time::Duration::from_secs(10) {
                 tracing::info!(
@@ -382,6 +413,7 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
                 last_sig = sig;
                 last_beat = std::time::Instant::now();
             }
+            last_title = title;
         } else if had_specs {
             // Disabled while holes were out — clear once.
             holes.set_specs(Vec::new());
@@ -547,10 +579,14 @@ struct WalkCtx {
 }
 
 /// Walk the foreground window and return the desired hole set.
+/// `warm_total` is mutated: it re-baselines from every live walk (the
+/// live FindAll sees the REAL population) and grows when the tree
+/// outgrows the recorded warm-up size — both keep the starvation
+/// heuristic honest without a re-warm-up.
 unsafe fn discover(
     automation: &IUIAutomation,
     fg: HWND,
-    warm_total: u32,
+    warm_total: &mut u32,
     allow_live: bool,
 ) -> (Vec<HoleSpec>, String, bool) {
     // Foreground window rect — the clamp anchor for every candidate.
@@ -571,6 +607,7 @@ unsafe fn discover(
         let _ = cache.AddProperty(UIA_NamePropertyId);
         let _ = cache.AddProperty(UIA_LocalizedControlTypePropertyId);
         let _ = cache.AddProperty(UIA_BoundingRectanglePropertyId);
+        let _ = cache.AddProperty(UIA_IsOffscreenPropertyId);
         if let Ok(cached_root) = root.BuildUpdatedCache(&cache) {
             let mut ctx = WalkCtx {
                 total: 0,
@@ -579,25 +616,55 @@ unsafe fn discover(
                 candidates: Vec::new(),
             };
             walk_cached(&cached_root, false, 0, &mut ctx);
+            // Baseline growth: the tree legitimately outgrew the
+            // recorded warm-up population (lazy expansion, SPA
+            // growth). Grow the baseline — otherwise every later walk
+            // reads as "starved".
+            if ctx.total > *warm_total {
+                *warm_total = ctx.total;
+            }
             // GECKO GUARD: Gecko/LibreWolf succeed at BuildUpdatedCache
             // but never fill CachedChildren — the walk sees only the
             // root element. Don't hand back an empty hole set then;
             // drop to the live walk, which works on every provider.
             if ctx.total > 1 {
-                // STARVATION GUARD (alpha.6): a cached walk that saw
-                // LESS THAN HALF the warm-up population means the
-                // provider is still handing out a partial tree (the
-                // Chromium lazy-materialization case). One live FindAll
-                // walk fixes the hole set for this tick; the 2s
-                // cooldown keeps the tax off the video renderer.
-                if warm_total > 50 && ctx.total * 2 < warm_total && allow_live {
+                // STARVATION GUARD (alpha.6, split in alpha.12): a
+                // cached walk that saw LESS THAN HALF the warm-up
+                // population means the provider is still handing out a
+                // PARTIAL tree. When the live walk is allowed, take it —
+                // it returns the real population and re-baselines.
+                // When it is NOT (5s cooldown), publish NOTHING: a
+                // half-built tree's rects are placeholders, and holes
+                // built from them are the "random holes" report. Holes
+                // hide for a tick or two instead — quiet is correct.
+                if *warm_total > 50 && ctx.total * 2 < *warm_total {
+                    if allow_live {
+                        tracing::info!(
+                            "tracker: cached walk starved ({}/{} nodes) — live walk this tick",
+                            ctx.total,
+                            *warm_total
+                        );
+                        let (specs, dump, total) = live_discover(automation, &root, ctx.fg, false);
+                        *warm_total = total; // the live walk is ground truth
+                        if STARVED_QUIET.swap(false, Ordering::Relaxed) {
+                            tracing::info!("tracker: full tree restored ({total} nodes)");
+                        }
+                        return (specs, dump, true);
+                    }
+                    if !STARVED_QUIET.swap(true, Ordering::Relaxed) {
+                        tracing::info!(
+                            "tracker: cached walk starved ({}/{} nodes), live walk cooling down — suppressing holes rather than publishing partial-tree rects",
+                            ctx.total,
+                            *warm_total
+                        );
+                    }
+                    return (Vec::new(), String::new(), false);
+                }
+                if STARVED_QUIET.swap(false, Ordering::Relaxed) {
                     tracing::info!(
-                        "tracker: cached walk starved ({}/{} nodes) — live walk this tick",
-                        ctx.total,
-                        warm_total
+                        "tracker: tree back to full population ({} nodes)",
+                        ctx.total
                     );
-                    let (specs, dump) = live_discover(automation, &root, ctx.fg, false);
-                    return (specs, dump, true);
                 }
                 let (specs, dump) = ctx_to_specs(ctx);
                 return (specs, dump, false);
@@ -615,7 +682,8 @@ unsafe fn discover(
     // FALLBACK: flat live FindAll (no document scoping possible cheaply
     // — gates still apply). Same shape as the probe's fallback.
     tracing::debug!("tracker: cached walk unavailable — live fallback");
-    let (specs, dump) = live_discover(automation, &root, fg_opt, true);
+    let (specs, dump, total) = live_discover(automation, &root, fg_opt, true);
+    *warm_total = total; // the live walk is ground truth
     (specs, dump, false)
 }
 
@@ -628,15 +696,15 @@ unsafe fn live_discover(
     root: &IUIAutomationElement,
     fg: Option<RECT>,
     log_len: bool,
-) -> (Vec<HoleSpec>, String) {
+) -> (Vec<HoleSpec>, String, u32) {
     let Ok(true_cond) = automation.CreateTrueCondition() else {
-        return (Vec::new(), String::new());
+        return (Vec::new(), String::new(), 0);
     };
     let Ok(all) = root.FindAll(TreeScope_Descendants, &true_cond) else {
-        return (Vec::new(), String::new());
+        return (Vec::new(), String::new(), 0);
     };
     let Ok(len) = all.Length() else {
-        return (Vec::new(), String::new());
+        return (Vec::new(), String::new(), 0);
     };
     if log_len {
         tracing::debug!("tracker: live walk: {len} elements");
@@ -655,7 +723,9 @@ unsafe fn live_discover(
             classify_live(&el, &mut ctx);
         }
     }
-    ctx_to_specs(ctx)
+    let total = ctx.total;
+    let (specs, dump) = ctx_to_specs(ctx);
+    (specs, dump, total)
 }
 
 /// Cached-walk recursion. `in_doc` = we are inside a Document subtree —
@@ -675,13 +745,23 @@ fn walk_cached(el: &IUIAutomationElement, in_doc: bool, depth: u32, ctx: &mut Wa
         let in_doc_child = in_doc || is_doc;
 
         if in_doc && !is_doc {
-            let lct = el
-                .CachedLocalizedControlType()
-                .map(|s| s.to_string())
-                .unwrap_or_default();
-            let name = el.CachedName().map(|s| s.to_string()).unwrap_or_default();
-            let rect = el.CachedBoundingRectangle().unwrap_or_default();
-            offer_candidate(classify(ct, &lct), &rect, &name, ctx);
+            // OFFSCREEN FILTER (alpha.12): IsOffscreen=true elements
+            // are display:none, scrolled out, or virtualized
+            // placeholders. Their BoundingRectangles are stale or huge
+            // (probe history has full-window rects from virtualized
+            // reads), and clamping a huge rect into the fg window pins
+            // a hole to a "random place". Recursion continues — every
+            // element is judged on its own flag.
+            let offscreen = el.CachedIsOffscreen().is_ok_and(|b| b.as_bool());
+            if !offscreen {
+                let lct = el
+                    .CachedLocalizedControlType()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                let name = el.CachedName().map(|s| s.to_string()).unwrap_or_default();
+                let rect = el.CachedBoundingRectangle().unwrap_or_default();
+                offer_candidate(classify(ct, &lct), &rect, &name, ctx);
+            }
         }
 
         if ctx.total < MAX_NODES {
@@ -706,6 +786,10 @@ fn walk_cached(el: &IUIAutomationElement, in_doc: bool, depth: u32, ctx: &mut Wa
 fn classify_live(el: &IUIAutomationElement, ctx: &mut WalkCtx) {
     unsafe {
         ctx.total += 1;
+        // OFFSCREEN FILTER (alpha.12 — see walk_cached).
+        if el.CurrentIsOffscreen().is_ok_and(|b| b.as_bool()) {
+            return;
+        }
         let ct = el.CurrentControlType().unwrap_or(UIA_CONTROLTYPE_ID(0));
         let lct = el
             .CurrentLocalizedControlType()

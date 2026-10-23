@@ -4,29 +4,34 @@
 
 ![Invertonator](icon.svg)
 
-> **Status: v0.3.0-alpha.11** — Windows: UIA media tracker + Magnifier-API
+> **Status: v0.3.0-alpha.12** — Windows: UIA media tracker + Magnifier-API
 > true-color holes proven on hardware (1,152-node cache-request walks ·
 > 164 media elements classified · MagSetColorEffect/Source/Transform all
 > verified). Gecko browsers (Firefox/LibreWolf) supported via automatic
 > live-walk fallback when a provider leaves CachedChildren empty.
-> alpha.11 makes stale holes structurally impossible: (1) EVIDENCE TTL —
-> the pump hides every hole whose spec set was not re-confirmed by a
-> completed walk within 8s, so a walk wedged inside a browser that is
-> tearing down its accessibility provider (classic after a tab switch)
-> degrades to "no holes" and self-recovers instead of freezing the last
-> holes on screen forever; (2) tab-switch wake — switching tabs changes
-> the window title but fires no wheel event, so the tracker now polls
-> the fg title in its 50ms wake loop and re-walks within ~50ms; (3)
-> completed walks slower than 1s log a warning (the wedged-provider
-> signature, visible in log.txt without any user diagnosis).
+> alpha.12 fixes both alpha.11 symptoms: (1) SMOOTHNESS — the pump now
+> runs at 15ms with timeBeginPeriod(1) (the 30ms pump actually fired at
+> 22–32Hz on the 15.6ms scheduler grid) and hole hosts are no longer
+> opaque layered windows (every repaint went through DWM redirection);
+> hole content now refreshes at ~64Hz, and a pump heartbeat logs the
+> actual delivery Hz every 10s; (2) PRECISION — two garbage-rect
+> generators removed: IsOffscreen=true elements (display:none,
+> scrolled-out, virtualized placeholders) never become candidates, and
+> a half-built (starved) tree no longer publishes its placeholder rects
+> — holes hide until a trustworthy walk completes. The warm-up now
+> re-runs on title change (tab switch/navigation) so the starvation
+> baseline describes the current page.
+> alpha.11 kept: evidence TTL (holes hide if no walk completes within
+> 8s — permanent holes structurally impossible) and tab-switch title
+> wake (~50ms re-sync).
 > alpha.10 kept: wake-on-demand discovery (scroll burst end / wheel /
 > fg move-resize → walk in ~50ms), 800/1500ms playing cadence, startup
 > auto-diagnostics.
 > alpha.9 kept: SAME-NAME hole merge (unnamed fragments AND fragments
 > sharing one accessible name merge across seams up to ~6% of their
 > size; differently-named media keeps the 8px floor so grid thumbnails
-> can never chain into a mega-hole) and every-hole ~33Hz poke (a video
-> fragment mislabeled as image/graphic used to refresh at 6.6Hz).
+> can never chain into a mega-hole) and every-hole poke (classification
+> can no longer throttle hole content refresh).
 > Diagnostics deliver THEMSELVES: 10s after launch, 3s after inversion
 > comes ON (or on F10) the full report goes to the clipboard AND a
 > Desktop file (invertonator-diagnostics.txt) — paste it into the bug

@@ -860,6 +860,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         if !state_ptr.is_null() {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
         }
+        // Undo the alpha.12 timer-resolution raise (paired with
+        // timeBeginPeriod(1) in run()).
+        unsafe {
+            let _ = windows::Win32::Media::timeEndPeriod(1);
+        }
         tracing::info!("window destroyed — quitting");
         PostQuitMessage(0);
         return LRESULT(0);
@@ -987,6 +992,16 @@ pub fn run() {
 
     // Logging: %LOCALAPPDATA%\Invertonator\log.txt (shared helper).
     init_logging();
+
+    // TIMER RESOLUTION (alpha.12): without this a 15ms SetTimer fires
+    // on the ~15.6ms scheduler grid with several-ms jitter — the pump's
+    // poke rate wobbles (22–32Hz at the old 30ms cadence) and video in
+    // the hole reads slightly slow next to the 60fps page. One call,
+    // process-wide; undone in WM_DESTROY.
+    unsafe {
+        let r = windows::Win32::Media::timeBeginPeriod(1);
+        tracing::info!("timer: timeBeginPeriod(1) -> {r:?}");
+    }
 
     tracing::info!(
         "=== Invertonator-rs v{} (windows: magnifier + uia) ===",
