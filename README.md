@@ -4,15 +4,19 @@
 
 ![Invertonator](icon.svg)
 
-> **Status: v0.3.0-alpha.5** — Windows: UIA media tracker + Magnifier-API
+> **Status: v0.3.0-alpha.6** — Windows: UIA media tracker + Magnifier-API
 > true-color holes proven on hardware (1,152-node cache-request walks ·
 > 164 media elements classified · MagSetColorEffect/Source/Transform all
 > verified). Gecko browsers (Firefox/LibreWolf) supported via automatic
 > live-walk fallback when a provider leaves CachedChildren empty.
-> alpha.5 hardening: no more periodic capture re-arms inside video
-> holes (the in-hole stutter), gap-merge so one media can't split into
-> side-by-side holes, 4px rect quantize, fg-window clamp, 60-level UIA
-> walk (was 25 — YouTube runs deeper), adaptive discovery cadence.
+> alpha.6 refresh-model fix: the Magnifier control only re-captures when
+> its paint is poked (as Microsoft's own sample does every ~16ms) —
+> holes are now poked with InvalidateRect every tick (video ~33Hz),
+> so in-hole video is live without the laggy MagSetWindowSource reset
+> spam. Plus: per-window UIA warm-up (Chromium hands out a partial
+> tree — sidebar/watch media was never seen), 64px media gates
+> (kills holes on UI icons), merge-growth guard (thumbnail grids no
+> longer chain into one mega-hole), candidate-level hole logging.
 > Linux (X11): global gamma-ramp inversion shipped — the
 > XComposite true-color-hole overlay is the next milestone. For the
 > **fully-featured C# edition**, see

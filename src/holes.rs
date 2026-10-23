@@ -5,6 +5,13 @@
 //   INVERT color effect — media under a hole passes through the OS
 //   inversion twice and renders in TRUE colors.
 //
+//   REFRESH MODEL (alpha.6): the Magnifier child re-captures ONLY when
+//   its paint is poked — InvalidateRect — which is what Microsoft's
+//   windowed-magnifier sample does every ~16ms. The pump therefore
+//   pokes every visible hole on its tick: video holes ~33Hz, static
+//   holes ~6.6Hz. MagSetWindowSource (expensive pipeline rebuild) is
+//   reserved for rect changes, re-shows and the rare static self-heal.
+//
 //   THREADING MODEL (v0.2.0-alpha.3 — the "F11 rule"):
 //   · Hole windows are created on the MAIN thread and stay there.
 //     Windows cannot move between threads: the OS ties every HWND to
@@ -33,16 +40,14 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use windows::Win32::Foundation::{
-    BOOL, COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
-};
+use windows::core::{w, PCWSTR};
+use windows::Win32::Foundation::{BOOL, COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::InvalidateRect;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, DestroyWindow, MoveWindow, RegisterClassW,
-    SetLayeredWindowAttributes, ShowWindow,
-    LAYERED_WINDOW_ATTRIBUTES_FLAGS, SHOW_WINDOW_CMD, WNDCLASSW,
+    DefWindowProcW, DestroyWindow, MoveWindow, RegisterClassW, SetLayeredWindowAttributes,
+    ShowWindow, LAYERED_WINDOW_ATTRIBUTES_FLAGS, SHOW_WINDOW_CMD, WNDCLASSW,
 };
-use windows::core::{w, PCWSTR};
 
 // ---- Magnification window-level externs (proven via F11 probe) ----
 
@@ -62,7 +67,10 @@ extern "system" {
         lpclassname: *const u16,
         lpwindowname: *const u16,
         dwstyle: u32,
-        x: i32, y: i32, nwidth: i32, nheight: i32,
+        x: i32,
+        y: i32,
+        nwidth: i32,
+        nheight: i32,
         hwndparent: HWND,
         hmenu: isize,
         hinstance: HINSTANCE,
@@ -71,11 +79,8 @@ extern "system" {
 }
 
 const INVERT_FLAT: [f32; 25] = [
-    -1.0, 0.0, 0.0, 0.0, 0.0,
-    0.0, -1.0, 0.0, 0.0, 0.0,
-    0.0, 0.0, -1.0, 0.0, 0.0,
-    0.0, 0.0, 0.0, 1.0, 0.0,
-    1.0, 1.0, 1.0, 0.0, 1.0,
+    -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0,
 ];
 
 const IDENTITY_9: [f32; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
@@ -92,13 +97,33 @@ const WS_EX_TOPMOST: u32 = 0x0000_0008;
 const WS_EX_TRANSPARENT: u32 = 0x0000_0020;
 const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
 const WS_EX_NOACTIVATE: u32 = 0x0800_0000;
-const LWA_ALPHA_FLAG: LAYERED_WINDOW_ATTRIBUTES_FLAGS =
-    LAYERED_WINDOW_ATTRIBUTES_FLAGS(2);
+const LWA_ALPHA_FLAG: LAYERED_WINDOW_ATTRIBUTES_FLAGS = LAYERED_WINDOW_ATTRIBUTES_FLAGS(2);
 const SW_HIDE_CMD: SHOW_WINDOW_CMD = SHOW_WINDOW_CMD(0);
 const SW_SHOWNOACTIVATE_CMD: SHOW_WINDOW_CMD = SHOW_WINDOW_CMD(4);
-pub const PUMP_MS: u32 = 30;      // pump cadence (SetTimer, ms)
-const STATIC_EVERY: u64 = 200;    // static-hole self-heal ~0.17Hz
+pub const PUMP_MS: u32 = 30; // pump cadence (SetTimer, ms)
+const STATIC_EVERY: u64 = 200; // static-hole capture re-arm ~6s
+const STATIC_POKE_EVERY: u64 = 5; // static-hole repaint poke ~6.6Hz
 pub const MAX_HOLES: usize = 16;
+
+// CAPTURE MODEL (alpha.6 — measured, not assumed):
+// the "Magnifier" control does NOT stream its source region on its
+// own. It re-captures only when its paint is poked. Microsoft's own
+// windowed-magnifier sample drives it with a ~16ms SetTimer whose
+// callback is just SetWindowPos(topmost) + InvalidateRect(hwndMag).
+// alpha.5 trusted the control to live-update after a single
+// MagSetWindowSource and only re-armed on rect change — the holes
+// froze on their first captured frame ("nope not working").
+//
+// So the pump now pokes EVERY visible hole with InvalidateRect:
+//   · dynamic (video) holes — every tick (~33Hz live content)
+//   · static holes (thumbnails) — every 5th tick (~6.6Hz)
+// InvalidateRect is CHEAP (just a repaint flag — no pipeline reset).
+// MagSetWindowSource — the expensive call that tears down and rebuilds
+// the DWM frame source — stays reserved for what only it can do:
+// pointing the hole at a new rect (move / re-show / rare self-heal).
+// That split is the fix for BOTH "video in the hole is frozen"
+// (alpha.5) and "video in the hole is very laggy" (alpha.4's 33
+// MagSetWindowSource resets per second).
 
 // =====================================================================
 // Public API
@@ -128,9 +153,9 @@ pub struct Holes {
 pub struct HolesShared {
     // The desired hole set — written by the tracker, read by the pump.
     pub specs: Mutex<Vec<HoleSpec>>,
-    pub active: AtomicBool,   // false = holes hidden (Dim/Off)
-    pub pierce: AtomicBool,   // manual hide-all (F7)
-    pub hold: AtomicBool,     // scroll-hold (holes hidden during flicks)
+    pub active: AtomicBool, // false = holes hidden (Dim/Off)
+    pub pierce: AtomicBool, // manual hide-all (F7)
+    pub hold: AtomicBool,   // scroll-hold (holes hidden during flicks)
 }
 
 impl Holes {
@@ -240,22 +265,25 @@ impl HolePool {
                     h.visible = false;
                 }
 
-                // CAPTURE DISCIPLINE (alpha.5 — the lag fix):
-                // every MagSetWindowSource restarts the Magnifier's
-                // capture pipeline. alpha.4 re-armed dynamic (video)
-                // holes EVERY 30ms tick — 33 pipeline resets per second
-                // with the rect unchanged — and the video inside the
-                // hole stuttered. Now: re-arm only on a real rect change
-                // (above) or a re-show (above). Static holes keep a slow
-                // ~0.17Hz self-heal against a frozen capture after
-                // display-mode changes; video holes never get one —
-                // any content change that matters comes with a rect
-                // change, and the Magnifier updates live otherwise.
-                if want_visible
-                    && h.visible
-                    && !h.dynamic
-                    && tick.is_multiple_of(STATIC_EVERY)
-                {
+                // LIVE-CONTENT POKE (alpha.6 — the real refresh model).
+                // The Magnifier control re-captures ONLY when repainted
+                // (see the capture-model note above). Without this poke
+                // a hole shows one static frame forever — the alpha.5
+                // regression. With it, video holes repaint at ~33Hz
+                // WITHOUT any MagSetWindowSource pipeline reset.
+                if want_visible && h.visible {
+                    let every = if h.dynamic { 1 } else { STATIC_POKE_EVERY };
+                    if tick.is_multiple_of(every) {
+                        let _ = InvalidateRect(h.mag, None, false);
+                    }
+                }
+
+                // Static-hole self-heal (~6s): a rare MagSetWindowSource
+                // re-arm in case a display-mode change froze the frame
+                // source entirely. Video holes never get one — their
+                // content is kept live by the poke above, and a source
+                // reset mid-playback is exactly the alpha.4 stutter.
+                if want_visible && h.visible && !h.dynamic && tick.is_multiple_of(STATIC_EVERY) {
                     let _ = MagSetWindowSource(h.mag, h.source);
                 }
             }
@@ -321,12 +349,14 @@ unsafe fn create_pool() -> HolePool {
         // foreground app (browser playing video) can never cover them,
         // no matter how often the user clicks around.
         let host = CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TRANSPARENT
-                | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             HOST_CLASS.as_ptr(),
             w!("Invertonator hole").as_ptr(),
-            WS_POPUP | WS_DISABLED,   // disabled → skipped in hit-testing
-            -10000, -10000, 8, 8,     // parked offscreen
+            WS_POPUP | WS_DISABLED, // disabled → skipped in hit-testing
+            -10000,
+            -10000,
+            8,
+            8, // parked offscreen
             HWND::default(),
             0,
             hinstance,
@@ -339,19 +369,17 @@ unsafe fn create_pool() -> HolePool {
             );
             break;
         }
-        let _ = SetLayeredWindowAttributes(
-            host,
-            COLORREF(0),
-            255,
-            LWA_ALPHA_FLAG,
-        );
+        let _ = SetLayeredWindowAttributes(host, COLORREF(0), 255, LWA_ALPHA_FLAG);
 
         let mag = CreateWindowExW(
             0,
             MAGNIFIER_CLASS.as_ptr(),
             std::ptr::null(),
             WS_CHILD | WS_VISIBLE,
-            0, 0, 8, 8,
+            0,
+            0,
+            8,
+            8,
             host,
             0,
             hinstance,

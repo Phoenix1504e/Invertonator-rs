@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const VERSION: &str = "0.3.0-alpha.5";
+pub const VERSION: &str = "0.3.0-alpha.6";
 
 // =====================================================================
 // Settings — same settings.json format as the C# edition.
@@ -65,7 +65,10 @@ pub struct FeatureSettings {
 
 impl Default for FeatureSettings {
     fn default() -> Self {
-        Self { at_mode: false, dim_level: 0.4 }
+        Self {
+            at_mode: false,
+            dim_level: 0.4,
+        }
     }
 }
 

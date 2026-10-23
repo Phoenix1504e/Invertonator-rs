@@ -34,9 +34,7 @@ fn main() {
     {
         // Gamma inversion is easy on macOS (CGSetDisplayTransferByTable)
         // but true-color holes need private APIs — unsupported for now.
-        eprintln!(
-            "Invertonator-rs: macOS is not supported yet (see README platform matrix)."
-        );
+        eprintln!("Invertonator-rs: macOS is not supported yet (see README platform matrix).");
         std::process::exit(2);
     }
 }

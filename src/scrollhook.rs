@@ -22,8 +22,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetMessageW, SetWindowsHookExW, UnhookWindowsHookEx,
-    HHOOK, MSG, WH_MOUSE_LL, WM_MOUSEHWHEEL, WM_MOUSEWHEEL,
+    CallNextHookEx, GetMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, MSG, WH_MOUSE_LL,
+    WM_MOUSEHWHEEL, WM_MOUSEWHEEL,
 };
 
 /// Holes stay hidden this long after the LAST wheel tick. Refreshed on
@@ -62,12 +62,12 @@ pub fn spawn() -> std::thread::JoinHandle<()> {
         .name("scroll-hook".into())
         .spawn(move || unsafe {
             let hinstance = HINSTANCE::from(GetModuleHandleW(None).unwrap());
-            let hook: HHOOK = match SetWindowsHookExW(
-                WH_MOUSE_LL, Some(hook_proc), hinstance, 0,
-            ) {
+            let hook: HHOOK = match SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), hinstance, 0) {
                 Ok(h) => h,
                 Err(e) => {
-                    tracing::error!("scroll-hook: install failed: {e} — holes will flicker on scroll");
+                    tracing::error!(
+                        "scroll-hook: install failed: {e} — holes will flicker on scroll"
+                    );
                     return;
                 }
             };

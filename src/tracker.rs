@@ -19,22 +19,33 @@
 //   · "video" and "graphic" have no standard numeric type — Chromium
 //     reports them via LocalizedControlType, matched ASCII-case-
 //     insensitively.
-//   · Size gates: image/graphic ≥ 40×40 px (kills favicons, inline
-//     icons), hyperlink ≥ 96×96 px (thumbnail-sized links like the
-//     YouTube grid; text links stay inverted), video ≥ 48×48 px
-//     (alpha.4 let "video" pass at ANY size — tiny custom video-ish
-//     widgets then punched the "small squares scattered on UI" the
-//     user reported).
+//   · Size gates 64×64 px for image/graphic AND video (alpha.6: was
+//     40/48 — every 40–63 px UI icon then punched a "small square
+//     scattered on UI elements"), hyperlink ≥ 96×96 px (thumbnail-
+//     sized links like the YouTube grid; text links stay inverted).
+//     Real media is ≥64 px on both axes in practice; the sidebar
+//     thumbnails (~168×94) still clear the bar via their Image child.
 //   · Depth 60 (alpha.4 capped at 25): YouTube's DOM runs deeper than
 //     25 levels — sidebar thumbnails and watch-page media sit BELOW
-//     the old cap and were silently pruned. That pruning is the prime
-//     suspect for "media outside the player is not recognised".
+//     the old cap and were silently pruned.
+//   · WARM-UP (alpha.6 — the "media outside the player" fix): the
+//     probe's logs showed Chromium hands a UIA client a PARTIALLY
+//     materialized tree on first contact (probe: 419 nodes; the warm-
+//     up FindAll then expanded it). The tracker walked that starved
+//     tree — concentrated around the player — so sidebar/watch media
+//     below the fold was never seen at all. The tracker now runs the
+//     same warm-up FindAll ONCE per foreground window, and if a cached
+//     walk still comes back starved (< warm-up/2 nodes), it does a
+//     full live FindAll walk that tick (2s cooldown).
 //   · Clamp to the foreground window + 4px quantize: off-screen
 //     garbage rects never become holes, and UIA's ±1-3px rect wobble
 //     no longer moves holes / re-arms captures every walk.
-//   · Gap merge (8px) + fixpoint: the video element and its overlay
-//     canvases are reported as near-adjacent siblings — one media can
-//     no longer end up as "multiple holes side by side".
+//   · Merge = near (8px seam tolerance) AND growth ≤ 1.3× the larger
+//     fragment (alpha.6 guard): fragments of ONE media (element +
+//     overlay/canvas siblings, near-identical rects) still union into
+//     a single hole, but the YouTube thumbnail GRID — items ~8–12px
+//     apart — no longer chains into one mega-hole (a grid pair unions
+//     to 2.0×, blocked).
 //   · Cap at MAX_HOLES, largest first.
 //
 //   COORDINATES: screen physical pixels end to end (per-monitor-v2
@@ -46,33 +57,29 @@ use std::time::Duration;
 
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER,
-    COINIT_APARTMENTTHREADED,
+    CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
 };
 use windows::Win32::UI::Accessibility::{
-    CUIAutomation, IUIAutomation, IUIAutomationElement,
-    TreeScope_Descendants, UIA_BoundingRectanglePropertyId,
-    UIA_ControlTypePropertyId, UIA_DocumentControlTypeId,
-    UIA_HyperlinkControlTypeId, UIA_ImageControlTypeId,
-    UIA_LocalizedControlTypePropertyId, UIA_NamePropertyId,
-    UIA_CONTROLTYPE_ID,
+    CUIAutomation, IUIAutomation, IUIAutomationElement, TreeScope_Descendants,
+    UIA_BoundingRectanglePropertyId, UIA_ControlTypePropertyId, UIA_DocumentControlTypeId,
+    UIA_HyperlinkControlTypeId, UIA_ImageControlTypeId, UIA_LocalizedControlTypePropertyId,
+    UIA_NamePropertyId, UIA_CONTROLTYPE_ID,
 };
-use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetWindowTextW, GetWindowRect,
-};
+use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowRect, GetWindowTextW};
 
 use crate::holes::{HoleSpec, Holes, MAX_HOLES};
 
-const DISCOVERY_MS: u64 = 400;       // active cadence (page changing)
-const MAX_DISCOVERY_MS: u64 = 1500;  // idle backoff cap (page stable)
-const MIN_MEDIA: i32 = 40;   // image/graphic min w and h (px)
-const MIN_LINK: i32 = 96;    // hyperlink min w and h (px)
-const MIN_VIDEO: i32 = 48;   // video min w and h (px) — NO more any-size
-const MIN_HOLE: i32 = 32;    // final hole min — degenerate slivers out
-const MERGE_GAP: i32 = 8;    // near-adjacent fragments of one media
-const QUANTUM: i32 = 4;      // rect quantization grid (px)
+const DISCOVERY_MS: u64 = 400; // active cadence (page changing)
+const MAX_DISCOVERY_MS: u64 = 1500; // idle backoff cap (page stable)
+const MIN_MEDIA: i32 = 64; // image/graphic AND video min w and h (px)
+const MIN_LINK: i32 = 96; // hyperlink min w and h (px)
+const MIN_HOLE: i32 = 32; // final hole min — degenerate slivers out
+const MERGE_GAP: i32 = 8; // near-adjacent fragments of one media
+const MERGE_GROWTH: f64 = 1.3; // max union growth vs the larger fragment
+const QUANTUM: i32 = 4; // rect quantization grid (px)
 const MAX_NODES: u32 = 100_000;
-const MAX_DEPTH: u32 = 60;   // alpha.4 capped at 25 — YouTube runs deeper
+const MAX_DEPTH: u32 = 60; // alpha.4 capped at 25 — YouTube runs deeper
+const LIVE_COOLDOWN_MS: u64 = 2000; // starvation live-walk throttle
 
 /// One-shot flag: the Gecko live-fallback notice is logged exactly once
 /// per process (discovery ticks every 400ms — per-tick logs would spam
@@ -106,7 +113,12 @@ impl Tracker {
             .spawn(move || discovery_loop(th_holes, th_enabled, th_stop))
             .expect("tracker: discovery thread spawn");
 
-        Self { holes, enabled, stop, thread: Some(thread) }
+        Self {
+            holes,
+            enabled,
+            stop,
+            thread: Some(thread),
+        }
     }
 
     /// true = discover holes for the foreground window. false = clear
@@ -142,34 +154,74 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
             tracing::info!("tracker: CoInitializeEx: {hr} (ok if already init)");
         }
     }
-    let automation: IUIAutomation = match unsafe {
-        CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
-    } {
-        Ok(a) => a,
-        Err(e) => {
-            tracing::error!("tracker: CoCreateInstance failed: {e} — tracker dead");
-            return;
-        }
-    };
+    let automation: IUIAutomation =
+        match unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) } {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!("tracker: CoCreateInstance failed: {e} — tracker dead");
+                return;
+            }
+        };
     tracing::info!("tracker: alive (discovery every {DISCOVERY_MS}ms)");
 
     let mut had_specs = false;
     let mut last_sig = String::new();
     let mut last_rects = String::new();
+    let mut last_cands = String::new();
     let mut last_fg: usize = 0;
     let mut interval = DISCOVERY_MS;
     let mut last_beat = std::time::Instant::now();
+    // Warm-up + live-walk state (alpha.6): the warm-up runs once per
+    // foreground window; the starvation live-walk is throttled.
+    let mut warm_fg: usize = 0;
+    let mut warm_total: u32 = 0;
+    let mut last_live = std::time::Instant::now();
     while !stop.load(Ordering::Relaxed) {
         if enabled.load(Ordering::Relaxed) {
             let fg = unsafe { GetForegroundWindow() };
             let t0 = std::time::Instant::now();
-            let specs = if fg.is_invalid() {
-                Vec::new()
+            let (specs, cand_dump) = if fg.is_invalid() {
+                (Vec::new(), String::new())
             } else {
-                unsafe { discover(&automation, fg) }
+                // WARM-UP (alpha.6): first contact with a foreground
+                // window — force the provider to materialize its full
+                // accessibility tree and record how big it really is.
+                // Chromium hands out a PARTIAL tree otherwise, and the
+                // tracker then only ever saw the player-adjacent part
+                // ("media outside the player is not recognised").
+                if fg.0 as usize != warm_fg {
+                    warm_fg = fg.0 as usize;
+                    let (n, rect_line) = unsafe { warmup(&automation, fg) };
+                    warm_total = n;
+                    if !rect_line.is_empty() {
+                        tracing::info!("tracker: {rect_line}");
+                    }
+                    if warm_total > 0 {
+                        tracing::info!("tracker: warm-up FindAll: {warm_total} elements");
+                    }
+                }
+                let allow_live =
+                    last_live.elapsed() >= std::time::Duration::from_millis(LIVE_COOLDOWN_MS);
+                let (s, dump, went_live) =
+                    unsafe { discover(&automation, fg, warm_total, allow_live) };
+                if went_live {
+                    last_live = std::time::Instant::now();
+                }
+                (s, dump)
             };
             let walk_ms = t0.elapsed().as_millis();
             let n_holes = specs.len();
+
+            // CANDIDATE OBSERVABILITY (alpha.6): every gated candidate
+            // (BEFORE merging), so the log shows exactly which elements
+            // the walker saw and where — the ground truth for any
+            // "hole is in the wrong place" report.
+            if cand_dump != last_cands {
+                if !cand_dump.is_empty() {
+                    tracing::info!("tracker: cands [{cand_dump}]");
+                }
+                last_cands = cand_dump;
+            }
 
             // HOLE-SET OBSERVABILITY (alpha.5): whenever the hole set
             // changes shape, dump every hole rect. This is the ground
@@ -246,6 +298,38 @@ fn window_title(hwnd: HWND) -> String {
     }
 }
 
+/// First-contact warm-up (alpha.6): count the provider's REAL element
+/// population and capture the foreground window rect (coordinate
+/// ground truth for the log). The FindAll itself forces Chromium to
+/// materialize the full accessibility tree — without it, the cached
+/// walk only sees whatever fragment Chromium had handy.
+unsafe fn warmup(automation: &IUIAutomation, fg: HWND) -> (u32, String) {
+    let mut rect_line = String::new();
+    let mut fg_rect = RECT::default();
+    if GetWindowRect(fg, &mut fg_rect).is_ok() {
+        rect_line = format!(
+            "fg rect ({},{}),({},{}) {}x{}",
+            fg_rect.left,
+            fg_rect.top,
+            fg_rect.right,
+            fg_rect.bottom,
+            fg_rect.right - fg_rect.left,
+            fg_rect.bottom - fg_rect.top
+        );
+    }
+    let Ok(root) = automation.ElementFromHandle(fg) else {
+        return (0, rect_line);
+    };
+    let Ok(cond) = automation.CreateTrueCondition() else {
+        return (0, rect_line);
+    };
+    let Ok(all) = root.FindAll(TreeScope_Descendants, &cond) else {
+        return (0, rect_line);
+    };
+    let n = all.Length().unwrap_or(0).max(0) as u32;
+    (n, rect_line)
+}
+
 // =====================================================================
 // Tree walk
 // =====================================================================
@@ -264,6 +348,8 @@ struct Candidate {
     w: i32,
     h: i32,
     dynamic: bool,
+    /// "img" | "lnk" | "vid" — for the candidate observability dump.
+    kind: &'static str,
 }
 
 struct WalkCtx {
@@ -275,7 +361,12 @@ struct WalkCtx {
 }
 
 /// Walk the foreground window and return the desired hole set.
-unsafe fn discover(automation: &IUIAutomation, fg: HWND) -> Vec<HoleSpec> {
+unsafe fn discover(
+    automation: &IUIAutomation,
+    fg: HWND,
+    warm_total: u32,
+    allow_live: bool,
+) -> (Vec<HoleSpec>, String, bool) {
     // Foreground window rect — the clamp anchor for every candidate.
     let mut fg_rect = RECT::default();
     let fg_opt = if GetWindowRect(fg, &mut fg_rect).is_ok() {
@@ -285,7 +376,7 @@ unsafe fn discover(automation: &IUIAutomation, fg: HWND) -> Vec<HoleSpec> {
     };
 
     let Ok(root) = automation.ElementFromHandle(fg) else {
-        return Vec::new();
+        return (Vec::new(), String::new(), false);
     };
 
     // Cached walk (the probe's proven main path).
@@ -295,15 +386,35 @@ unsafe fn discover(automation: &IUIAutomation, fg: HWND) -> Vec<HoleSpec> {
         let _ = cache.AddProperty(UIA_LocalizedControlTypePropertyId);
         let _ = cache.AddProperty(UIA_BoundingRectanglePropertyId);
         if let Ok(cached_root) = root.BuildUpdatedCache(&cache) {
-            let mut ctx =
-                WalkCtx { total: 0, docs: 0, fg: fg_opt, candidates: Vec::new() };
+            let mut ctx = WalkCtx {
+                total: 0,
+                docs: 0,
+                fg: fg_opt,
+                candidates: Vec::new(),
+            };
             walk_cached(&cached_root, false, 0, &mut ctx);
             // GECKO GUARD: Gecko/LibreWolf succeed at BuildUpdatedCache
             // but never fill CachedChildren — the walk sees only the
             // root element. Don't hand back an empty hole set then;
             // drop to the live walk, which works on every provider.
             if ctx.total > 1 {
-                return ctx_to_specs(ctx);
+                // STARVATION GUARD (alpha.6): a cached walk that saw
+                // LESS THAN HALF the warm-up population means the
+                // provider is still handing out a partial tree (the
+                // Chromium lazy-materialization case). One live FindAll
+                // walk fixes the hole set for this tick; the 2s
+                // cooldown keeps the tax off the video renderer.
+                if warm_total > 50 && ctx.total * 2 < warm_total && allow_live {
+                    tracing::info!(
+                        "tracker: cached walk starved ({}/{} nodes) — live walk this tick",
+                        ctx.total,
+                        warm_total
+                    );
+                    let (specs, dump) = live_discover(automation, &root, ctx.fg, false);
+                    return (specs, dump, true);
+                }
+                let (specs, dump) = ctx_to_specs(ctx);
+                return (specs, dump, false);
             }
             if !FALLBACK_LOGGED.swap(true, Ordering::Relaxed) {
                 tracing::info!(
@@ -318,14 +429,38 @@ unsafe fn discover(automation: &IUIAutomation, fg: HWND) -> Vec<HoleSpec> {
     // FALLBACK: flat live FindAll (no document scoping possible cheaply
     // — gates still apply). Same shape as the probe's fallback.
     tracing::debug!("tracker: cached walk unavailable — live fallback");
+    let (specs, dump) = live_discover(automation, &root, fg_opt, true);
+    (specs, dump, false)
+}
+
+/// Flat live FindAll walk: enumerate ALL descendants, classify each.
+/// Works on every provider — never relies on CachedChildren.
+/// `log_len` = mention the element count in the log (the permanent-
+/// fallback path logs it; the starvation path already explained why).
+unsafe fn live_discover(
+    automation: &IUIAutomation,
+    root: &IUIAutomationElement,
+    fg: Option<RECT>,
+    log_len: bool,
+) -> (Vec<HoleSpec>, String) {
     let Ok(true_cond) = automation.CreateTrueCondition() else {
-        return Vec::new();
+        return (Vec::new(), String::new());
     };
     let Ok(all) = root.FindAll(TreeScope_Descendants, &true_cond) else {
-        return Vec::new();
+        return (Vec::new(), String::new());
     };
-    let Ok(len) = all.Length() else { return Vec::new() };
-    let mut ctx = WalkCtx { total: 0, docs: 0, fg: fg_opt, candidates: Vec::new() };
+    let Ok(len) = all.Length() else {
+        return (Vec::new(), String::new());
+    };
+    if log_len {
+        tracing::debug!("tracker: live walk: {len} elements");
+    }
+    let mut ctx = WalkCtx {
+        total: 0,
+        docs: 0,
+        fg,
+        candidates: Vec::new(),
+    };
     for i in 0..len {
         if ctx.total > MAX_NODES {
             break;
@@ -425,6 +560,11 @@ fn classify(ct: UIA_CONTROLTYPE_ID, lct: &str) -> Option<MediaKind> {
 /// Physical pixels end to end.
 fn offer_candidate(kind: Option<MediaKind>, rect: &RECT, ctx: &mut WalkCtx) {
     let Some(kind) = kind else { return };
+    let kind_tag = match kind {
+        MediaKind::Image => "img",
+        MediaKind::Link => "lnk",
+        MediaKind::Video => "vid",
+    };
     let mut x = rect.left;
     let mut y = rect.top;
     let mut w = rect.right - rect.left;
@@ -465,12 +605,14 @@ fn offer_candidate(kind: Option<MediaKind>, rect: &RECT, ctx: &mut WalkCtx) {
     h = bq - yq;
 
     let passes = match kind {
+        // alpha.6: image/graphic AND video gates raised 40/48 → 64 px.
+        // Real media is ≥64 px on both axes in practice; every 40–63 px
+        // UI icon (comment avatars, player-overlay buttons, app chrome)
+        // used to clear the old bar and punch the "small squares
+        // scattered on UI elements" the user kept reporting.
         MediaKind::Image => w >= MIN_MEDIA && h >= MIN_MEDIA,
         MediaKind::Link => w >= MIN_LINK && h >= MIN_LINK,
-        // "video" used to pass at ANY size — hidden preview players,
-        // spinners and other tiny video-ish widgets then punched the
-        // "small squares scattered on UI elements".
-        MediaKind::Video => w >= MIN_VIDEO && h >= MIN_VIDEO,
+        MediaKind::Video => w >= MIN_MEDIA && h >= MIN_MEDIA,
     };
     if !passes {
         return;
@@ -481,6 +623,7 @@ fn offer_candidate(kind: Option<MediaKind>, rect: &RECT, ctx: &mut WalkCtx) {
         w,
         h,
         dynamic: kind == MediaKind::Video,
+        kind: kind_tag,
     });
 }
 
@@ -502,6 +645,22 @@ impl Candidate {
             && o.y < self.y + self.h + MERGE_GAP
     }
 
+    /// Proximity AND growth guard (alpha.6): merge only if the union
+    /// stays within MERGE_GROWTH (1.3×) of the larger fragment.
+    /// Fragments of one media (element + overlay + canvas, rects
+    /// near-identical or slightly offset) union to ~1.0–1.2× — they
+    /// merge. The YouTube thumbnail grid sits ~8–12px apart — a grid
+    /// pair unions to 2.0× — blocked, so the 8px proximity rule can
+    /// no longer chain the whole sidebar into one mega-hole.
+    fn same_media(&self, o: &Candidate) -> bool {
+        if !self.near(o) {
+            return false;
+        }
+        let u = self.union(*o);
+        let max_a = self.area().max(o.area()) as f64;
+        u.area() as f64 <= MERGE_GROWTH * max_a
+    }
+
     /// Union rect of two candidates (dynamic = either).
     fn union(self, o: Candidate) -> Candidate {
         let x = self.x.min(o.x);
@@ -514,6 +673,7 @@ impl Candidate {
             w: r - x,
             h: b - y,
             dynamic: self.dynamic || o.dynamic,
+            kind: if self.dynamic { self.kind } else { o.kind },
         }
     }
 
@@ -522,9 +682,24 @@ impl Candidate {
     }
 }
 
-fn ctx_to_specs(ctx: WalkCtx) -> Vec<HoleSpec> {
+fn ctx_to_specs(ctx: WalkCtx) -> (Vec<HoleSpec>, String) {
     if ctx.candidates.is_empty() {
-        return Vec::new();
+        return (Vec::new(), String::new());
+    }
+
+    // CANDIDATE DUMP (alpha.6): the gated candidate set BEFORE merging
+    // — kind, size, position. This is what turns the next "holes are
+    // in the wrong place" report into a precise diagnosis: the log
+    // will show exactly which element produced which rect.
+    let mut dump = String::new();
+    for (i, c) in ctx.candidates.iter().enumerate().take(12) {
+        dump.push_str(&format!(
+            "{}{} {}x{}@({},{})  ",
+            c.kind, i, c.w, c.h, c.x, c.y
+        ));
+    }
+    if ctx.candidates.len() > 12 {
+        dump.push_str(&format!("+{}", ctx.candidates.len() - 12));
     }
 
     // Largest first.
@@ -540,7 +715,7 @@ fn ctx_to_specs(ctx: WalkCtx) -> Vec<HoleSpec> {
         }
         let mut merged = false;
         for k in kept.iter_mut() {
-            if k.near(&c) {
+            if k.same_media(&c) {
                 *k = k.union(c);
                 merged = true;
                 break;
@@ -553,13 +728,13 @@ fn ctx_to_specs(ctx: WalkCtx) -> Vec<HoleSpec> {
 
     // FIXPOINT (alpha.5): a union can grow until it touches another
     // kept hole — repeat pairwise merging until stable, so one media
-    // NEVER stays split across two holes.
+    // NEVER stays split across two holes. Same growth guard applies.
     let mut changed = true;
     while changed {
         changed = false;
         for i in 0..kept.len() {
             for j in ((i + 1)..kept.len()).rev() {
-                if kept[i].near(&kept[j]) {
+                if kept[i].same_media(&kept[j]) {
                     kept[i] = kept[i].union(kept[j]);
                     kept.remove(j);
                     changed = true;
@@ -575,7 +750,15 @@ fn ctx_to_specs(ctx: WalkCtx) -> Vec<HoleSpec> {
         kept.truncate(MAX_HOLES);
     }
 
-    kept.into_iter()
-        .map(|k| HoleSpec { x: k.x, y: k.y, w: k.w, h: k.h, dynamic: k.dynamic })
-        .collect()
+    let specs = kept
+        .into_iter()
+        .map(|k| HoleSpec {
+            x: k.x,
+            y: k.y,
+            w: k.w,
+            h: k.h,
+            dynamic: k.dynamic,
+        })
+        .collect();
+    (specs, dump)
 }

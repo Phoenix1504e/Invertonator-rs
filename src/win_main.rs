@@ -25,20 +25,18 @@ use crate::common::{init_logging, Settings, VERSION};
 use crate::holes::{HolePool, Holes};
 use crate::tracker::Tracker;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM, HINSTANCE};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, HOT_KEY_MODIFIERS};
 use windows::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NOTIFYICONDATAW,
-    NIM_ADD, NIM_DELETE, NIM_MODIFY,
+    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+    NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, DispatchMessageW, GetMessageW, LoadCursorW,
-    LoadImageW, RegisterClassW, TranslateMessage, DestroyWindow, PostQuitMessage,
-    HICON, IMAGE_ICON, LR_DEFAULTSIZE, MSG,
-    WNDCLASSW, CS_HREDRAW, CS_VREDRAW, IDC_ARROW, CW_USEDEFAULT, WM_DESTROY,
-    GetForegroundWindow,
+    DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow, GetMessageW, LoadCursorW,
+    LoadImageW, PostQuitMessage, RegisterClassW, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
+    CW_USEDEFAULT, HICON, IDC_ARROW, IMAGE_ICON, LR_DEFAULTSIZE, MSG, WM_DESTROY, WNDCLASSW,
 };
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, SetWindowLongPtrW, GWLP_USERDATA,
 };
@@ -65,11 +63,11 @@ mod magnification {
     }
 
     pub const INVERT: [[f32; 5]; 5] = [
-        [-1.0,  0.0,  0.0, 0.0, 0.0],
-        [ 0.0, -1.0,  0.0, 0.0, 0.0],
-        [ 0.0,  0.0, -1.0, 0.0, 0.0],
-        [ 0.0,  0.0,  0.0, 1.0, 0.0],
-        [ 1.0,  1.0,  1.0, 0.0, 1.0],
+        [-1.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, -1.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, -1.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0, 0.0],
+        [1.0, 1.0, 1.0, 0.0, 1.0],
     ];
 
     pub const IDENTITY: [[f32; 5]; 5] = [
@@ -82,9 +80,9 @@ mod magnification {
 
     pub fn dim_matrix(d: f32) -> [[f32; 5]; 5] {
         [
-            [d,   0.0, 0.0, 0.0, 0.0],
-            [0.0, d,   0.0, 0.0, 0.0],
-            [0.0, 0.0, d,   0.0, 0.0],
+            [d, 0.0, 0.0, 0.0, 0.0],
+            [0.0, d, 0.0, 0.0, 0.0],
+            [0.0, 0.0, d, 0.0, 0.0],
             [0.0, 0.0, 0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0, 0.0, 1.0],
         ]
@@ -117,7 +115,10 @@ extern "system" {
         lpclassname: *const u16,
         lpwindowname: *const u16,
         dwstyle: u32,
-        x: i32, y: i32, nwidth: i32, nheight: i32,
+        x: i32,
+        y: i32,
+        nwidth: i32,
+        nheight: i32,
         hwndparent: HWND,
         hmenu: isize,
         hinstance: HINSTANCE,
@@ -134,12 +135,10 @@ mod uia {
 
     use windows::Win32::Foundation::HWND;
     use windows::Win32::System::Com::{
-        CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER,
-        COINIT_APARTMENTTHREADED,
+        CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
     };
     use windows::Win32::UI::Accessibility::{
-        CUIAutomation, IUIAutomation, IUIAutomationElement,
-        TreeScope_Descendants,
+        CUIAutomation, IUIAutomation, IUIAutomationElement, TreeScope_Descendants,
         UIA_BoundingRectanglePropertyId, UIA_ControlTypePropertyId,
         UIA_LocalizedControlTypePropertyId, UIA_NamePropertyId,
     };
@@ -248,7 +247,9 @@ mod uia {
                 tracing::error!("uia-probe: FindAll failed");
                 return (0, 0, Vec::new());
             };
-            let Ok(len) = all.Length() else { return (0, 0, Vec::new()); };
+            let Ok(len) = all.Length() else {
+                return (0, 0, Vec::new());
+            };
             tracing::info!("uia-probe live walk: FindAll returned {len} elements");
 
             let mut total: u32 = 0;
@@ -294,21 +295,20 @@ mod uia {
                 .CachedLocalizedControlType()
                 .map(|s| s.to_string())
                 .unwrap_or_default();
-            let name = el
-                .CachedName()
-                .map(|s| s.to_string())
-                .unwrap_or_default();
+            let name = el.CachedName().map(|s| s.to_string()).unwrap_or_default();
 
             let lct_lower = lct.to_lowercase();
             if matches!(lct_lower.as_str(), "image" | "graphic" | "link" | "video") {
                 *media += 1;
-                if samples.len() < 24 {
+                if samples.len() < 40 {
                     let rect = el.CachedBoundingRectangle().unwrap_or_default();
                     let n = trunc(&name, 30);
                     samples.push(format!(
                         "[{lct}] \"{n}\" {}x{} @({},{})",
-                        rect.right - rect.left, rect.bottom - rect.top,
-                        rect.left, rect.top
+                        rect.right - rect.left,
+                        rect.bottom - rect.top,
+                        rect.left,
+                        rect.top
                     ));
                 }
             }
@@ -359,12 +359,14 @@ mod uia {
             let lct_lower = lct.to_lowercase();
             if matches!(lct_lower.as_str(), "image" | "graphic" | "link" | "video") {
                 *media += 1;
-                if samples.len() < 24 {
+                if samples.len() < 40 {
                     let n = trunc(&name, 30);
                     samples.push(format!(
                         "[{lct}] \"{n}\" {}x{} @({},{})",
-                        rect.right - rect.left, rect.bottom - rect.top,
-                        rect.left, rect.top
+                        rect.right - rect.left,
+                        rect.bottom - rect.top,
+                        rect.left,
+                        rect.top
                     ));
                 }
             }
@@ -379,15 +381,12 @@ mod uia {
 // =====================================================================
 
 mod magprobe {
-    use windows::Win32::Foundation::{
-        BOOL, HINSTANCE, HWND, RECT, LPARAM, LRESULT, WPARAM,
-    };
-    use windows::Win32::UI::WindowsAndMessaging::HMENU;
+    use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::WindowsAndMessaging::HMENU;
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW,
-        ShowWindow, SW_SHOWNOACTIVATE, WS_CHILD, WS_VISIBLE,
-        WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, ShowWindow,
+        SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW, WS_CHILD, WS_VISIBLE,
     };
 
     #[link(name = "Magnification")]
@@ -398,11 +397,8 @@ mod magprobe {
     }
 
     const INVERT_FLAT: [f32; 25] = [
-        -1.0, 0.0, 0.0, 0.0, 0.0,
-        0.0, -1.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, -1.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 1.0, 0.0,
-        1.0, 1.0, 1.0, 0.0, 1.0,
+        -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0,
     ];
 
     // The crate's DefWindowProcW is generic — wrap it in a concrete
@@ -434,9 +430,12 @@ mod magprobe {
             class_name,
             windows::core::w!("InvertonatorMagProbe"),
             WINDOW_STYLE(0x9000_0000), // WS_POPUP | WS_VISIBLE
-            100, 100, 300, 200,
-            None,                    // no parent
-            HMENU::default(),        // no menu
+            100,
+            100,
+            300,
+            200,
+            None,             // no parent
+            HMENU::default(), // no menu
             hinstance,
             None,
         )
@@ -453,7 +452,10 @@ mod magprobe {
             windows::core::w!("Magnifier"),
             windows::core::PCWSTR::null(),
             WINDOW_STYLE((WS_CHILD | WS_VISIBLE).0),
-            0, 0, 300, 200,
+            0,
+            0,
+            300,
+            200,
             Some(&host),
             HMENU::default(),
             hinstance,
@@ -467,7 +469,12 @@ mod magprobe {
         }
 
         // Source region (screen area it captures) + 1:1 transform + invert.
-        let src = RECT { left: 100, top: 100, right: 400, bottom: 300 };
+        let src = RECT {
+            left: 100,
+            top: 100,
+            right: 400,
+            bottom: 300,
+        };
         let set_src = MagSetWindowSource(mag, src).as_bool();
         let transform: [f32; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
         let set_tf = MagSetWindowTransform(mag, transform.as_ptr()).as_bool();
@@ -523,9 +530,11 @@ impl AppState {
         tracing::info!("apply mode={:?} invert_on={} ok={}", mode, invert_on, ok);
 
         // Holes only exist in Invert mode (v1.0 design: Dim = watch mode).
-        self.holes.set_active(invert_on && mode == ScreenMode::Invert);
+        self.holes
+            .set_active(invert_on && mode == ScreenMode::Invert);
         // Same rule for media discovery — the tracker idles in Dim/Off.
-        self.tracker.set_enabled(invert_on && mode == ScreenMode::Invert);
+        self.tracker
+            .set_enabled(invert_on && mode == ScreenMode::Invert);
     }
 
     fn cycle_mode(&mut self) {
@@ -604,10 +613,18 @@ unsafe fn register_hotkeys(hwnd: HWND) -> bool {
     // to F9 then F8 so the mag diagnostic is always reachable.
     let mut e = register(HOTKEY_MAGPROBE, VK_F11, "mag-window-probe");
     if !e {
-        e = register(HOTKEY_MAGPROBE, VK_F9, "mag-window-probe (F11 taken, trying F9)");
+        e = register(
+            HOTKEY_MAGPROBE,
+            VK_F9,
+            "mag-window-probe (F11 taken, trying F9)",
+        );
     }
     if !e {
-        e = register(HOTKEY_MAGPROBE, VK_F8, "mag-window-probe (F9 taken too, trying F8)");
+        e = register(
+            HOTKEY_MAGPROBE,
+            VK_F8,
+            "mag-window-probe (F9 taken too, trying F8)",
+        );
     }
     let f = register(HOTKEY_PIERCE, VK_F7, "pierce");
     a && b && c && d && e && f
@@ -625,12 +642,7 @@ unsafe fn update_tray_tip(nid: &mut NOTIFYICONDATAW, text: &str) {
 // Window procedure
 // =====================================================================
 
-unsafe extern "system" fn wndproc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
+unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState;
 
     // WM_DESTROY handled FIRST: clear the userdata slot so no later
@@ -730,9 +742,7 @@ fn set_dpi_awareness() {
     unsafe {
         // Win10 1703+. If unavailable, fall back; if even that fails,
         // log loudly — holes WILL misplace on scaled displays.
-        if SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
-            .is_err()
-        {
+        if SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2).is_err() {
             if !SetProcessDPIAware().as_bool() {
                 tracing::warn!(
                     "dpi: awareness unavailable — holes will misplace on scaled displays"
@@ -754,7 +764,10 @@ pub fn run() {
     // Logging: %LOCALAPPDATA%\Invertonator\log.txt (shared helper).
     init_logging();
 
-    tracing::info!("=== Invertonator-rs v{} (windows: magnifier + uia) ===", VERSION);
+    tracing::info!(
+        "=== Invertonator-rs v{} (windows: magnifier + uia) ===",
+        VERSION
+    );
 
     let settings = Settings::load();
     tracing::info!("settings: dimLevel={}", settings.features.dim_level);
@@ -796,8 +809,10 @@ pub fn run() {
             class_name.as_ptr(),
             windows::core::w!("Invertonator").as_ptr(),
             0,
-            CW_USEDEFAULT, CW_USEDEFAULT,
-            CW_USEDEFAULT, CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
             HWND::default(),
             0,
             hinstance,
@@ -814,12 +829,18 @@ pub fn run() {
             .and_then(|p| p.parent().map(|d| d.join("icon.ico")))
             .filter(|p| p.exists())
             .and_then(|p| {
-                let wide: Vec<u16> = p.as_os_str().to_string_lossy()
-                    .encode_utf16().chain([0]).collect();
+                let wide: Vec<u16> = p
+                    .as_os_str()
+                    .to_string_lossy()
+                    .encode_utf16()
+                    .chain([0])
+                    .collect();
                 LoadImageW(
                     Some(&hinstance),
                     windows::core::PCWSTR(wide.as_ptr()),
-                    IMAGE_ICON, 0, 0,
+                    IMAGE_ICON,
+                    0,
+                    0,
                     LR_DEFAULTSIZE,
                 )
                 .ok()
@@ -830,9 +851,7 @@ pub fn run() {
         let state_ptr = Box::into_raw(Box::new(AppState {
             mode: ScreenMode::Invert,
             invert_on: AtomicBool::new(true),
-            dim_level_milli: AtomicUsize::new(
-                (settings.features.dim_level * 1000.0) as usize
-            ),
+            dim_level_milli: AtomicUsize::new((settings.features.dim_level * 1000.0) as usize),
             pierce_on: false,
             holes,
             pool,
@@ -865,7 +884,10 @@ pub fn run() {
         // Hole pump — 33Hz tick on main. All Mag*/window calls run on
         // the thread that created the windows (the F11 rule).
         let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(
-            Some(&hwnd), 1, crate::holes::PUMP_MS, None,
+            Some(&hwnd),
+            1,
+            crate::holes::PUMP_MS,
+            None,
         );
 
         let mut msg = MSG::default();

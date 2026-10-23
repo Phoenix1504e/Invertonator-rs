@@ -71,9 +71,17 @@ impl Lut {
     fn identity(size: usize) -> Lut {
         // size < 2 (degenerate LUT): full-on is the least surprising.
         let gen = move |i: usize| -> c_ushort {
-            if size < 2 { 65535 } else { ((i * 65535) / (size - 1)) as c_ushort }
+            if size < 2 {
+                65535
+            } else {
+                ((i * 65535) / (size - 1)) as c_ushort
+            }
         };
-        let mut lut = Lut { red: Vec::new(), green: Vec::new(), blue: Vec::new() };
+        let mut lut = Lut {
+            red: Vec::new(),
+            green: Vec::new(),
+            blue: Vec::new(),
+        };
         Lut::fill(&mut lut.red, size, gen);
         Lut::fill(&mut lut.green, size, gen);
         Lut::fill(&mut lut.blue, size, gen);
@@ -82,9 +90,17 @@ impl Lut {
 
     fn inverted(size: usize) -> Lut {
         let gen = move |i: usize| -> c_ushort {
-            if size < 2 { 0 } else { (((size - 1 - i) * 65535) / (size - 1)) as c_ushort }
+            if size < 2 {
+                0
+            } else {
+                (((size - 1 - i) * 65535) / (size - 1)) as c_ushort
+            }
         };
-        let mut lut = Lut { red: Vec::new(), green: Vec::new(), blue: Vec::new() };
+        let mut lut = Lut {
+            red: Vec::new(),
+            green: Vec::new(),
+            blue: Vec::new(),
+        };
         Lut::fill(&mut lut.red, size, gen);
         Lut::fill(&mut lut.green, size, gen);
         Lut::fill(&mut lut.blue, size, gen);
@@ -152,7 +168,9 @@ fn ramp_is_inverted(l: &Lut) -> bool {
     }
     let size = r.len();
     let tol = 65535usize / (size - 1).max(1) + 300;
-    let monotonic = r.windows(2).all(|w| (w[1] as usize) <= (w[0] as usize) + tol);
+    let monotonic = r
+        .windows(2)
+        .all(|w| (w[1] as usize) <= (w[0] as usize) + tol);
     let span = (r[0] as usize).saturating_sub(r[size - 1] as usize);
     monotonic && span > 65535 / 2
 }
@@ -198,18 +216,15 @@ impl Drop for Session {
 
 impl Session {
     fn open() -> Result<Session, String> {
-        let xlib = Xlib::open().map_err(|e| {
-            format!("libX11 unavailable ({e}) — is an X11 stack installed?")
-        })?;
+        let xlib = Xlib::open()
+            .map_err(|e| format!("libX11 unavailable ({e}) — is an X11 stack installed?"))?;
         let rr = Xrandr::open()
             .map_err(|e| format!("libXrandr unavailable ({e}) — XRandR 1.2+ required"))?;
         unsafe {
             (xlib.XSetErrorHandler)(Some(x_err_handler));
             let dpy = (xlib.XOpenDisplay)(std::ptr::null());
             if dpy.is_null() {
-                return Err(
-                    "XOpenDisplay failed — $DISPLAY unset or no X server reachable".into()
-                );
+                return Err("XOpenDisplay failed — $DISPLAY unset or no X server reachable".into());
             }
             let root = (xlib.XDefaultRootWindow)(dpy);
             Ok(Session {
@@ -344,12 +359,22 @@ impl Session {
             ];
             for extra in extras {
                 (self.xlib.XGrabKey)(
-                    self.dpy, self.kc_toggle as c_int, base | extra, self.root,
-                    xlib::False, xlib::GrabModeAsync, xlib::GrabModeAsync,
+                    self.dpy,
+                    self.kc_toggle as c_int,
+                    base | extra,
+                    self.root,
+                    xlib::False,
+                    xlib::GrabModeAsync,
+                    xlib::GrabModeAsync,
                 );
                 (self.xlib.XGrabKey)(
-                    self.dpy, self.kc_quit as c_int, base | extra, self.root,
-                    xlib::False, xlib::GrabModeAsync, xlib::GrabModeAsync,
+                    self.dpy,
+                    self.kc_quit as c_int,
+                    base | extra,
+                    self.root,
+                    xlib::False,
+                    xlib::GrabModeAsync,
+                    xlib::GrabModeAsync,
                 );
             }
             (self.xlib.XSync)(self.dpy, xlib::False);
@@ -392,9 +417,7 @@ pub fn run() {
     let restore_only = args.iter().any(|a| a == "--restore");
 
     init_logging();
-    tracing::info!(
-        "=== Invertonator-rs v{VERSION} (linux-x11: gamma inversion) ==="
-    );
+    tracing::info!("=== Invertonator-rs v{VERSION} (linux-x11: gamma inversion) ===");
 
     if let Err(e) = x11_run(restore_only) {
         tracing::error!("{e}");
@@ -405,9 +428,7 @@ pub fn run() {
 }
 
 fn x11_run(restore_only: bool) -> Result<(), String> {
-    if std::env::var_os("WAYLAND_DISPLAY").is_some()
-        && std::env::var_os("DISPLAY").is_none()
-    {
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() && std::env::var_os("DISPLAY").is_none() {
         return Err(
             "Wayland session detected (WAYLAND_DISPLAY set, DISPLAY empty). \
              This backend needs an X11 session — native Wayland support \
@@ -439,15 +460,16 @@ fn x11_run(restore_only: bool) -> Result<(), String> {
     println!("Invertonator v{VERSION} (linux-x11): {msg}");
 
     loop {
-        let mut ev = xlib::XEvent { pad: [0 as c_long; 24] };
+        let mut ev = xlib::XEvent {
+            pad: [0 as c_long; 24],
+        };
         unsafe { (session.xlib.XNextEvent)(session.dpy, &mut ev) };
 
         // XEvent storage is a 24-c_long block; XKeyEvent overlays its
         // head exactly as in C — read it with a pointer cast, not a
         // transmute (sizes differ).
-        let kev: xlib::XKeyEvent = unsafe {
-            std::ptr::read(&ev as *const xlib::XEvent as *const xlib::XKeyEvent)
-        };
+        let kev: xlib::XKeyEvent =
+            unsafe { std::ptr::read(&ev as *const xlib::XEvent as *const xlib::XKeyEvent) };
         if kev.type_ != xlib::KeyPress {
             continue;
         }
@@ -482,7 +504,13 @@ fn self_test() -> i32 {
     println!("=== Invertonator-rs v{VERSION} — Linux self-test report ===");
     println!();
     println!("[environment]");
-    for key in ["DISPLAY", "WAYLAND_DISPLAY", "XDG_SESSION_TYPE", "XDG_CURRENT_DESKTOP", "DESKTOP_SESSION"] {
+    for key in [
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "XDG_SESSION_TYPE",
+        "XDG_CURRENT_DESKTOP",
+        "DESKTOP_SESSION",
+    ] {
         let val = std::env::var(key).unwrap_or_else(|_| "<unset>".into());
         println!("  {key:19} = {val}");
     }
@@ -600,7 +628,11 @@ fn self_test() -> i32 {
             let active = nout > 0;
             let gsize = (rr.XRRGetCrtcGammaSize)(dpy, crtc).max(0) as usize;
             let state = if active { "ACTIVE" } else { "idle  " };
-            let outs = if names.is_empty() { "-".to_string() } else { names.join("+") };
+            let outs = if names.is_empty() {
+                "-".to_string()
+            } else {
+                names.join("+")
+            };
             if !active || gsize < 2 {
                 println!("  CRTC #{i} ({state}) outputs={outs} gamma_size={gsize} — skipped");
                 continue;
@@ -642,9 +674,15 @@ fn self_test() -> i32 {
             };
             println!("  CRTC #{i} ({state}) outputs={outs} gamma_size={gsize} round-trip={rt}");
             tested += 1;
-            if set_ok { inverted_ok += 1; }
-            if restored { restore_ok += 1; }
-            if !wrote { rejected += 1; }
+            if set_ok {
+                inverted_ok += 1;
+            }
+            if restored {
+                restore_ok += 1;
+            }
+            if !wrote {
+                rejected += 1;
+            }
         }
         (rr.XRRFreeScreenResources)(res);
 
@@ -667,10 +705,24 @@ fn self_test() -> i32 {
                 (xlib::LockMask | xlib::Mod2Mask) as c_uint,
             ];
             for extra in extras {
-                (xlib.XGrabKey)(dpy, kc_t as c_int, base | extra, root, xlib::False,
-                                xlib::GrabModeAsync, xlib::GrabModeAsync);
-                (xlib.XGrabKey)(dpy, kc_q as c_int, base | extra, root, xlib::False,
-                                xlib::GrabModeAsync, xlib::GrabModeAsync);
+                (xlib.XGrabKey)(
+                    dpy,
+                    kc_t as c_int,
+                    base | extra,
+                    root,
+                    xlib::False,
+                    xlib::GrabModeAsync,
+                    xlib::GrabModeAsync,
+                );
+                (xlib.XGrabKey)(
+                    dpy,
+                    kc_q as c_int,
+                    base | extra,
+                    root,
+                    xlib::False,
+                    xlib::GrabModeAsync,
+                    xlib::GrabModeAsync,
+                );
             }
             (xlib.XSync)(dpy, xlib::False);
             let conflict = GRAB_CONFLICT.load(Ordering::Relaxed);
@@ -682,7 +734,9 @@ fn self_test() -> i32 {
             if conflict {
                 println!("  Ctrl+Alt+I / Q      : CONFLICT — another app owns these keys (app still\n  runs; close that tool or it will win the keys)");
             } else {
-                println!("  Ctrl+Alt+I / Q      : OK — keys are free and grabbable (test grabs removed)");
+                println!(
+                    "  Ctrl+Alt+I / Q      : OK — keys are free and grabbable (test grabs removed)"
+                );
             }
         }
 
@@ -705,7 +759,9 @@ fn self_test() -> i32 {
     println!("  {line}");
     tracing::info!("self-test verdict: {line}");
     println!();
-    println!(">>> Please copy this ENTIRE report (everything the command printed) and send it back. <<<");
+    println!(
+        ">>> Please copy this ENTIRE report (everything the command printed) and send it back. <<<"
+    );
     code
 }
 
