@@ -15,12 +15,24 @@
 //   · "video" and "graphic" have no standard numeric type — Chromium
 //     reports them via LocalizedControlType, matched ASCII-case-
 //     insensitively.
-//   · Size gates: image/graphic ≥ 40×40 px (kills favicons, inline
+//   · Size gates: image/graphic ≥ 64×64 px (kills favicons, inline
 //     icons), hyperlink ≥ 96×96 px (thumbnail-sized links like the
 //     YouTube grid; text links stay inverted), video any size.
-//   · Overlap merge: an <img> inside an <a> produces two candidates
-//     for the same thumbnail — merged into one hole, biggest wins.
-//   · Cap at MAX_HOLES, largest first.
+//   · VIDEO PRIORITY: when the walk saw real <video> elements, they
+//     ARE what the user is watching — page thumbnails/icons around a
+//     player must not become holes. Watch page → exactly the player.
+//   · DOMINANCE: without videos, keep only candidates within 20% of
+//     the largest survivor's area. Kills the avatar/icon swarms (the
+//     "small squares scattered on UI elements" report).
+//   · FLATNESS PROBE: image candidates whose on-screen pixels are
+//     uniform (solid spacer / bogus rect parked on flat page area)
+//     get no hole — 5×5 GetPixel grid, inverted-desktop-safe.
+//   · Overlap merge (TIGHTENED): an <img> inside an <a> produces two
+//     candidates for the same thumbnail — merged into one hole, but
+//     ONLY when the intersection is ≥ 40% of the smaller candidate.
+//     The old any-touch rule grew Frankenstein unions out of rects
+//     that merely shared a corner (the "random rectangle" report).
+//   · Cap at 4 holes, largest first.
 //
 //   COORDINATES: screen physical pixels end to end (per-monitor-v2
 //   aware — see main::set_dpi_awareness).
@@ -48,14 +60,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SM_YVIRTUALSCREEN,
 };
 
-use crate::holes::{HoleSpec, Holes, MAX_HOLES};
+use crate::holes::{HoleSpec, Holes, KIND_IMG, KIND_LINK, KIND_VIDEO};
 
 const DISCOVERY_MS: u64 = 400;
-const MIN_MEDIA: i32 = 40;   // image/graphic min w and h (px)
+const MIN_MEDIA: i32 = 64;   // image/graphic min w and h (px)
 const MIN_LINK: i32 = 96;    // hyperlink min w and h (px)
 const MAX_NODES: u32 = 100_000;
 const MAX_DEPTH: u32 = 25;
 const POKE_TOLERANCE: i32 = 8;   // pt beyond the window edge → bogus rect
+const KEEP_MIN_PCT: i64 = 20;    // dominance: ≥ 20% of largest survivor's area
+const MAX_KEEP: usize = 4;       // holes actually kept per tick (pool is 16)
 const SUMMARY_EVERY_MS: u64 = 2_000;  // state-change summary throttle
 const HEARTBEAT_MS: u64 = 10_000;     // unconditional liveness line
 
@@ -218,7 +232,37 @@ struct Candidate {
     /// Size gate this candidate must keep passing after on-screen
     /// clamping (MIN_MEDIA / MIN_LINK / 1 for video).
     min: i32,
-    dynamic: bool,
+    kind: MediaKind,
+}
+
+impl Candidate {
+    fn area(&self) -> i64 {
+        self.w as i64 * self.h as i64
+    }
+    fn is_video(&self) -> bool {
+        self.kind == MediaKind::Video
+    }
+    fn kind_id(&self) -> u8 {
+        match self.kind {
+            MediaKind::Video => KIND_VIDEO,
+            MediaKind::Link => KIND_LINK,
+            MediaKind::Image => KIND_IMG,
+        }
+    }
+}
+
+/// Intersection / smaller-area ratio — the tightened merge test.
+fn overlap_ratio(a: &Candidate, b: &Candidate) -> f32 {
+    let ix = a.x.max(b.x);
+    let iy = a.y.max(b.y);
+    let ir = (a.x + a.w).min(b.x + b.w);
+    let ib = (a.y + a.h).min(b.y + b.h);
+    let inter = (ir - ix).max(0) as i64 * (ib - iy).max(0) as i64;
+    let min_area = a.area().min(b.area());
+    if min_area <= 0 {
+        return 0.0;
+    }
+    inter as f32 / min_area as f32
 }
 
 struct WalkCtx {
@@ -464,25 +508,19 @@ fn offer_candidate(kind: Option<MediaKind>, rect: &RECT, ctx: &mut WalkCtx) {
         w,
         h,
         min,
-        dynamic: kind == MediaKind::Video,
+        kind,
     });
 }
 
 // =====================================================================
-// Candidates → HoleSpecs (merge + cap)
+// Candidates → HoleSpecs (priority + dominance + merge + cap)
 // =====================================================================
-
-impl Candidate {
-    fn intersects(&self, ox: i32, oy: i32, ow: i32, oh: i32) -> bool {
-        self.x < ox + ow && ox < self.x + self.w && self.y < oy + oh && oy < self.y + self.h
-    }
-}
 
 fn ctx_to_specs(ctx: WalkCtx, clip: Option<Clip>) -> Vec<HoleSpec> {
     // Filter (bogus-rect + document-pane scoping) → clamp (final hole
-    // geometry) → merge → cap.
+    // geometry) → video priority → dominance → flatness → merge → cap.
     let WalkCtx { candidates, docs_rects, .. } = ctx;
-    let cands = match clip {
+    let mut cands: Vec<Candidate> = match clip {
         Some(clip) => candidates
             .into_iter()
             .filter_map(|c| clamp_candidate(c, &clip, &docs_rects))
@@ -493,20 +531,47 @@ fn ctx_to_specs(ctx: WalkCtx, clip: Option<Clip>) -> Vec<HoleSpec> {
         return Vec::new();
     }
 
-    // Largest first.
-    let mut cands = cands;
-    cands.sort_by_key(|c| std::cmp::Reverse(c.w as i64 * c.h as i64));
+    // VIDEO PRIORITY — a real <video> element dwarfs intent-wise
+    // everything else on the page. If any exist, ONLY they become
+    // holes: a watch page gets exactly the player, never a constellation
+    // of thumbnails around it.
+    if cands.iter().any(|c| c.is_video()) {
+        cands.retain(|c| c.is_video());
+    }
 
-    // Overlap merge: an <img> inside an <a> is ONE thumbnail. A new
-    // candidate intersecting a kept one grows that hole to the union.
-    let mut kept: Vec<Candidate> = Vec::with_capacity(MAX_HOLES);
+    // DOMINANCE — keep only candidates within KEEP_MIN_PCT% of the
+    // largest survivor's area. Avatars/icons next to a big preview sit
+    // at 1–6% and die here; a uniform media grid keeps its peers.
+    let max_area = cands.iter().map(|c| c.area()).max().unwrap_or(0);
+    cands.retain(|c| c.area() * 100 >= max_area * KEEP_MIN_PCT);
+
+    // FLATNESS — image candidates only: a rect whose on-screen pixels
+    // are uniform (solid spacer, bogus scroll-offset rect parked on
+    // flat page area) earns no hole. Videos are trusted — a paused
+    // talking-head frame can legitimately be flat.
+    // SAFETY: screen_rect_is_flat only reads the screen DC (GetPixel).
+    cands.retain(|c| {
+        c.is_video() || unsafe { !screen_rect_is_flat(c.x, c.y, c.w, c.h) }
+    });
+    if cands.is_empty() {
+        return Vec::new();
+    }
+
+    // Largest first.
+    cands.sort_by_key(|c| std::cmp::Reverse(c.area()));
+
+    // Overlap merge (TIGHTENED) — an <img> inside an <a> is ONE
+    // thumbnail (intersection ≥ 40% of the smaller), but rects that
+    // merely share a corner or edge stay SEPARATE. The old any-touch
+    // rule unioned candidates into giant misplaced holes.
+    let mut kept: Vec<Candidate> = Vec::with_capacity(MAX_KEEP);
     for c in cands {
-        if kept.len() >= MAX_HOLES {
+        if kept.len() >= MAX_KEEP {
             break;
         }
         let mut merged = false;
         for k in kept.iter_mut() {
-            if c.intersects(k.x, k.y, k.w, k.h) {
+            if overlap_ratio(&c, k) >= 0.4 {
                 let nx = k.x.min(c.x);
                 let ny = k.y.min(c.y);
                 let nr = k.x.max(c.x + c.w);
@@ -515,7 +580,6 @@ fn ctx_to_specs(ctx: WalkCtx, clip: Option<Clip>) -> Vec<HoleSpec> {
                 k.y = ny;
                 k.w = nr - nx;
                 k.h = nb - ny;
-                k.dynamic = k.dynamic || c.dynamic;
                 merged = true;
                 break;
             }
@@ -526,8 +590,63 @@ fn ctx_to_specs(ctx: WalkCtx, clip: Option<Clip>) -> Vec<HoleSpec> {
     }
 
     kept.into_iter()
-        .map(|k| HoleSpec { x: k.x, y: k.y, w: k.w, h: k.h, dynamic: k.dynamic })
+        .map(|k| HoleSpec {
+            x: k.x,
+            y: k.y,
+            w: k.w,
+            h: k.h,
+            dynamic: k.is_video(),
+            kind: k.kind_id(),
+        })
         .collect()
+}
+
+/// True when the on-screen pixels under the rect look uniform (solid
+/// background / spacer graphic / bogus rect parked on flat page area).
+/// Samples a 5×5 grid via GetPixel on the screen DC — the desktop shows
+/// the INVERTED content, but inversion preserves variance, so the
+/// thresholds hold in every mode. Failure-conservative: if the screen
+/// DC can't be read, the rect is KEPT (can't tell → don't drop).
+unsafe fn screen_rect_is_flat(x: i32, y: i32, w: i32, h: i32) -> bool {
+    use windows::Win32::Graphics::Gdi::{GetDC, GetPixel, ReleaseDC};
+    let hdc = GetDC(None);
+    if hdc.is_invalid() {
+        return false;
+    }
+    let mut min_l = i32::MAX;
+    let mut max_l = i32::MIN;
+    let mut colors: Vec<u32> = Vec::new();
+    let mut samples = 0u32;
+    for i in 0..5u32 {
+        for j in 0..5u32 {
+            let px = x + w * (2 * i as i32 + 1) / 10;
+            let py = y + h * (2 * j as i32 + 1) / 10;
+            let c = GetPixel(hdc, px, py);
+            if c.0 == 0xFFFF_FFFF {
+                continue; // CLR_INVALID — outside the visible screen
+            }
+            let (r, g, b) = (
+                (c.0 & 0xFF) as i32,
+                ((c.0 >> 8) & 0xFF) as i32,
+                ((c.0 >> 16) & 0xFF) as i32,
+            );
+            let lum = (r * 299 + g * 587 + b * 114) / 1000;
+            min_l = min_l.min(lum);
+            max_l = max_l.max(lum);
+            // 3-bit-per-channel coarse quantization for a cheap
+            // distinct-color count (photo ≥ 10, flat ≤ 4).
+            let coarse = (((r >> 5) as u32) << 6) | (((g >> 5) as u32) << 3) | ((b >> 5) as u32);
+            if !colors.contains(&coarse) {
+                colors.push(coarse);
+            }
+            samples += 1;
+        }
+    }
+    ReleaseDC(None, hdc);
+    if samples < 10 {
+        return false; // mostly unreadable — keep
+    }
+    (max_l - min_l) < 28 && colors.len() <= 4
 }
 
 /// Placement filter for one candidate. Three gates, in order:
@@ -540,12 +659,12 @@ fn ctx_to_specs(ctx: WalkCtx, clip: Option<Clip>) -> Vec<HoleSpec> {
 ///    over the wrong area.
 /// 2. DOCUMENT-PANE SCOPING — when the walk saw any Document element
 ///    (browser page / iframes / editor content), a candidate's CENTER
-///    must sit inside one of those rects. Kills holes on browser
-///    chrome, toolbars and page furniture in the flat live walk.
-///    Apps exposing no documents keep the old keep-all behavior.
-/// 3. CLAMP — the survivors are clipped to the window ∩ virtual
-///    screen (tiny pokes and monitor edges) and must still pass their
-///    own size gate.
+///    must sit inside one of those rects, and that rect then becomes
+///    the clamp boundary too (a hole can never poke out of its page).
+///    Apps exposing no documents keep the old window-clip behavior.
+/// 3. CLAMP — the survivors are clipped to the scoping chain (document
+///    ∩ window ∩ virtual screen) and must still pass their own size
+///    gate.
 fn clamp_candidate(mut c: Candidate, clip: &Clip, docs: &[RECT]) -> Option<Candidate> {
     // 1) bogus-poke guard
     if c.x < clip.win.left - POKE_TOLERANCE
@@ -555,21 +674,28 @@ fn clamp_candidate(mut c: Candidate, clip: &Clip, docs: &[RECT]) -> Option<Candi
     {
         return None;
     }
-    // 2) document-pane scoping (center-in-document)
+    // 2) document-pane scoping — center must sit inside a Document;
+    //    that Document also becomes the clamp boundary (gate 3).
+    let mut scope: Option<RECT> = None;
     if !docs.is_empty() {
         let (cx, cy) = (c.x + c.w / 2, c.y + c.h / 2);
-        let inside = docs
+        scope = docs
             .iter()
-            .any(|d| cx >= d.left && cx < d.right && cy >= d.top && cy < d.bottom);
-        if !inside {
-            return None;
-        }
+            .copied()
+            .find(|d| cx >= d.left && cx < d.right && cy >= d.top && cy < d.bottom);
+        scope?;
     }
-    // 3) clamp to window, then to the virtual screen
-    let l = c.x.max(clip.win.left);
-    let t = c.y.max(clip.win.top);
-    let r = (c.x + c.w).min(clip.win.right);
-    let b = (c.y + c.h).min(clip.win.bottom);
+    // 3) clamp to the scoping chain: doc (if any) ∩ window ∩ virtual screen
+    let mut l = c.x.max(clip.win.left);
+    let mut t = c.y.max(clip.win.top);
+    let mut r = (c.x + c.w).min(clip.win.right);
+    let mut b = (c.y + c.h).min(clip.win.bottom);
+    if let Some(d) = scope {
+        l = l.max(d.left);
+        t = t.max(d.top);
+        r = r.min(d.right);
+        b = b.min(d.bottom);
+    }
     let (l, t, r, b) = match clip.vis {
         Some(v) => (l.max(v.left), t.max(v.top), r.min(v.right), b.min(v.bottom)),
         None => (l, t, r, b),

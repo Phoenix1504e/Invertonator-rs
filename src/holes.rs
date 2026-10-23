@@ -114,8 +114,14 @@ pub const MAX_HOLES: usize = 16;
 // Public API
 // =====================================================================
 
+// Hole kind tags — logging/diagnosis only, the pump geometry ignores
+// them. 'V' = UIA video element, 'I' = image/graphic, 'L' = hyperlink.
+pub const KIND_IMG: u8 = 0;
+pub const KIND_LINK: u8 = 1;
+pub const KIND_VIDEO: u8 = 2;
+
 /// One desired hole. Coordinates are SCREEN physical pixels (the
-/// process is per-monitor-v2 DPI aware — see main::set_dpi_awareness).
+/// process is per-monitor-v2 DPI aware — see win_main::set_dpi_awareness).
 #[derive(Clone, Copy, Default, Debug)]
 pub struct HoleSpec {
     pub x: i32,
@@ -124,6 +130,19 @@ pub struct HoleSpec {
     pub h: i32,
     /// true = refresh every pump tick (video-adjacent). false = ~1.7Hz.
     pub dynamic: bool,
+    /// KIND_IMG / KIND_LINK / KIND_VIDEO — shows up in hole logs so a
+    /// field log alone answers "what did the tracker think this was?".
+    pub kind: u8,
+}
+
+impl HoleSpec {
+    pub fn kind_char(&self) -> char {
+        match self.kind {
+            KIND_VIDEO => 'V',
+            KIND_LINK => 'L',
+            _ => 'I',
+        }
+    }
 }
 
 /// Clone-able handle to the hole system's desired-state. The tracker
@@ -229,9 +248,19 @@ impl HolePool {
             if moved {
                 h.source = src;
                 unsafe {
-                    let _ = MoveWindow(h.host, spec.x, spec.y, spec.w, spec.h, true);
-                    let _ = MoveWindow(h.mag, 0, 0, spec.w, spec.h, true);
-                    let _ = MagSetWindowSource(h.mag, src);
+                    let ok_host = MoveWindow(h.host, spec.x, spec.y, spec.w, spec.h, true).is_ok();
+                    let ok_mag = MoveWindow(h.mag, 0, 0, spec.w, spec.h, true).is_ok();
+                    let ok_src = MagSetWindowSource(h.mag, src).as_bool();
+                    // alpha.6: these were silent — a failed source-set
+                    // leaves the PREVIOUS region's content displayed at
+                    // the new position (the "random rectangle" report).
+                    if !ok_host || !ok_mag || !ok_src {
+                        tracing::warn!(
+                            "holes: #{} move result host={} mag={} src={} @({},{}) {}x{}",
+                            i, ok_host, ok_mag, ok_src,
+                            spec.x, spec.y, spec.w, spec.h
+                        );
+                    }
                 }
             }
 
@@ -251,8 +280,9 @@ impl HolePool {
                     );
                     h.visible = true;
                     tracing::info!(
-                        "holes: #{} shown @({},{}) {}x{}{}",
+                        "holes: #{} shown @({},{}) {}x{} {}{}",
                         i, spec.x, spec.y, spec.w, spec.h,
+                        spec.kind_char(),
                         if h.dynamic { " dyn" } else { "" }
                     );
                 } else if !want_visible && h.visible {
@@ -269,7 +299,21 @@ impl HolePool {
                     && h.visible
                     && (h.dynamic || tick.is_multiple_of(STATIC_EVERY))
                 {
-                    let _ = MagSetWindowSource(h.mag, h.source);
+                    let ok = MagSetWindowSource(h.mag, h.source).as_bool();
+                    if ok != h.src_ok {
+                        // Edge-logged: one line per failure onset / recovery.
+                        if ok {
+                            tracing::info!("holes: #{} source recovered", i);
+                        } else {
+                            tracing::warn!(
+                                "holes: #{} MagSetWindowSource FAILED @({},{}) {}x{} — content frozen",
+                                i, h.source.left, h.source.top,
+                                h.source.right - h.source.left,
+                                h.source.bottom - h.source.top
+                            );
+                        }
+                        h.src_ok = ok;
+                    }
                     if tick.is_multiple_of(STATIC_EVERY) {
                         let _ = SetWindowPos(
                             h.host,
@@ -305,6 +349,10 @@ struct PoolHole {
     source: RECT,
     visible: bool,
     dynamic: bool,
+    /// Last MagSetWindowSource result — failures are logged on EDGE
+    /// (ok→fail / fail→ok), never per tick (pump runs at 30ms; a failing
+    /// call would otherwise spam 33 lines/second into log.txt).
+    src_ok: bool,
 }
 
 unsafe extern "system" fn hole_host_wndproc(
@@ -395,6 +443,7 @@ unsafe fn create_pool() -> HolePool {
             source: RECT::default(),
             visible: false,
             dynamic: false,
+            src_ok: true,
         });
     }
 

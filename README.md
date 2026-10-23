@@ -4,7 +4,7 @@
 
 ![Invertonator](icon.svg)
 
-> **Status: v0.3.0-alpha.5** — Windows: UIA media tracker + Magnifier-API
+> **Status: v0.3.0-alpha.6** — Windows: UIA media tracker + Magnifier-API
 > true-color holes proven on hardware (1,152-node cache-request walks ·
 > 164 media elements classified · MagSetColorEffect/Source/Transform all
 > verified). Gecko browsers (Firefox/LibreWolf) supported via automatic
@@ -13,7 +13,11 @@
 > alpha.5 hole-placement hardening: bogus UIA rects poking outside their
 > window are dropped, live-walk candidates are document-pane scoped
 > (media only inside the page area), survivors clamped to the visible
-> window region. Linux (X11): global gamma-ramp inversion shipped — the
+> window region. alpha.6 candidate selection: <video> elements take
+> priority (a watch page gets exactly the player), dominance filter
+> kills avatar/icon swarms, GetPixel flatness probe drops uniform
+> rects, tightened overlap merge, DPI status + Mag failure logging.
+> Linux (X11): global gamma-ramp inversion shipped — the
 > XComposite true-color-hole overlay is the next milestone. For the
 > **fully-featured C# edition**, see
 > [Invertonator](https://github.com/Phoenix1504e/Invertonator).

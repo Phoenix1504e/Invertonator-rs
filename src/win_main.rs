@@ -710,26 +710,27 @@ unsafe extern "system" fn wndproc(
 // PER_MONITOR_AWARE_V2 gives us physical pixels end to end.
 // =====================================================================
 
-fn set_dpi_awareness() {
+fn set_dpi_awareness() -> &'static str {
     use windows::Win32::UI::HiDpi::{
         SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
     };
     use windows::Win32::UI::WindowsAndMessaging::SetProcessDPIAware;
     unsafe {
         // Win10 1703+. If unavailable, fall back; if even that fails,
-        // log loudly — holes WILL misplace on scaled displays.
+        // holes WILL misplace on scaled displays.
+        //
+        // alpha.6: this fn runs BEFORE init_logging, so its tracing lines
+        // used to go nowhere — the field log could never confirm which
+        // awareness level actually engaged. It now RETURNS the status and
+        // run() logs it once the logger is up.
         if SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
-            .is_err()
+            .is_ok()
         {
-            if !SetProcessDPIAware().as_bool() {
-                tracing::warn!(
-                    "dpi: awareness unavailable — holes will misplace on scaled displays"
-                );
-            } else {
-                tracing::info!("dpi: system-aware fallback (PMv2 unsupported)");
-            }
+            "per-monitor-v2 aware (physical px end to end)"
+        } else if SetProcessDPIAware().as_bool() {
+            "system-aware fallback (PMv2 unsupported) — holes may misplace on scaled displays"
         } else {
-            tracing::info!("dpi: per-monitor-v2 aware");
+            "AWARENESS UNAVAILABLE — holes WILL misplace on scaled displays"
         }
     }
 }
@@ -737,12 +738,15 @@ fn set_dpi_awareness() {
 pub fn run() {
     // DPI first — before logging, settings, windows, anything that
     // touches coordinates.
-    set_dpi_awareness();
+    let dpi_status = set_dpi_awareness();
 
     // Logging: %LOCALAPPDATA%\Invertonator\log.txt (shared helper).
     init_logging();
 
     tracing::info!("=== Invertonator-rs v{} (windows: magnifier + uia) ===", VERSION);
+    // DPI status is logged HERE (not inside set_dpi_awareness) — that fn
+    // runs before the logger exists; its lines used to vanish.
+    tracing::info!("dpi: {dpi_status}");
 
     let settings = Settings::load();
     tracing::info!("settings: dimLevel={}", settings.features.dim_level);
@@ -795,6 +799,18 @@ pub fn run() {
             let err = std::io::Error::last_os_error();
             tracing::error!("CreateWindowExW failed: {err}");
             return;
+        }
+
+        // alpha.6: record the actual DPI numbers. If these aren't 96/96
+        // on a scaled display, every coordinate below is physical px —
+        // and the PMv2 line above MUST say "per-monitor-v2".
+        {
+            use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
+            tracing::info!(
+                "dpi: system={} window={} (96 = 100% scale)",
+                GetDpiForSystem(),
+                GetDpiForWindow(hwnd)
+            );
         }
 
         let hicon: HICON = std::env::current_exe()
