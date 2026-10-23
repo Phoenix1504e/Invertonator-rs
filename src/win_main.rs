@@ -20,9 +20,6 @@ extern "system" {}
 #[cfg(windows)]
 #[link(name = "user32")]
 extern "system" {}
-#[cfg(windows)]
-#[link(name = "winmm")]
-extern "system" {}
 
 use crate::common::{init_logging, Settings, VERSION};
 use crate::holes::{HolePool, Holes};
@@ -45,21 +42,6 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, SetWindowLongPtrW, GWLP_USERDATA,
 };
-
-// =====================================================================
-// Timer resolution — the hole pump's 15ms SetTimer is only as steady
-// as the scheduler allows. Windows defaults to a 15.6ms timer
-// resolution: a 15/30ms WM_TIMER drifts on that grid and the pump
-// effectively stutters between 21–32Hz. timeBeginPeriod(1) requests
-// 1ms resolution for the lifetime of the process; timeEndPeriod(1)
-// releases it on exit.
-// =====================================================================
-
-#[link(name = "winmm")]
-extern "system" {
-    fn timeBeginPeriod(ms: u32) -> u32;
-    fn timeEndPeriod(ms: u32) -> u32;
-}
 
 // =====================================================================
 // Magnification engine (Milestone 1)
@@ -159,26 +141,8 @@ mod uia {
         CUIAutomation, IUIAutomation, IUIAutomationElement,
         TreeScope_Descendants,
         UIA_BoundingRectanglePropertyId, UIA_ControlTypePropertyId,
-        UIA_HyperlinkControlTypeId, UIA_ImageControlTypeId,
         UIA_LocalizedControlTypePropertyId, UIA_NamePropertyId,
-        UIA_CONTROLTYPE_ID,
     };
-
-    /// The probe's media census must MATCH the tracker's classifier —
-    /// a probe that sees media the tracker ignores is the worst kind
-    /// of lie. alpha.9: the movie/media/animation/thumbnail localized
-    /// strings joined the match set (see tracker::classify — windows-rs
-    /// 0.58 ships no numeric Thumbnail constant).
-    fn is_media(ct: UIA_CONTROLTYPE_ID, lct_lower: &str) -> bool {
-        if ct == UIA_ImageControlTypeId || ct == UIA_HyperlinkControlTypeId {
-            return true;
-        }
-        matches!(
-            lct_lower,
-            "image" | "graphic" | "link" | "video" | "thumbnail" | "movie"
-                | "media" | "animation" | "picture" | "photo"
-        )
-    }
 
     /// Probe the given window: returns (total_nodes, media_count, samples).
     pub fn probe(hwnd: HWND) -> (u32, u32, Vec<String>) {
@@ -319,7 +283,9 @@ mod uia {
         samples: &mut Vec<String>,
     ) {
         unsafe {
-            if *total > 100_000 || depth > 25 {
+            // Depth 60 (tracker parity, alpha.5): 25 silently pruned
+            // YouTube watch-page media — the DOM runs deeper.
+            if *total > 100_000 || depth > 60 {
                 return;
             }
             *total += 1;
@@ -334,10 +300,9 @@ mod uia {
                 .unwrap_or_default();
 
             let lct_lower = lct.to_lowercase();
-            let ct = el.CachedControlType().unwrap_or(UIA_CONTROLTYPE_ID(0));
-            if is_media(ct, &lct_lower) {
+            if matches!(lct_lower.as_str(), "image" | "graphic" | "link" | "video") {
                 *media += 1;
-                if samples.len() < 12 {
+                if samples.len() < 24 {
                     let rect = el.CachedBoundingRectangle().unwrap_or_default();
                     let n = trunc(&name, 30);
                     samples.push(format!(
@@ -392,10 +357,9 @@ mod uia {
             }
 
             let lct_lower = lct.to_lowercase();
-            let ct = el.CurrentControlType().unwrap_or(UIA_CONTROLTYPE_ID(0));
-            if is_media(ct, &lct_lower) {
+            if matches!(lct_lower.as_str(), "image" | "graphic" | "link" | "video") {
                 *media += 1;
-                if samples.len() < 12 {
+                if samples.len() < 24 {
                     let n = trunc(&name, 30);
                     samples.push(format!(
                         "[{lct}] \"{n}\" {}x{} @({},{})",
@@ -617,6 +581,8 @@ const VK_F5: u32 = 0x74;
 const VK_F2: u32 = 0x71;
 const VK_F6: u32 = 0x75;
 const VK_F7: u32 = 0x76;
+const VK_F8: u32 = 0x77;
+const VK_F9: u32 = 0x78;
 const VK_F10: u32 = 0x79;
 const VK_F11: u32 = 0x7A;
 
@@ -634,7 +600,15 @@ unsafe fn register_hotkeys(hwnd: HWND) -> bool {
     let b = register(HOTKEY_CYCLE, VK_F6, "mode");
     let c = register(HOTKEY_QUIT, VK_F2, "quit");
     let d = register(HOTKEY_PROBE, VK_F10, "uia-probe");
-    let e = register(HOTKEY_MAGPROBE, VK_F11, "mag-window-probe");
+    // F11 is a favorite of GPU/screen tools — if it is taken, fall back
+    // to F9 then F8 so the mag diagnostic is always reachable.
+    let mut e = register(HOTKEY_MAGPROBE, VK_F11, "mag-window-probe");
+    if !e {
+        e = register(HOTKEY_MAGPROBE, VK_F9, "mag-window-probe (F11 taken, trying F9)");
+    }
+    if !e {
+        e = register(HOTKEY_MAGPROBE, VK_F8, "mag-window-probe (F9 taken too, trying F8)");
+    }
     let f = register(HOTKEY_PIERCE, VK_F7, "pierce");
     a && b && c && d && e && f
 }
@@ -748,27 +722,26 @@ unsafe extern "system" fn wndproc(
 // PER_MONITOR_AWARE_V2 gives us physical pixels end to end.
 // =====================================================================
 
-fn set_dpi_awareness() -> &'static str {
+fn set_dpi_awareness() {
     use windows::Win32::UI::HiDpi::{
         SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
     };
     use windows::Win32::UI::WindowsAndMessaging::SetProcessDPIAware;
     unsafe {
         // Win10 1703+. If unavailable, fall back; if even that fails,
-        // holes WILL misplace on scaled displays.
-        //
-        // alpha.6: this fn runs BEFORE init_logging, so its tracing lines
-        // used to go nowhere — the field log could never confirm which
-        // awareness level actually engaged. It now RETURNS the status and
-        // run() logs it once the logger is up.
+        // log loudly — holes WILL misplace on scaled displays.
         if SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
-            .is_ok()
+            .is_err()
         {
-            "per-monitor-v2 aware (physical px end to end)"
-        } else if SetProcessDPIAware().as_bool() {
-            "system-aware fallback (PMv2 unsupported) — holes may misplace on scaled displays"
+            if !SetProcessDPIAware().as_bool() {
+                tracing::warn!(
+                    "dpi: awareness unavailable — holes will misplace on scaled displays"
+                );
+            } else {
+                tracing::info!("dpi: system-aware fallback (PMv2 unsupported)");
+            }
         } else {
-            "AWARENESS UNAVAILABLE — holes WILL misplace on scaled displays"
+            tracing::info!("dpi: per-monitor-v2 aware");
         }
     }
 }
@@ -776,20 +749,12 @@ fn set_dpi_awareness() -> &'static str {
 pub fn run() {
     // DPI first — before logging, settings, windows, anything that
     // touches coordinates.
-    let dpi_status = set_dpi_awareness();
+    set_dpi_awareness();
 
     // Logging: %LOCALAPPDATA%\Invertonator\log.txt (shared helper).
     init_logging();
 
     tracing::info!("=== Invertonator-rs v{} (windows: magnifier + uia) ===", VERSION);
-    // DPI status is logged HERE (not inside set_dpi_awareness) — that fn
-    // runs before the logger exists; its lines used to vanish.
-    tracing::info!("dpi: {dpi_status}");
-
-    // alpha.9: 1ms scheduler resolution — the hole pump's 15ms SetTimer
-    // is unreliable on the default 15.6ms grid (see the header note).
-    let tbr = unsafe { timeBeginPeriod(1) };
-    tracing::info!("timer: timeBeginPeriod(1) -> {tbr} (0 = ok)");
 
     let settings = Settings::load();
     tracing::info!("settings: dimLevel={}", settings.features.dim_level);
@@ -842,18 +807,6 @@ pub fn run() {
             let err = std::io::Error::last_os_error();
             tracing::error!("CreateWindowExW failed: {err}");
             return;
-        }
-
-        // alpha.6: record the actual DPI numbers. If these aren't 96/96
-        // on a scaled display, every coordinate below is physical px —
-        // and the PMv2 line above MUST say "per-monitor-v2".
-        {
-            use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
-            tracing::info!(
-                "dpi: system={} window={} (96 = 100% scale)",
-                GetDpiForSystem(),
-                GetDpiForWindow(hwnd)
-            );
         }
 
         let hicon: HICON = std::env::current_exe()
@@ -909,9 +862,8 @@ pub fn run() {
             tracing::warn!("some hotkeys failed");
         }
 
-        // Hole pump — ~66Hz tick on main (15ms + timeBeginPeriod(1)).
-        // All Mag*/window calls run on the thread that created the
-        // windows (the F11 rule).
+        // Hole pump — 33Hz tick on main. All Mag*/window calls run on
+        // the thread that created the windows (the F11 rule).
         let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(
             Some(&hwnd), 1, crate::holes::PUMP_MS, None,
         );
@@ -925,7 +877,6 @@ pub fn run() {
         let _ = Shell_NotifyIconW(NIM_DELETE, &state.tray_nid);
         // Free the AppState box (leak fix — it used to live forever).
         drop(Box::from_raw(state_ptr));
-        timeEndPeriod(1);
         magnification::uninitialize();
         tracing::info!("clean exit — colors restored");
     }

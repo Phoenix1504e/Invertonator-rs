@@ -4,43 +4,15 @@
 
 ![Invertonator](icon.svg)
 
-> **Status: v0.3.0-alpha.9** — Windows: UIA media tracker + Magnifier-API
+> **Status: v0.3.0-alpha.5** — Windows: UIA media tracker + Magnifier-API
 > true-color holes proven on hardware (1,152-node cache-request walks ·
 > 164 media elements classified · MagSetColorEffect/Source/Transform all
 > verified). Gecko browsers (Firefox/LibreWolf) supported via automatic
 > live-walk fallback when a provider leaves CachedChildren empty.
-> alpha.4: topmost hole overlays + tracker discovery summary logging.
-> alpha.5 hole-placement hardening: bogus UIA rects poking outside their
-> window are dropped, live-walk candidates are document-pane scoped
-> (media only inside the page area), survivors clamped to the visible
-> window region. alpha.6 candidate selection: <video> elements take
-> priority (a watch page gets exactly the player), dominance filter
-> kills avatar/icon swarms, GetPixel flatness probe drops uniform
-> rects, tightened overlap merge, DPI status + Mag failure logging.
-> alpha.7 video smoothness: the UIA walk backs off 400ms→1.6s while the
-> hole set is stable, and the Gecko live fallback builds its property
-> cache in ONE cross-process pass instead of ~30k per-second COM reads
-> into the browser.
-> alpha.8 hole freshness + media recognition: the Magnifier control does
-> NOT live-track the screen — MagSetWindowSource IS the refresh
-> mechanism, so video holes re-source every pump tick and static holes
-> at ~1.7Hz, ending the "video in the hole is very laggy" slideshow. The
-> alpha.6 hard video priority (any <video> → images get nothing) is
-> replaced by per-kind dominance: a YouTube watch page keeps the player
-> AND its sidebar thumbnails; a unified 80×80 gate (videos included)
-> kills 1×1 ad <video> anchors and avatar squares; hole cap raised 4→8.
-> alpha.9 smoothness triage round two + recognition breadth: the
-> tracker's incremental rect-refresh collapses steady-state UIA traffic
-> ~1000× (full-tree walks only on app switch / navigation / stale
-> element / 5s age — between them just the kept candidates' rects are
-> re-read), the hole pump runs at 15ms with timeBeginPeriod(1) (~66Hz
-> video re-source, per-frame on 60Hz displays), hosts are no longer
-> WS_EX_LAYERED (opaque layered windows force DWM redirection on every
-> magnifier repaint), and every 10s a `holes: stat` telemetry line
-> measures the actual tick rate and per-call MagSetWindowSource cost.
-> Recognition widens: thumbnail/movie/media/animation localized types
-> and a ClassName tag fallback (Chromium exposes HTML tag names) —
-> media outside the player no longer depends on a single string.
+> alpha.5 hardening: no more periodic capture re-arms inside video
+> holes (the in-hole stutter), gap-merge so one media can't split into
+> side-by-side holes, 4px rect quantize, fg-window clamp, 60-level UIA
+> walk (was 25 — YouTube runs deeper), adaptive discovery cadence.
 > Linux (X11): global gamma-ramp inversion shipped — the
 > XComposite true-color-hole overlay is the next milestone. For the
 > **fully-featured C# edition**, see
