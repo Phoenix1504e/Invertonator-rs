@@ -36,9 +36,19 @@
 //     transition). Result: holes vanish the first time anything gets
 //     focused — exactly the "hole appeared then disappeared" report.
 //     Fix: show via SetWindowPos(HWND_TOPMOST, SWP_SHOWWINDOW |
-//     SWP_NOACTIVATE) and re-assert topmost on the static refresh
-//     cadence. Click-through is unaffected (WS_EX_TRANSPARENT +
-//     WM_NCHITTEST→HTTRANSPARENT still pass input through).
+//     SWP_NOACTIVATE). Click-through is unaffected (WS_EX_TRANSPARENT
+//     + WM_NCHITTEST→HTTRANSPARENT still pass input through).
+//   · v0.3.0-alpha.7 — THE SOURCE-SET IS NOT A HEARTBEAT. Once
+//     MagSetWindowSource succeeds, the Magnifier control updates its
+//     content LIVE on its own (that is the whole point of the API —
+//     the OS magnifier works exactly this way). alpha.4–6 re-called
+//     it every 30ms tick on dynamic holes to "keep them fresh": every
+//     call tears down and rebuilds the capture pipeline, and with a
+//     hole parked on a video that is 33 capture resets per second —
+//     the "video is very laggy" field report. Re-source only when
+//     something actually requires it: rect moved, hole (re)shown,
+//     previous call failed, or the 3s watchdog (content-freeze
+//     insurance + topmost re-assert).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -107,7 +117,17 @@ const LWA_ALPHA_FLAG: LAYERED_WINDOW_ATTRIBUTES_FLAGS =
     LAYERED_WINDOW_ATTRIBUTES_FLAGS(2);
 const SW_HIDE_CMD: SHOW_WINDOW_CMD = SHOW_WINDOW_CMD(0);
 pub const PUMP_MS: u32 = 30;      // pump cadence (SetTimer, ms)
-const STATIC_EVERY: u64 = 20;     // static holes refresh ~1.7Hz
+/// Watchdog cadence in pump ticks (~3.0s at 30ms/tick): one re-source
+/// and one topmost re-assert per visible hole — insurance against the
+/// content-freeze failure class, NOT the refresh mechanism.
+const WATCHDOG_EVERY: u64 = 100;
+/// Retry cadence for a FAILED MagSetWindowSource (~300ms). Failures
+/// must be retried promptly (stale content at the hole position) but
+/// never at the full pump rate.
+const RETRY_EVERY: u64 = 10;
+/// Component deltas ≤ this are UIA round-off jitter, not moves — a
+/// re-source for a 1px drift would only reset the capture pipeline.
+const MOVE_EPSILON: i32 = 1;
 pub const MAX_HOLES: usize = 16;
 
 // =====================================================================
@@ -239,10 +259,7 @@ impl HolePool {
                 right: spec.x + spec.w,
                 bottom: spec.y + spec.h,
             };
-            let moved = h.source.left != src.left
-                || h.source.top != src.top
-                || h.source.right != src.right
-                || h.source.bottom != src.bottom;
+            let moved = !rect_close(&h.source, &src);
             h.dynamic = spec.dynamic;
 
             if moved {
@@ -251,6 +268,7 @@ impl HolePool {
                     let ok_host = MoveWindow(h.host, spec.x, spec.y, spec.w, spec.h, true).is_ok();
                     let ok_mag = MoveWindow(h.mag, 0, 0, spec.w, spec.h, true).is_ok();
                     let ok_src = MagSetWindowSource(h.mag, src).as_bool();
+                    h.src_ok = ok_src;
                     // alpha.6: these were silent — a failed source-set
                     // leaves the PREVIOUS region's content displayed at
                     // the new position (the "random rectangle" report).
@@ -279,6 +297,9 @@ impl HolePool {
                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
                     );
                     h.visible = true;
+                    // Freshly shown: the magnifier child may still hold
+                    // pre-hide content — force one re-source below.
+                    h.pending_src = true;
                     tracing::info!(
                         "holes: #{} shown @({},{}) {}x{} {}{}",
                         i, spec.x, spec.y, spec.w, spec.h,
@@ -291,14 +312,18 @@ impl HolePool {
                     tracing::info!("holes: #{} hidden", i);
                 }
 
-                // Tiered refresh: dynamic every tick, static ~1.7Hz.
-                // The static cadence also re-asserts topmost — if any
-                // other topmost popup slipped above us, the hole
-                // recovers within ~600ms without user action.
-                if want_visible
-                    && h.visible
-                    && (h.dynamic || tick.is_multiple_of(STATIC_EVERY))
-                {
+                // alpha.7 re-source policy — see the header lesson: the
+                // magnifier content is LIVE, so re-source only on need.
+                //   · pending_src  — hole just became visible
+                //   · !src_ok      — retry a failed call ~3.3Hz
+                //   · watchdog     — ~0.33Hz freeze insurance; the
+                //     topmost re-assert rides along (recovered within
+                //     ~3s if another topmost popup slipped above us).
+                let due = h.pending_src
+                    || (!h.src_ok && tick.is_multiple_of(RETRY_EVERY))
+                    || tick.is_multiple_of(WATCHDOG_EVERY);
+                if want_visible && h.visible && due {
+                    h.pending_src = false;
                     let ok = MagSetWindowSource(h.mag, h.source).as_bool();
                     if ok != h.src_ok {
                         // Edge-logged: one line per failure onset / recovery.
@@ -314,7 +339,7 @@ impl HolePool {
                         }
                         h.src_ok = ok;
                     }
-                    if tick.is_multiple_of(STATIC_EVERY) {
+                    if tick.is_multiple_of(WATCHDOG_EVERY) {
                         let _ = SetWindowPos(
                             h.host,
                             HWND_TOPMOST,
@@ -350,9 +375,22 @@ struct PoolHole {
     visible: bool,
     dynamic: bool,
     /// Last MagSetWindowSource result — failures are logged on EDGE
-    /// (ok→fail / fail→ok), never per tick (pump runs at 30ms; a failing
-    /// call would otherwise spam 33 lines/second into log.txt).
+    /// (ok→fail / fail→ok) and retried at RETRY_EVERY, never per tick.
     src_ok: bool,
+    /// Set when a hidden hole becomes visible — one re-source to flush
+    /// whatever the magnifier child displayed while hidden.
+    pending_src: bool,
+}
+
+/// True when two rects differ by at most MOVE_EPSILON per component —
+/// UIA round-off jitter must not trigger MoveWindow + MagSetWindowSource
+/// churn (each re-source resets the capture pipeline — the video-lag
+/// lesson). A 1px drift is invisible; do not chase it.
+fn rect_close(a: &RECT, b: &RECT) -> bool {
+    (a.left - b.left).abs() <= MOVE_EPSILON
+        && (a.top - b.top).abs() <= MOVE_EPSILON
+        && (a.right - b.right).abs() <= MOVE_EPSILON
+        && (a.bottom - b.bottom).abs() <= MOVE_EPSILON
 }
 
 unsafe extern "system" fn hole_host_wndproc(
@@ -444,6 +482,7 @@ unsafe fn create_pool() -> HolePool {
             visible: false,
             dynamic: false,
             src_ok: true,
+            pending_src: false,
         });
     }
 

@@ -1,8 +1,18 @@
 // Invertonator-rs — tracker: media classification gates → live holes
 //
-//   Runs a discovery loop on its own thread: every DISCOVERY_MS it
-//   walks the FOREGROUND window's UIA tree (cached walk) and turns
-//   media elements into HoleSpecs for the hole pump.
+//   Runs a discovery loop on its own thread: it walks the FOREGROUND
+//   window's UIA tree (cached walk, live fallback) and turns media
+//   elements into HoleSpecs for the hole pump.
+//
+//   CADENCE (alpha.7 — adaptive): the walk starts at DISCOVERY_MS and
+//   doubles while the foreground window AND its hole set stay stable,
+//   capped at BACKOFF_MAX_MS. Every change — app switch, title change
+//   (navigation), different hole rects, recent wheel activity — snaps
+//   the cadence back to fast. A playing video holds a static rect, so
+//   steady-state re-scans drop 4×; that plus the FindAllBuildCache
+//   bulk walk below is what fixed the "video is very laggy" field
+//   report (the tracker used to hammer the browser's UI thread with
+//   tens of thousands of cross-process COM calls per second).
 //
 //   CLASSIFICATION GATES (the "what deserves a hole" rules):
 //   · Document-pane scoping — media is only collected INSIDE
@@ -62,7 +72,17 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::holes::{HoleSpec, Holes, KIND_IMG, KIND_LINK, KIND_VIDEO};
 
-const DISCOVERY_MS: u64 = 400;
+const DISCOVERY_MS: u64 = 400;  // fast floor after any change
+/// Steady-state cap: while fg window + hole set are stable, the walk
+/// interval doubles each tick up to this (4× fewer UIA passes over a
+/// playing video).
+const BACKOFF_MAX_MS: u64 = 1_600;
+/// Wheel activity within this window forces the fast cadence — scroll
+/// moves every media rect on screen (scrollhook::ms_since_wheel).
+const WHEEL_FAST_MS: u64 = 1_500;
+/// Backoff sleep granularity: the nap wakes early on foreground
+/// switches / wheel activity, so snappiness survives the backoff.
+const NAP_SLICE_MS: u64 = 100;
 const MIN_MEDIA: i32 = 64;   // image/graphic min w and h (px)
 const MIN_LINK: i32 = 96;    // hyperlink min w and h (px)
 const MAX_NODES: u32 = 100_000;
@@ -74,8 +94,8 @@ const SUMMARY_EVERY_MS: u64 = 2_000;  // state-change summary throttle
 const HEARTBEAT_MS: u64 = 10_000;     // unconditional liveness line
 
 /// One-shot flag: the Gecko live-fallback notice is logged exactly once
-/// per process (discovery ticks every 400ms — per-tick logs would spam
-/// log.txt at 150 lines/minute).
+/// per process (discovery ticks every 400ms–1.6s — per-tick logs would
+/// spam log.txt).
 static FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
 
 // =====================================================================
@@ -150,34 +170,67 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
             return;
         }
     };
-    tracing::info!("tracker: alive (discovery every {DISCOVERY_MS}ms)");
+    tracing::info!(
+        "tracker: alive (discovery {DISCOVERY_MS}ms → backoff {BACKOFF_MAX_MS}ms on stable state)"
+    );
 
     let mut had_specs = false;
     let mut last_log = std::time::Instant::now();
     let mut last_key = String::new();
+    // Adaptive cadence state — see the cadence constants above.
+    let mut interval = DISCOVERY_MS;
+    let mut last_sig = String::new();
+    let mut last_fg: isize = 0;
+    let mut last_title = String::new();
+
     while !stop.load(Ordering::Relaxed) {
         if enabled.load(Ordering::Relaxed) {
             let fg = unsafe { GetForegroundWindow() };
-            let (specs, nodes, cands, docs_n) = if fg.is_invalid() {
-                (Vec::new(), 0, 0, 0)
-            } else {
-                unsafe { discover(&automation, fg) }
-            };
-            had_specs = !specs.is_empty();
-            holes.set_specs(specs.clone());
-
-            // Throttled discovery summary — the alpha.3 log proved the
-            // PROBE sees media but said nothing about what the TRACKER
-            // produced. This line closes that observability gap: one
-            // line per state change, plus a 10s heartbeat.
-            let now = std::time::Instant::now();
-            let elapsed = now.duration_since(last_log).as_millis() as u64;
+            let fg_raw = fg.0 as isize;
             let title = if fg.is_invalid() {
                 String::new()
             } else {
                 // SAFETY: fg valid, plain HWND read (GetWindowTextW).
                 unsafe { window_title(fg) }
             };
+            // A foreground switch — or even a title change, which is
+            // how browsers announce navigation — makes the old hole
+            // set suspect: snap back to the fast cadence.
+            let fg_changed = fg_raw != last_fg || title != last_title;
+            last_fg = fg_raw;
+            last_title = title.clone();
+
+            let t0 = std::time::Instant::now();
+            let (specs, nodes, cands, docs_n) = if fg.is_invalid() {
+                (Vec::new(), 0, 0, 0)
+            } else {
+                unsafe { discover(&automation, fg) }
+            };
+            let walk_ms = t0.elapsed().as_millis() as u64;
+            had_specs = !specs.is_empty();
+            holes.set_specs(specs.clone());
+
+            // Cadence: identical hole set on an unchanged foreground →
+            // double the interval (cap BACKOFF_MAX_MS); any change →
+            // back to DISCOVERY_MS. UIA round-off is absorbed by the
+            // 2px signature quantization.
+            let sig = specs_sig(&specs);
+            let stable = !fg_changed && sig == last_sig;
+            last_sig = sig;
+            interval = if stable {
+                (interval * 2).min(BACKOFF_MAX_MS)
+            } else {
+                DISCOVERY_MS
+            };
+
+            // Throttled discovery summary — the alpha.3 log proved the
+            // PROBE sees media but said nothing about what the TRACKER
+            // produced. This line closes that observability gap: one
+            // line per state change, plus a 10s heartbeat. iv=/walk=
+            // expose the cadence and per-walk cost in the field log
+            // (alpha.7 lag triage).
+            let now = std::time::Instant::now();
+            let elapsed = now.duration_since(last_log).as_millis() as u64;
             let key = format!("{}\u{1}{}", title, specs.len());
             if elapsed >= HEARTBEAT_MS || (elapsed >= SUMMARY_EVERY_MS && key != last_key) {
                 last_log = now;
@@ -194,12 +247,14 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
                     })
                     .collect();
                 tracing::info!(
-                    "tracker: fg=\"{}\" nodes={} cands={} docs={} holes={} [{}]",
+                    "tracker: fg=\"{}\" nodes={} cands={} docs={} holes={} iv={}ms walk={}ms [{}]",
                     title,
                     nodes,
                     cands,
                     docs_n,
                     specs.len(),
+                    interval,
+                    walk_ms,
                     rects.join(" ")
                 );
             }
@@ -208,9 +263,56 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
             holes.set_specs(Vec::new());
             had_specs = false;
         }
-        std::thread::sleep(Duration::from_millis(DISCOVERY_MS));
+        nap(&stop, &enabled, interval, last_fg);
     }
     tracing::info!("tracker: stopped");
+}
+
+/// Sleeps up to `ms` in NAP_SLICE_MS slices, waking early when the
+/// user switches windows, scrolls (recent wheel activity), toggles
+/// the tracker, or the process stops. This is what keeps the backoff
+/// safe: a backed-off tracker still reacts to alt-tab and scrolling
+/// within one slice — both events demand fresh hole rects.
+fn nap(stop: &AtomicBool, enabled: &AtomicBool, ms: u64, fg: isize) {
+    let start_enabled = enabled.load(Ordering::Relaxed);
+    let mut slept = 0u64;
+    while slept < ms {
+        std::thread::sleep(Duration::from_millis(NAP_SLICE_MS));
+        slept += NAP_SLICE_MS;
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        if enabled.load(Ordering::Relaxed) != start_enabled {
+            return; // toggled mid-nap — react immediately
+        }
+        if !start_enabled {
+            continue; // disabled: stay idle, don't wake on input
+        }
+        if crate::scrollhook::ms_since_wheel() < WHEEL_FAST_MS {
+            return; // scrolling — hole rects are moving
+        }
+        let cur = unsafe { GetForegroundWindow() };
+        if cur.0 as isize != fg {
+            return; // app switch — walk the new foreground now
+        }
+    }
+}
+
+/// Change signature of a hole set — rects quantized to 2px (UIA
+/// round-off must not read as a state change) plus the kind letter.
+fn specs_sig(specs: &[HoleSpec]) -> String {
+    let mut s = String::new();
+    for sp in specs {
+        s.push_str(&format!(
+            "{},{},{},{},{};",
+            sp.x / 2,
+            sp.y / 2,
+            sp.w / 2,
+            sp.h / 2,
+            sp.kind_char()
+        ));
+    }
+    s
 }
 
 // =====================================================================
@@ -284,13 +386,28 @@ unsafe fn discover(automation: &IUIAutomation, fg: HWND) -> (Vec<HoleSpec>, u32,
     // (see clip_rect). Computed once per discovery tick.
     let clip = clip_rect(fg);
 
+    // ONE cache request, shared by the cached walk and the live
+    // fallback. alpha.7: the live fallback now goes through
+    // FindAllBuildCache — every element's properties are filled in ONE
+    // cross-process pass, instead of 3–4 Current* round trips PER NODE
+    // (LibreWolf: ~4k nodes × 4 reads at the old 400ms cadence ≈ tens
+    // of thousands of COM calls per second straight into the browser's
+    // UI thread — the video-lag driver).
+    let cache = automation.CreateCacheRequest().ok();
+    if let Some(c) = &cache {
+        for p in [
+            UIA_ControlTypePropertyId,
+            UIA_NamePropertyId,
+            UIA_LocalizedControlTypePropertyId,
+            UIA_BoundingRectanglePropertyId,
+        ] {
+            let _ = c.AddProperty(p);
+        }
+    }
+
     // Cached walk (the probe's proven main path).
-    if let Ok(cache) = automation.CreateCacheRequest() {
-        let _ = cache.AddProperty(UIA_ControlTypePropertyId);
-        let _ = cache.AddProperty(UIA_NamePropertyId);
-        let _ = cache.AddProperty(UIA_LocalizedControlTypePropertyId);
-        let _ = cache.AddProperty(UIA_BoundingRectanglePropertyId);
-        if let Ok(cached_root) = root.BuildUpdatedCache(&cache) {
+    if let Some(cache_req) = &cache {
+        if let Ok(cached_root) = root.BuildUpdatedCache(cache_req) {
             let mut ctx = WalkCtx {
                 total: 0,
                 docs: 0,
@@ -319,7 +436,7 @@ unsafe fn discover(automation: &IUIAutomation, fg: HWND) -> (Vec<HoleSpec>, u32,
         // Cache failed OR cached walk came back empty → live walk.
     }
 
-    // FALLBACK: flat live FindAll — no tree recursion possible, but
+    // FALLBACK: flat live walk — no tree recursion possible, but
     // Document elements harvested during the walk give the same
     // document-pane scoping the cached path had (see classify_live +
     // clamp_candidate), and the size gates still apply.
@@ -327,8 +444,24 @@ unsafe fn discover(automation: &IUIAutomation, fg: HWND) -> (Vec<HoleSpec>, u32,
     let Ok(true_cond) = automation.CreateTrueCondition() else {
         return (Vec::new(), 0, 0, 0);
     };
-    let Ok(all) = root.FindAll(TreeScope_Descendants, &true_cond) else {
-        return (Vec::new(), 0, 0, 0);
+    // Bulk cache build first; plain FindAll only if that fails
+    // (classify_live then falls back to per-node Current* reads).
+    let all = if let Some(c) = &cache {
+        match root.FindAllBuildCache(TreeScope_Descendants, &true_cond, c) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::debug!("tracker: FindAllBuildCache failed ({e}) — plain FindAll");
+                match root.FindAll(TreeScope_Descendants, &true_cond) {
+                    Ok(a) => a,
+                    Err(_) => return (Vec::new(), 0, 0, 0),
+                }
+            }
+        }
+    } else {
+        match root.FindAll(TreeScope_Descendants, &true_cond) {
+            Ok(a) => a,
+            Err(_) => return (Vec::new(), 0, 0, 0),
+        }
     };
     let Ok(len) = all.Length() else { return (Vec::new(), 0, 0, 0) };
     let mut ctx = WalkCtx {
@@ -440,8 +573,18 @@ fn walk_cached(el: &IUIAutomationElement, in_doc: bool, depth: u32, ctx: &mut Wa
 fn classify_live(el: &IUIAutomationElement, ctx: &mut WalkCtx) {
     unsafe {
         ctx.total += 1;
-        let ct = el.CurrentControlType().unwrap_or(UIA_CONTROLTYPE_ID(0));
-        let rect = el.CurrentBoundingRectangle().unwrap_or_default();
+        // Cached-first: FindAllBuildCache filled these client-side —
+        // zero extra cross-process trips. Current* only when the cache
+        // is missing (plain-FindAll path, or a provider that skipped
+        // the property).
+        let ct = el
+            .CachedControlType()
+            .or_else(|_| el.CurrentControlType())
+            .unwrap_or(UIA_CONTROLTYPE_ID(0));
+        let rect = el
+            .CachedBoundingRectangle()
+            .or_else(|_| el.CurrentBoundingRectangle())
+            .unwrap_or_default();
         if ct == UIA_DocumentControlTypeId {
             // The page area (and iframes) — candidate scoping anchors.
             // Degenerate rects are skipped so a failed read can't turn
@@ -452,7 +595,8 @@ fn classify_live(el: &IUIAutomationElement, ctx: &mut WalkCtx) {
             return;
         }
         let lct = el
-            .CurrentLocalizedControlType()
+            .CachedLocalizedControlType()
+            .or_else(|_| el.CurrentLocalizedControlType())
             .map(|s| s.to_string())
             .unwrap_or_default();
         offer_candidate(classify(ct, &lct), &rect, ctx);

@@ -32,6 +32,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
 pub const HOLD_BURST_MS: u64 = 350;
 
 static HOLD_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+/// Timestamp of the last wheel event, 0 = never. The tracker reads
+/// ms_since_wheel() to snap its discovery cadence back to fast while
+/// scrolling (every media rect on screen is moving) and to wake its
+/// backoff nap early after a flick ends.
+static LAST_WHEEL_MS: AtomicU64 = AtomicU64::new(0);
 
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -45,11 +50,24 @@ pub fn hold_active() -> bool {
     now_ms() < HOLD_UNTIL_MS.load(Ordering::Relaxed)
 }
 
+/// Milliseconds since the last wheel event (u64::MAX = never). Cheap:
+/// two atomic loads. The tracker cadence (alpha.7) treats a recent
+/// wheel as "all media rects are moving" — walk at the fast cadence.
+pub fn ms_since_wheel() -> u64 {
+    let last = LAST_WHEEL_MS.load(Ordering::Relaxed);
+    if last == 0 {
+        return u64::MAX;
+    }
+    now_ms().saturating_sub(last)
+}
+
 unsafe extern "system" fn hook_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if ncode >= 0 {
         let msg = wparam.0 as u32;
         if msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL {
-            HOLD_UNTIL_MS.store(now_ms().saturating_add(HOLD_BURST_MS), Ordering::Relaxed);
+            let now = now_ms();
+            HOLD_UNTIL_MS.store(now.saturating_add(HOLD_BURST_MS), Ordering::Relaxed);
+            LAST_WHEEL_MS.store(now, Ordering::Relaxed);
         }
     }
     CallNextHookEx(None, ncode, wparam, lparam)
