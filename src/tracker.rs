@@ -55,6 +55,7 @@ const MIN_MEDIA: i32 = 40;   // image/graphic min w and h (px)
 const MIN_LINK: i32 = 96;    // hyperlink min w and h (px)
 const MAX_NODES: u32 = 100_000;
 const MAX_DEPTH: u32 = 25;
+const POKE_TOLERANCE: i32 = 8;   // pt beyond the window edge → bogus rect
 const SUMMARY_EVERY_MS: u64 = 2_000;  // state-change summary throttle
 const HEARTBEAT_MS: u64 = 10_000;     // unconditional liveness line
 
@@ -143,8 +144,8 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
     while !stop.load(Ordering::Relaxed) {
         if enabled.load(Ordering::Relaxed) {
             let fg = unsafe { GetForegroundWindow() };
-            let (specs, nodes, cands) = if fg.is_invalid() {
-                (Vec::new(), 0, 0)
+            let (specs, nodes, cands, docs_n) = if fg.is_invalid() {
+                (Vec::new(), 0, 0, 0)
             } else {
                 unsafe { discover(&automation, fg) }
             };
@@ -179,10 +180,11 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
                     })
                     .collect();
                 tracing::info!(
-                    "tracker: fg=\"{}\" nodes={} cands={} holes={} [{}]",
+                    "tracker: fg=\"{}\" nodes={} cands={} docs={} holes={} [{}]",
                     title,
                     nodes,
                     cands,
+                    docs_n,
                     specs.len(),
                     rects.join(" ")
                 );
@@ -222,14 +224,17 @@ struct Candidate {
 struct WalkCtx {
     total: u32,
     docs: u32,
+    /// Screen rects of every Document element seen this walk — the
+    /// live walk's document-pane scoping (browser page area).
+    docs_rects: Vec<RECT>,
     candidates: Vec<Candidate>,
 }
 
 /// Walk the foreground window and return the desired hole set plus
-/// walk counters for the summary log.
-unsafe fn discover(automation: &IUIAutomation, fg: HWND) -> (Vec<HoleSpec>, u32, u32) {
+/// walk counters for the summary log (specs, nodes, candidates, docs).
+unsafe fn discover(automation: &IUIAutomation, fg: HWND) -> (Vec<HoleSpec>, u32, u32, u32) {
     let Ok(root) = automation.ElementFromHandle(fg) else {
-        return (Vec::new(), 0, 0);
+        return (Vec::new(), 0, 0, 0);
     };
     // Hole rects are clamped to the foreground window ∩ virtual screen
     // (see clip_rect). Computed once per discovery tick.
@@ -242,7 +247,12 @@ unsafe fn discover(automation: &IUIAutomation, fg: HWND) -> (Vec<HoleSpec>, u32,
         let _ = cache.AddProperty(UIA_LocalizedControlTypePropertyId);
         let _ = cache.AddProperty(UIA_BoundingRectanglePropertyId);
         if let Ok(cached_root) = root.BuildUpdatedCache(&cache) {
-            let mut ctx = WalkCtx { total: 0, docs: 0, candidates: Vec::new() };
+            let mut ctx = WalkCtx {
+                total: 0,
+                docs: 0,
+                docs_rects: Vec::new(),
+                candidates: Vec::new(),
+            };
             walk_cached(&cached_root, false, 0, &mut ctx);
             // GECKO GUARD: Gecko/LibreWolf succeed at BuildUpdatedCache
             // but never fill CachedChildren — the walk sees only the
@@ -251,8 +261,9 @@ unsafe fn discover(automation: &IUIAutomation, fg: HWND) -> (Vec<HoleSpec>, u32,
             if ctx.total > 1 {
                 let nodes = ctx.total;
                 let cands = ctx.candidates.len() as u32;
+                let docs_n = ctx.docs;
                 let specs = ctx_to_specs(ctx, clip);
-                return (specs, nodes, cands);
+                return (specs, nodes, cands, docs_n);
             }
             if !FALLBACK_LOGGED.swap(true, Ordering::Relaxed) {
                 tracing::info!(
@@ -264,17 +275,24 @@ unsafe fn discover(automation: &IUIAutomation, fg: HWND) -> (Vec<HoleSpec>, u32,
         // Cache failed OR cached walk came back empty → live walk.
     }
 
-    // FALLBACK: flat live FindAll (no document scoping possible cheaply
-    // — gates still apply). Same shape as the probe's fallback.
+    // FALLBACK: flat live FindAll — no tree recursion possible, but
+    // Document elements harvested during the walk give the same
+    // document-pane scoping the cached path had (see classify_live +
+    // clamp_candidate), and the size gates still apply.
     tracing::debug!("tracker: cached walk unavailable — live fallback");
     let Ok(true_cond) = automation.CreateTrueCondition() else {
-        return (Vec::new(), 0, 0);
+        return (Vec::new(), 0, 0, 0);
     };
     let Ok(all) = root.FindAll(TreeScope_Descendants, &true_cond) else {
-        return (Vec::new(), 0, 0);
+        return (Vec::new(), 0, 0, 0);
     };
-    let Ok(len) = all.Length() else { return (Vec::new(), 0, 0) };
-    let mut ctx = WalkCtx { total: 0, docs: 0, candidates: Vec::new() };
+    let Ok(len) = all.Length() else { return (Vec::new(), 0, 0, 0) };
+    let mut ctx = WalkCtx {
+        total: 0,
+        docs: 0,
+        docs_rects: Vec::new(),
+        candidates: Vec::new(),
+    };
     for i in 0..len {
         if ctx.total > MAX_NODES {
             break;
@@ -285,31 +303,40 @@ unsafe fn discover(automation: &IUIAutomation, fg: HWND) -> (Vec<HoleSpec>, u32,
     }
     let nodes = ctx.total;
     let cands = ctx.candidates.len() as u32;
-    (ctx_to_specs(ctx, clip), nodes, cands)
+    let docs_n = ctx.docs_rects.len() as u32;
+    (ctx_to_specs(ctx, clip), nodes, cands, docs_n)
 }
 
-/// Visible-area clip for hole rects: the foreground window's rect
-/// intersected with the virtual screen (all monitors, physical px).
-/// UIA rects for scrolled-out or transform-mangled elements regularly
-/// land partly or wholly off-screen (alpha.3 log: a "video player"
-/// image at (-218,-109), a stray element at y=-11526) — a hole whose
-/// source is off-screen captures garbage or nothing. None = window
-/// rect was degenerate; the caller then skips clamping.
-unsafe fn clip_rect(fg: HWND) -> Option<RECT> {
+/// Visible-area clip for hole rects. `win` = foreground window rect,
+/// physical px. `vis` = win ∩ virtual screen (all monitors) — None when
+/// degenerate. Used by clamp_candidate to drop bogus UIA rects (see the
+/// alpha.3/-4 field logs: a "player" image at (-218,-109), a stray
+/// element at y=-11526) and to keep holes inside real on-screen area.
+struct Clip {
+    win: RECT,
+    vis: Option<RECT>,
+}
+
+unsafe fn clip_rect(fg: HWND) -> Option<Clip> {
     let mut wr = RECT::default();
     GetWindowRect(fg, &mut wr).ok()?;
+    if wr.right <= wr.left || wr.bottom <= wr.top {
+        return None;
+    }
     let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
     let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    let clip = RECT {
+    let vis = RECT {
         left: wr.left.max(vx),
         top: wr.top.max(vy),
         right: wr.right.min(vx + GetSystemMetrics(SM_CXVIRTUALSCREEN)),
         bottom: wr.bottom.min(vy + GetSystemMetrics(SM_CYVIRTUALSCREEN)),
     };
-    if clip.right <= clip.left || clip.bottom <= clip.top {
-        return None;
-    }
-    Some(clip)
+    let vis = if vis.right > vis.left && vis.bottom > vis.top {
+        Some(vis)
+    } else {
+        None
+    };
+    Some(Clip { win: wr, vis })
 }
 
 /// Truncated foreground-window title for the summary log. Char-boundary
@@ -364,16 +391,26 @@ fn walk_cached(el: &IUIAutomationElement, in_doc: bool, depth: u32, ctx: &mut Wa
 }
 
 /// Live-walk classification for the fallback path (flat list — no
-/// recursion, no document scoping).
+/// recursion). Document elements are harvested as scoping rects; every
+/// other element goes through the media classifier.
 fn classify_live(el: &IUIAutomationElement, ctx: &mut WalkCtx) {
     unsafe {
         ctx.total += 1;
         let ct = el.CurrentControlType().unwrap_or(UIA_CONTROLTYPE_ID(0));
+        let rect = el.CurrentBoundingRectangle().unwrap_or_default();
+        if ct == UIA_DocumentControlTypeId {
+            // The page area (and iframes) — candidate scoping anchors.
+            // Degenerate rects are skipped so a failed read can't turn
+            // into a docs_rects that swallows every candidate.
+            if rect.right > rect.left && rect.bottom > rect.top {
+                ctx.docs_rects.push(rect);
+            }
+            return;
+        }
         let lct = el
             .CurrentLocalizedControlType()
             .map(|s| s.to_string())
             .unwrap_or_default();
-        let rect = el.CurrentBoundingRectangle().unwrap_or_default();
         offer_candidate(classify(ct, &lct), &rect, ctx);
     }
 }
@@ -441,15 +478,16 @@ impl Candidate {
     }
 }
 
-fn ctx_to_specs(ctx: WalkCtx, clip: Option<RECT>) -> Vec<HoleSpec> {
-    // On-screen clamp first (final hole geometry), then merge, then cap.
+fn ctx_to_specs(ctx: WalkCtx, clip: Option<Clip>) -> Vec<HoleSpec> {
+    // Filter (bogus-rect + document-pane scoping) → clamp (final hole
+    // geometry) → merge → cap.
+    let WalkCtx { candidates, docs_rects, .. } = ctx;
     let cands = match clip {
-        Some(clip) => ctx
-            .candidates
+        Some(clip) => candidates
             .into_iter()
-            .filter_map(|c| clamp_candidate(c, &clip))
+            .filter_map(|c| clamp_candidate(c, &clip, &docs_rects))
             .collect(),
-        None => ctx.candidates,
+        None => candidates,
     };
     if cands.is_empty() {
         return Vec::new();
@@ -492,21 +530,52 @@ fn ctx_to_specs(ctx: WalkCtx, clip: Option<RECT>) -> Vec<HoleSpec> {
         .collect()
 }
 
-/// Clamp a candidate to the visible clip rect. Drops it when the
-/// visible remainder falls below the candidate's own size gate or
-/// shows less than half the original element (a sliver of a mostly
-/// off-screen image is not worth a hole).
-fn clamp_candidate(mut c: Candidate, clip: &RECT) -> Option<Candidate> {
-    let l = c.x.max(clip.left);
-    let t = c.y.max(clip.top);
-    let r = (c.x + c.w).min(clip.right);
-    let b = (c.y + c.h).min(clip.bottom);
-    let (w, h) = (r - l, b - t);
-    if w < c.min || h < c.min {
+/// Placement filter for one candidate. Three gates, in order:
+///
+/// 1. BOGUS-POKE GUARD — real on-page media lives INSIDE its window;
+///    a rect poking more than POKE_TOLERANCE past any window edge is a
+///    mangled/hidden UIA element (field evidence: "player" images at
+///    (-218,-109) and y=-11526 that became giant misplaced holes).
+///    Dropped, not clamped — a clamp would still paint a huge hole
+///    over the wrong area.
+/// 2. DOCUMENT-PANE SCOPING — when the walk saw any Document element
+///    (browser page / iframes / editor content), a candidate's CENTER
+///    must sit inside one of those rects. Kills holes on browser
+///    chrome, toolbars and page furniture in the flat live walk.
+///    Apps exposing no documents keep the old keep-all behavior.
+/// 3. CLAMP — the survivors are clipped to the window ∩ virtual
+///    screen (tiny pokes and monitor edges) and must still pass their
+///    own size gate.
+fn clamp_candidate(mut c: Candidate, clip: &Clip, docs: &[RECT]) -> Option<Candidate> {
+    // 1) bogus-poke guard
+    if c.x < clip.win.left - POKE_TOLERANCE
+        || c.y < clip.win.top - POKE_TOLERANCE
+        || c.x + c.w > clip.win.right + POKE_TOLERANCE
+        || c.y + c.h > clip.win.bottom + POKE_TOLERANCE
+    {
         return None;
     }
-    let orig = c.w as i64 * c.h as i64;
-    if orig > 0 && (w as i64 * h as i64) * 2 < orig {
+    // 2) document-pane scoping (center-in-document)
+    if !docs.is_empty() {
+        let (cx, cy) = (c.x + c.w / 2, c.y + c.h / 2);
+        let inside = docs
+            .iter()
+            .any(|d| cx >= d.left && cx < d.right && cy >= d.top && cy < d.bottom);
+        if !inside {
+            return None;
+        }
+    }
+    // 3) clamp to window, then to the virtual screen
+    let l = c.x.max(clip.win.left);
+    let t = c.y.max(clip.win.top);
+    let r = (c.x + c.w).min(clip.win.right);
+    let b = (c.y + c.h).min(clip.win.bottom);
+    let (l, t, r, b) = match clip.vis {
+        Some(v) => (l.max(v.left), t.max(v.top), r.min(v.right), b.min(v.bottom)),
+        None => (l, t, r, b),
+    };
+    let (w, h) = (r - l, b - t);
+    if w < c.min || h < c.min {
         return None;
     }
     c.x = l;
