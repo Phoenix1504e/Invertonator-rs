@@ -40,20 +40,27 @@
 //   · Clamp to the foreground window + 4px quantize: off-screen
 //     garbage rects never become holes, and UIA's ±1-3px rect wobble
 //     no longer moves holes / re-arms captures every walk.
-//   · Merge (alpha.7 — the "player split into 3-4 holes" fix):
-//     transitive union-find clustering. Two candidates join when the
-//     gap between their rects is ≤ tolerance, where tolerance =
-//     max(8px, 6% of the SMALLER fragment's larger axis). Keying on
-//     the smaller fragment is the point: a 720p player's fragments
-//     (strips 20-40px apart) unify into the ONE big hole the user
-//     expects, while 168px grid thumbnails (tolerance 10px, gutters
-//     12px+) still stay separate — the big player never swallows the
-//     sidebar. alpha.6's fixed 8px seam + 1.3× union-growth cap did
-//     the opposite: any player reported as N fragments (union ≈ N×
-//     the largest fragment) was mathematically barred from ever
-//     merging — the "3-4 rectangles side by side with gaps" report.
-//     No growth cap: fragments of one media may union to any size;
-//     the gap rule alone keeps distinct media apart.
+//   · Merge (alpha.8 — name-gated clustering, fixes BOTH merge
+//     complaints): transitive union-find clustering over near()
+//     pairs, but the gap tolerance depends on the ELEMENT NAMES:
+//     · both candidates UNNAMED (empty accessible name — player
+//       canvas/poster/tile layers): tolerance = max(8px, 6.25% of
+//       the smaller fragment's larger axis) — seams up to ~45px on
+//       a 720p media merge into the ONE big hole the user expects
+//       (the alpha.6 "3-4 rectangles side by side" complaint).
+//     · either candidate NAMED (grid thumbnails carry video titles):
+//       tolerance stays at the 8px floor. A named candidate can
+//       never chain across a real page gutter — this kills the
+//       alpha.7 mega-hole ("a big rectangle which covers anything
+//       and everything"): the scaled tolerance chained thumbnails
+//       through their 8-13px gutters into one page-sized hole.
+//       Geometry alone cannot separate player seams from grid
+//       gutters (both live in 8-40px); the accessible name is the
+//       signal that can: fragments of one media are nameless, grid
+//       items are titled.
+//   · Giant filter: a NON-dynamic candidate covering ≥ 85% of the
+//     foreground window is clamped garbage or a page wrapper — it
+//     would absorb the entire clustering. Dropped.
 //   · Final order is deterministic (top-to-bottom, left-to-right),
 //     so an unchanged hole set keeps its pump index mapping — no
 //     hole-window churn when two specs merely swap slots.
@@ -85,10 +92,11 @@ const MAX_DISCOVERY_MS: u64 = 1500; // idle backoff cap (page stable)
 const MIN_MEDIA: i32 = 64; // image/graphic AND video min w and h (px)
 const MIN_LINK: i32 = 96; // hyperlink min w and h (px)
 const MIN_HOLE: i32 = 32; // final hole min — degenerate slivers out
-const MERGE_GAP: i32 = 8; // gap-tolerance floor (small media)
-                          // Above the floor the tolerance scales with the SMALLER fragment's
-                          // larger axis (÷16 ≈ 6.25%): big media get proportionally wider
-                          // seams, small grid items keep the tight alpha.5 floor.
+const MERGE_GAP: i32 = 8; // gap-tolerance floor (named media + small media)
+                          // Unnamed pairs (fragments of one media) scale above the floor with
+                          // the SMALLER fragment's larger axis (÷16 ≈ 6.25%). Named pairs never
+                          // leave the floor — see the merge notes in the header.
+const GIANT_SHARE: f64 = 0.85; // non-dynamic candidate vs fg window area
 const QUANTUM: i32 = 4; // rect quantization grid (px)
 const MAX_NODES: u32 = 100_000;
 const MAX_DEPTH: u32 = 60; // alpha.4 capped at 25 — YouTube runs deeper
@@ -361,6 +369,10 @@ struct Candidate {
     w: i32,
     h: i32,
     dynamic: bool,
+    /// Accessible name present (non-blank)? Named media = a real page
+    /// item (titled thumbnail); unnamed media = a layer/tile of one
+    /// rendered media. The merge tolerance keys on this — see near().
+    named: bool,
     /// "img" | "lnk" | "vid" — for the candidate observability dump.
     kind: &'static str,
 }
@@ -506,8 +518,9 @@ fn walk_cached(el: &IUIAutomationElement, in_doc: bool, depth: u32, ctx: &mut Wa
                 .CachedLocalizedControlType()
                 .map(|s| s.to_string())
                 .unwrap_or_default();
+            let name = el.CachedName().map(|s| s.to_string()).unwrap_or_default();
             let rect = el.CachedBoundingRectangle().unwrap_or_default();
-            offer_candidate(classify(ct, &lct), &rect, ctx);
+            offer_candidate(classify(ct, &lct), &rect, &name, ctx);
         }
 
         if ctx.total < MAX_NODES {
@@ -537,8 +550,9 @@ fn classify_live(el: &IUIAutomationElement, ctx: &mut WalkCtx) {
             .CurrentLocalizedControlType()
             .map(|s| s.to_string())
             .unwrap_or_default();
+        let name = el.CurrentName().map(|s| s.to_string()).unwrap_or_default();
         let rect = el.CurrentBoundingRectangle().unwrap_or_default();
-        offer_candidate(classify(ct, &lct), &rect, ctx);
+        offer_candidate(classify(ct, &lct), &rect, &name, ctx);
     }
 }
 
@@ -570,14 +584,16 @@ fn classify(ct: UIA_CONTROLTYPE_ID, lct: &str) -> Option<MediaKind> {
 }
 
 /// Size gates + fg-window clamp + 4px quantize + zero-rect rejection.
+/// `name` = the element's accessible name (blank = unnamed layer).
 /// Physical pixels end to end.
-fn offer_candidate(kind: Option<MediaKind>, rect: &RECT, ctx: &mut WalkCtx) {
+fn offer_candidate(kind: Option<MediaKind>, rect: &RECT, name: &str, ctx: &mut WalkCtx) {
     let Some(kind) = kind else { return };
     let kind_tag = match kind {
         MediaKind::Image => "img",
         MediaKind::Link => "lnk",
         MediaKind::Video => "vid",
     };
+    let named = !name.trim().is_empty();
     let mut x = rect.left;
     let mut y = rect.top;
     let mut w = rect.right - rect.left;
@@ -636,6 +652,7 @@ fn offer_candidate(kind: Option<MediaKind>, rect: &RECT, ctx: &mut WalkCtx) {
         w,
         h,
         dynamic: kind == MediaKind::Video,
+        named,
         kind: kind_tag,
     });
 }
@@ -645,26 +662,26 @@ fn offer_candidate(kind: Option<MediaKind>, rect: &RECT, ctx: &mut WalkCtx) {
 // =====================================================================
 
 impl Candidate {
-    /// Gap tolerance for the pair (alpha.7): max(8px, 6% of the
-    /// SMALLER fragment's larger axis). Keying on the smaller one is
-    /// what keeps the watch page honest — a 1280×720 player's
-    /// tolerance toward a 168px sidebar thumbnail is the thumbnail's
-    /// 10px, not the player's 80px, so the player can never swallow
-    /// the sidebar. Between fragments of one big media (strips,
-    /// poster+canvas layers) it scales up to 20-45px, which is where
-    /// provider-reported seams actually sit.
+    /// Gap tolerance for the pair (alpha.8 — NAME-GATED):
+    /// · either candidate named → the 8px floor. Named media is a real
+    ///   page item (a titled thumbnail); it must never chain across a
+    ///   page gutter no matter how small the gutter is — that chain is
+    ///   exactly the alpha.7 "one hole covers everything" regression.
+    /// · both unnamed → max(8px, 6.25% of the smaller fragment's larger
+    ///   axis). Unnamed media are layers/tiles of ONE rendered media
+    ///   (canvas, poster, video strips); their seams scale with the
+    ///   media — up to ~45px on a 720p player.
     fn gap_tol(&self, o: &Candidate) -> i32 {
+        if self.named || o.named {
+            return MERGE_GAP;
+        }
         let smaller_max = self.w.max(self.h).min(o.w.max(o.h));
         MERGE_GAP.max(smaller_max / 16)
     }
 
     /// Gap-tolerant proximity: two rects whose edges come within the
-    /// pair's gap tolerance belong to the same media. The video
-    /// element, its control overlay and its canvases are reported by
-    /// the provider as near-adjacent siblings; a player split into
-    /// strips sits 10-40px apart. Strict `<` keeps the floor honest:
-    /// a gap of exactly MERGE_GAP never merges (alpha.5 behavior for
-    /// small media is preserved bit-for-bit).
+    /// pair's gap tolerance belong to the same media. Strict `<` keeps
+    /// the floor honest: a gap of exactly MERGE_GAP never merges.
     fn near(&self, o: &Candidate) -> bool {
         let g = self.gap_tol(o);
         self.x - g < o.x + o.w
@@ -673,7 +690,7 @@ impl Candidate {
             && o.y < self.y + self.h + g
     }
 
-    /// Union rect of two candidates (dynamic = either).
+    /// Union rect of two candidates (dynamic = either, named = either).
     fn union(self, o: Candidate) -> Candidate {
         let x = self.x.min(o.x);
         let y = self.y.min(o.y);
@@ -685,6 +702,7 @@ impl Candidate {
             w: r - x,
             h: b - y,
             dynamic: self.dynamic || o.dynamic,
+            named: self.named || o.named,
             kind: if self.dynamic { self.kind } else { o.kind },
         }
     }
@@ -700,30 +718,60 @@ fn ctx_to_specs(ctx: WalkCtx) -> (Vec<HoleSpec>, String) {
     }
 
     // CANDIDATE DUMP (alpha.6): the gated candidate set BEFORE merging
-    // — kind, size, position. This is what turns the next "holes are
-    // in the wrong place" report into a precise diagnosis: the log
-    // will show exactly which element produced which rect.
+    // — kind, `*` = named, size, position. This is what turns the next
+    // "holes are in the wrong place" report into a precise diagnosis:
+    // the log will show exactly which element produced which rect.
     let mut dump = String::new();
     for (i, c) in ctx.candidates.iter().enumerate().take(12) {
         dump.push_str(&format!(
-            "{}{} {}x{}@({},{})  ",
-            c.kind, i, c.w, c.h, c.x, c.y
+            "{}{}{} {}x{}@({},{})  ",
+            c.kind,
+            if c.named { "*" } else { "" },
+            i,
+            c.w,
+            c.h,
+            c.x,
+            c.y
         ));
     }
     if ctx.candidates.len() > 12 {
         dump.push_str(&format!("+{}", ctx.candidates.len() - 12));
     }
 
-    // UNION-FIND CLUSTERING (alpha.7): every pair of candidates whose
-    // gap is within tolerance joins the same cluster; clusters are
-    // transitive (A~B, B~C ⇒ one media), so a player reported as any
-    // number of fragments with any seam up to the tolerance collapses
-    // into exactly ONE hole — the "3-4 rectangles side by side" fix.
-    // No union-growth cap: alpha.6's 1.3× guard barred N-fragment
-    // players (union ≈ N× the largest fragment) from merging — the
-    // exact geometry the user kept reporting. The gap rule alone
-    // keeps distinct media (grid thumbnails, 12px+ gutters) apart.
-    let cands = ctx.candidates;
+    // GIANT FILTER (alpha.8): a NON-dynamic candidate covering ≥ 85%
+    // of the foreground window is clamped garbage (probe history has
+    // full-window rects from virtualized UIA reads) or a page wrapper
+    // mislabeled as media. Whatever its origin, it would absorb the
+    // entire clustering into one window-sized hole. Real media that
+    // big is a fullscreen VIDEO — and that arrives dynamic, which this
+    // filter keeps.
+    let mut cands = ctx.candidates;
+    if let Some(fg) = ctx.fg {
+        let fg_area = (fg.right - fg.left) as f64 * (fg.bottom - fg.top) as f64;
+        if fg_area > 0.0 {
+            let before = cands.len();
+            cands.retain(|c| c.dynamic || (c.area() as f64) < GIANT_SHARE * fg_area);
+            if cands.len() != before {
+                tracing::info!(
+                    "tracker: giant filter dropped {} window-sized candidate(s)",
+                    before - cands.len()
+                );
+            }
+        }
+    }
+    if cands.is_empty() {
+        return (Vec::new(), dump);
+    }
+
+    // UNION-FIND CLUSTERING (alpha.7, name-gated in alpha.8): every
+    // pair of candidates within the pair's gap tolerance joins the
+    // same cluster; clusters are transitive (A~B, B~C ⇒ one media),
+    // so a player reported as any number of UNNAMED fragments with
+    // any seam up to the scaled tolerance collapses into exactly ONE
+    // hole. NAMED candidates never leave the 8px floor, so titled
+    // thumbnails cannot chain across page gutters (the alpha.7
+    // mega-hole). No union-growth cap: fragments of one media may
+    // union to any size.
     let n = cands.len();
     let mut parent: Vec<usize> = (0..n).collect();
     fn find(parent: &mut [usize], mut i: usize) -> usize {
