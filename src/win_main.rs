@@ -727,6 +727,14 @@ fn probe_report(
             if s.dynamic { " dyn" } else { "" }
         ));
     }
+    // alpha.13 — starvation telemetry: on a heavy page (YouTube) the
+    // cached walk is chronically half-tree; STARVED_TICKS climbing
+    // while holes are held by sticky trust is that exact signature.
+    r.push_str(&format!(
+        "tracker: starved_ticks={} sticky_held={}\r\n",
+        crate::tracker::STARVED_TICKS.load(Ordering::Relaxed),
+        crate::tracker::STICKY_HELD.load(Ordering::Relaxed)
+    ));
     r
 }
 

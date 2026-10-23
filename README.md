@@ -4,23 +4,25 @@
 
 ![Invertonator](icon.svg)
 
-> **Status: v0.3.0-alpha.12** — Windows: UIA media tracker + Magnifier-API
+> **Status: v0.3.0-alpha.13** — Windows: UIA media tracker + Magnifier-API
 > true-color holes proven on hardware (1,152-node cache-request walks ·
 > 164 media elements classified · MagSetColorEffect/Source/Transform all
 > verified). Gecko browsers (Firefox/LibreWolf) supported via automatic
 > live-walk fallback when a provider leaves CachedChildren empty.
-> alpha.12 fixes both alpha.11 symptoms: (1) SMOOTHNESS — the pump now
-> runs at 15ms with timeBeginPeriod(1) (the 30ms pump actually fired at
-> 22–32Hz on the 15.6ms scheduler grid) and hole hosts are no longer
-> opaque layered windows (every repaint went through DWM redirection);
-> hole content now refreshes at ~64Hz, and a pump heartbeat logs the
-> actual delivery Hz every 10s; (2) PRECISION — two garbage-rect
-> generators removed: IsOffscreen=true elements (display:none,
-> scrolled-out, virtualized placeholders) never become candidates, and
-> a half-built (starved) tree no longer publishes its placeholder rects
-> — holes hide until a trustworthy walk completes. The warm-up now
-> re-runs on title change (tab switch/navigation) so the starvation
-> baseline describes the current page.
+> alpha.13 fixes the alpha.12 regression it introduced on heavy pages:
+> the starved-publish guard fired on nearly every walk (Chromium's
+> cached view never approaches the warm-up population on YouTube), so
+> holes flashed for a second and vanished. Now (1) STICKY TRUST — a
+> starved tick re-publishes the last trusted hole set instead of empty,
+> so holes stay on screen between live walks; (2) EXPEDITED LIVE — a
+> wake walk (scroll end, tab switch, alt-tab, F5) that comes back
+> starved settles briefly and then runs the live FindAll immediately
+> instead of queueing behind the 5s idle cooldown. VSCodium-class pages
+> (never starved) behave exactly as in alpha.12. Starved-tick and
+> sticky counters now appear in the diagnostics report and the tracker
+> heartbeat.
+> alpha.12 kept: ~64Hz unlayered pump (timeBeginPeriod(1)), IsOffscreen
+> filter, warm-up re-keyed on title change.
 > alpha.11 kept: evidence TTL (holes hide if no walk completes within
 > 8s — permanent holes structurally impossible) and tab-switch title
 > wake (~50ms re-sync).

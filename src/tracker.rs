@@ -101,6 +101,30 @@
 //     navigation), so the starvation baseline describes the CURRENT
 //     page (a smaller next tab used to read as chronic starvation),
 //     and every live walk re-baselines it from the real population.
+//   · HOLE AVAILABILITY (alpha.13 — "the holes on youtube are gone
+//     now"): the alpha.12 starved-suppression over-fired. On a heavy
+//     page (YouTube watch) the CHEAP cached walk chronically returns
+//     a half-materialized tree — Chromium's CachedChildren view never
+//     approaches the warm-up FindAll population — so suppression hit
+//     nearly every tick while the only walk that actually FINDS the
+//     video (the live FindAll) waited out its 5s cooldown: holes
+//     flashed for <1s and vanished for ~4s in a loop, i.e. "gone".
+//     VSCodium-class pages are never starved and were perfect. Two
+//     changes, both invisible on non-starved pages:
+//     (1) STICKY TRUST — a starved tick no longer publishes empty;
+//     it re-publishes the last TRUSTED hole set (the latest live-walk
+//     or full-cached result), so holes stay on screen between live
+//     walks instead of blinking out. Trusted sets replace sticky on
+//     every healthy walk — including healthy empties (a real no-media
+//     page clears the holes as before).
+//     (2) EXPEDITED LIVE — a wake walk (scroll end, wheel, fg
+//     move/resize/change, title change, F5-ON) that comes back
+//     starved re-walks after the tree settles and, if STILL starved,
+//     runs the live FindAll IMMEDIATELY. The 5s cooldown caps the
+//     IDLE live rate (anti-stutter); user-initiated freshness is rare
+//     by construction and must not queue behind it. Tab switches and
+//     alt-tabs settle SETTLE_MS first — the same teardown window the
+//     alpha.11 title wake used to walk straight into.
 //   · Giant filter: a NON-dynamic candidate covering ≥ 85% of the
 //     foreground window is clamped garbage or a page wrapper — it
 //     would absorb the entire clustering. Dropped.
@@ -112,7 +136,7 @@
 //   COORDINATES: screen physical pixels end to end (per-monitor-v2
 //   aware — see main::set_dpi_awareness).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -158,6 +182,13 @@ const LIVE_COOLDOWN_MS: u64 = 5000; // starvation live-walk throttle
                                     // (alpha.9: was 2s — the live FindAll is the
                                     // HEAVIEST walk; every 2s it stuttered the video)
 const SLEEP_SLICE_MS: u64 = 50; // wake-loop nap slice (alpha.10)
+const SETTLE_MS: u64 = 600; // alpha.13 — post-teardown grace before a
+                            // starved wake walk re-walks (tab switch /
+                            // alt-tab): lets the provider finish
+                            // destroying/rebuilding its tree, so the
+                            // re-walk sees the NEW page instead of the
+                            // tearing-down one (also the alpha.11 wedge
+                            // window — walking it at +50ms was the risk)
 
 /// One-shot flag: the Gecko live-fallback notice is logged exactly once
 /// per process (discovery ticks every 400ms — per-tick logs would spam
@@ -166,6 +197,22 @@ static FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// alpha.12 — starvation-suppression transition logger (see discover).
 static STARVED_QUIET: AtomicBool = AtomicBool::new(false);
+
+/// alpha.13 diagnostics counters, read by the probe report
+/// (win_main::probe_report). STARVED_TICKS = suppressed starved ticks
+/// since process start — a big number next to a healthy walk count is
+/// the "cached walk is chronically half-tree on this page" signature
+/// (the YouTube failure mode). STICKY_HELD = hole specs currently held
+/// by the sticky-trust bridge.
+pub static STARVED_TICKS: AtomicU64 = AtomicU64::new(0);
+pub static STICKY_HELD: AtomicUsize = AtomicUsize::new(0);
+
+/// alpha.13 canary: logs the FIRST video-kind element the alpha.12
+/// offscreen gate suppresses. If Chromium ever flags a visible player
+/// as IsOffscreen, this line in log.txt is the answer to a "video hole
+/// missing" report — without it the filter is unfalsifiable from the
+/// outside.
+static OFFSCREEN_VIDEO: AtomicBool = AtomicBool::new(false);
 
 /// alpha.10 — wake signal: the discovery nap ends early whenever this
 /// is set. Raised by set_enabled(true) so F5-ON produces holes in ~50ms
@@ -282,7 +329,29 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
     let mut warm_key_last = String::new();
     let mut warm_total: u32 = 0;
     let mut last_live = std::time::Instant::now();
+    // alpha.13 sticky trust: the last TRUSTED hole set (live-walk or
+    // full-cached result). A starved tick re-publishes this instead of
+    // empty — holes must not vanish just because Chromium's cached
+    // tree is half-materialized between live walks.
+    let mut sticky_specs: Vec<HoleSpec> = Vec::new();
+    // consecutive suppressed starved ticks (heartbeat telemetry)
+    let mut starved_run: u32 = 0;
+    // alpha.13 wake reasons, raised by the nap loop, consumed by the
+    // next walk. pending_wake alone = scroll/rect/F5 wake (expedite
+    // only); the title/fg variants additionally settle first — those
+    // are the teardown moments.
+    let mut pending_wake = false;
+    let mut pending_wake_title = false;
+    let mut pending_wake_fg = false;
     while !stop.load(Ordering::Relaxed) {
+        // Consume wake reasons left over from the nap (and a WAKE raised
+        // while the previous walk ran — e.g. F5 pressed mid-walk).
+        let wake_walk = pending_wake || WAKE.swap(false, Ordering::Relaxed);
+        let wake_title = pending_wake_title;
+        let wake_fg = pending_wake_fg;
+        pending_wake = false;
+        pending_wake_title = false;
+        pending_wake_fg = false;
         if enabled.load(Ordering::Relaxed) {
             let fg = unsafe { GetForegroundWindow() };
             let t0 = std::time::Instant::now();
@@ -313,12 +382,39 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
                 }
                 let allow_live =
                     last_live.elapsed() >= std::time::Duration::from_millis(LIVE_COOLDOWN_MS);
-                let (s, dump, went_live) =
-                    unsafe { discover(&automation, fg, &mut warm_total, allow_live) };
+                // alpha.13: a wake walk (scroll end, wheel, fg
+                // move/resize/change, title change, F5-ON) may expedite
+                // the live walk when the cached tree comes back starved;
+                // title changes and fg switches settle first — those are
+                // the provider-teardown moments.
+                let expedite = wake_walk || wake_title || wake_fg;
+                let settle = wake_title || wake_fg;
+                let (s, dump, went_live, starved) = unsafe {
+                    discover(
+                        &automation,
+                        fg,
+                        &mut warm_total,
+                        allow_live,
+                        expedite,
+                        settle,
+                    )
+                };
                 if went_live {
                     last_live = std::time::Instant::now();
                 }
-                (s, dump)
+                if starved {
+                    // STICKY TRUST (alpha.13): keep the last trusted set
+                    // on screen — an empty publish here is what made the
+                    // holes "go gone" on YouTube between live walks.
+                    starved_run = starved_run.saturating_add(1);
+                    STARVED_TICKS.fetch_add(1, Ordering::Relaxed);
+                    (sticky_specs.clone(), String::new())
+                } else {
+                    starved_run = 0;
+                    sticky_specs = s.clone();
+                    STICKY_HELD.store(sticky_specs.len(), Ordering::Relaxed);
+                    (s, dump)
+                }
             };
             let walk_ms = t0.elapsed().as_millis();
             // SLOW-WALK SIGNATURE (alpha.11): a completed-but-slow walk
@@ -407,8 +503,11 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
             // last_title after the log.
             let sig = format!("{}:{had_specs}", fg.0 as usize);
             if sig != last_sig || last_beat.elapsed() >= std::time::Duration::from_secs(10) {
+                // starved= consecutive suppressed ticks — a page whose
+                // cached walk is chronically half-tree shows this climbing
+                // in every heartbeat (the alpha.13 YouTube signature).
                 tracing::info!(
-                    "tracker: fg=\"{title}\" holes={n_holes} walk={walk_ms}ms cadence={interval}ms"
+                    "tracker: fg=\"{title}\" holes={n_holes} walk={walk_ms}ms cadence={interval}ms starved={starved_run}"
                 );
                 last_sig = sig;
                 last_beat = std::time::Instant::now();
@@ -418,6 +517,9 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
             // Disabled while holes were out — clear once.
             holes.set_specs(Vec::new());
             had_specs = false;
+            // alpha.13: nothing is trusted across an F5-OFF/ON cycle.
+            sticky_specs.clear();
+            STICKY_HELD.store(0, Ordering::Relaxed);
         }
         // WAKE LOOP (alpha.10 — the "random places" fix): nap in 50ms
         // slices instead of one long sleep, and cut the nap short the
@@ -447,6 +549,10 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
         while remaining > 0 && !stop.load(Ordering::Relaxed) {
             let enabled_now = enabled.load(Ordering::Relaxed);
             let mut wake = WAKE.swap(false, Ordering::Relaxed);
+            if wake {
+                // F5-ON mid-nap — a user-initiated freshness walk.
+                pending_wake = true;
+            }
             if enabled_now && !wake {
                 let holding = crate::scrollhook::hold_active();
                 if holding {
@@ -457,6 +563,9 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
                 } else {
                     if was_hold || crate::scrollhook::take_page_dirty() {
                         wake = true;
+                        // Scroll burst just ended / wheel fired — the
+                        // page content moved; expedite the re-walk.
+                        pending_wake = true;
                     }
                     was_hold = false;
                 }
@@ -465,6 +574,10 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
                     let wu = w.0 as usize;
                     if last_fg != 0 && wu != last_fg {
                         wake = true;
+                        // New foreground window — fresh provider, may
+                        // still be building; expedite AND settle.
+                        pending_wake = true;
+                        pending_wake_fg = true;
                     } else if wu == last_fg && !w.is_invalid() {
                         let mut r = RECT::default();
                         if unsafe { GetWindowRect(w, &mut r) }.is_ok()
@@ -474,6 +587,10 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
                                 || r.bottom != last_fg_rect.bottom)
                         {
                             wake = true;
+                            // Window moved/resized — rects are stale,
+                            // but the provider is not tearing down:
+                            // expedite without settle.
+                            pending_wake = true;
                         }
                         // TAB SWITCH (alpha.11): same window, same rect,
                         // no wheel — the title is the only cheap signal
@@ -483,6 +600,10 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
                         // 50ms-slice poll.
                         if !wake && !last_title.is_empty() && window_title(w) != last_title {
                             wake = true;
+                            // alpha.13: a title change IS a teardown /
+                            // rebuild moment — expedite AND settle.
+                            pending_wake = true;
+                            pending_wake_title = true;
                         }
                     }
                 }
@@ -578,17 +699,51 @@ struct WalkCtx {
     candidates: Vec<Candidate>,
 }
 
+/// Build the cache request and walk the fg tree — the cheap main path.
+/// Returns None when the cache request or BuildUpdatedCache fails; the
+/// caller then drops to the live walk.
+unsafe fn cached_walk(
+    automation: &IUIAutomation,
+    root: &IUIAutomationElement,
+    fg: Option<RECT>,
+) -> Option<WalkCtx> {
+    let cache = automation.CreateCacheRequest().ok()?;
+    let _ = cache.AddProperty(UIA_ControlTypePropertyId);
+    let _ = cache.AddProperty(UIA_NamePropertyId);
+    let _ = cache.AddProperty(UIA_LocalizedControlTypePropertyId);
+    let _ = cache.AddProperty(UIA_BoundingRectanglePropertyId);
+    let _ = cache.AddProperty(UIA_IsOffscreenPropertyId);
+    let cached_root = root.BuildUpdatedCache(&cache).ok()?;
+    let mut ctx = WalkCtx {
+        total: 0,
+        docs: 0,
+        fg,
+        candidates: Vec::new(),
+    };
+    walk_cached(&cached_root, false, 0, &mut ctx);
+    Some(ctx)
+}
+
 /// Walk the foreground window and return the desired hole set.
 /// `warm_total` is mutated: it re-baselines from every live walk (the
 /// live FindAll sees the REAL population) and grows when the tree
 /// outgrows the recorded warm-up size — both keep the starvation
 /// heuristic honest without a re-warm-up.
+///
+/// Returns (specs, cand_dump, went_live, starved_suppressed):
+///   went_live          — a live FindAll ran (caller restarts the
+///                        cooldown clock);
+///   starved_suppressed — starved + cooling down + not a wake walk:
+///                        specs came back EMPTY and the caller holds the
+///                        last trusted (sticky) set on screen instead.
 unsafe fn discover(
     automation: &IUIAutomation,
     fg: HWND,
     warm_total: &mut u32,
     allow_live: bool,
-) -> (Vec<HoleSpec>, String, bool) {
+    expedite: bool,
+    settle_first: bool,
+) -> (Vec<HoleSpec>, String, bool, bool) {
     // Foreground window rect — the clamp anchor for every candidate.
     let mut fg_rect = RECT::default();
     let fg_opt = if GetWindowRect(fg, &mut fg_rect).is_ok() {
@@ -598,83 +753,108 @@ unsafe fn discover(
     };
 
     let Ok(root) = automation.ElementFromHandle(fg) else {
-        return (Vec::new(), String::new(), false);
+        return (Vec::new(), String::new(), false, false);
     };
 
     // Cached walk (the probe's proven main path).
-    if let Ok(cache) = automation.CreateCacheRequest() {
-        let _ = cache.AddProperty(UIA_ControlTypePropertyId);
-        let _ = cache.AddProperty(UIA_NamePropertyId);
-        let _ = cache.AddProperty(UIA_LocalizedControlTypePropertyId);
-        let _ = cache.AddProperty(UIA_BoundingRectanglePropertyId);
-        let _ = cache.AddProperty(UIA_IsOffscreenPropertyId);
-        if let Ok(cached_root) = root.BuildUpdatedCache(&cache) {
-            let mut ctx = WalkCtx {
-                total: 0,
-                docs: 0,
-                fg: fg_opt,
-                candidates: Vec::new(),
-            };
-            walk_cached(&cached_root, false, 0, &mut ctx);
-            // Baseline growth: the tree legitimately outgrew the
-            // recorded warm-up population (lazy expansion, SPA
-            // growth). Grow the baseline — otherwise every later walk
-            // reads as "starved".
-            if ctx.total > *warm_total {
-                *warm_total = ctx.total;
-            }
-            // GECKO GUARD: Gecko/LibreWolf succeed at BuildUpdatedCache
-            // but never fill CachedChildren — the walk sees only the
-            // root element. Don't hand back an empty hole set then;
-            // drop to the live walk, which works on every provider.
-            if ctx.total > 1 {
-                // STARVATION GUARD (alpha.6, split in alpha.12): a
-                // cached walk that saw LESS THAN HALF the warm-up
-                // population means the provider is still handing out a
-                // PARTIAL tree. When the live walk is allowed, take it —
-                // it returns the real population and re-baselines.
-                // When it is NOT (5s cooldown), publish NOTHING: a
-                // half-built tree's rects are placeholders, and holes
-                // built from them are the "random holes" report. Holes
-                // hide for a tick or two instead — quiet is correct.
-                if *warm_total > 50 && ctx.total * 2 < *warm_total {
-                    if allow_live {
-                        tracing::info!(
-                            "tracker: cached walk starved ({}/{} nodes) — live walk this tick",
-                            ctx.total,
-                            *warm_total
-                        );
-                        let (specs, dump, total) = live_discover(automation, &root, ctx.fg, false);
-                        *warm_total = total; // the live walk is ground truth
-                        if STARVED_QUIET.swap(false, Ordering::Relaxed) {
-                            tracing::info!("tracker: full tree restored ({total} nodes)");
-                        }
-                        return (specs, dump, true);
-                    }
-                    if !STARVED_QUIET.swap(true, Ordering::Relaxed) {
-                        tracing::info!(
-                            "tracker: cached walk starved ({}/{} nodes), live walk cooling down — suppressing holes rather than publishing partial-tree rects",
-                            ctx.total,
-                            *warm_total
-                        );
-                    }
-                    return (Vec::new(), String::new(), false);
-                }
-                if STARVED_QUIET.swap(false, Ordering::Relaxed) {
+    if let Some(ctx) = cached_walk(automation, &root, fg_opt) {
+        // Baseline growth: the tree legitimately outgrew the
+        // recorded warm-up population (lazy expansion, SPA
+        // growth). Grow the baseline — otherwise every later walk
+        // reads as "starved".
+        if ctx.total > *warm_total {
+            *warm_total = ctx.total;
+        }
+        // GECKO GUARD: Gecko/LibreWolf succeed at BuildUpdatedCache
+        // but never fill CachedChildren — the walk sees only the
+        // root element. Don't hand back an empty hole set then;
+        // drop to the live walk, which works on every provider.
+        if ctx.total > 1 {
+            // STARVATION GUARD (alpha.6, split in alpha.12, bridged in
+            // alpha.13): a cached walk that saw LESS THAN HALF the
+            // warm-up population means the provider is handing out a
+            // PARTIAL tree — its rects are placeholders and holes built
+            // from them are the "random holes" report. Three outcomes:
+            //   · live allowed (5s cooldown elapsed) → live walk now;
+            //   · WAKE walk (scroll end / tab switch / F5-ON) → settle,
+            //     re-walk, and if still starved run the live FindAll
+            //     IMMEDIATELY — user-initiated freshness must not queue
+            //     behind the idle cooldown;
+            //   · otherwise → publish nothing and let the caller hold
+            //     the last TRUSTED set on screen (sticky). Publishing
+            //     empty here is what made YouTube's holes "go gone" in
+            //     alpha.12 — the starved state is CHRONIC on heavy
+            //     pages, not a one-tick hiccup.
+            if *warm_total > 50 && ctx.total * 2 < *warm_total {
+                if allow_live {
                     tracing::info!(
-                        "tracker: tree back to full population ({} nodes)",
-                        ctx.total
+                        "tracker: cached walk starved ({}/{} nodes) — live walk this tick",
+                        ctx.total,
+                        *warm_total
+                    );
+                    let (specs, dump, total) = live_discover(automation, &root, ctx.fg, false);
+                    *warm_total = total; // the live walk is ground truth
+                    if STARVED_QUIET.swap(false, Ordering::Relaxed) {
+                        tracing::info!("tracker: full tree restored ({total} nodes)");
+                    }
+                    return (specs, dump, true, false);
+                }
+                if expedite {
+                    if settle_first {
+                        // Tab switch / alt-tab: give the provider a
+                        // moment to finish tearing down / rebuilding
+                        // before re-walking (also the alpha.11 wedge
+                        // window — walking it at +50ms was the risk).
+                        std::thread::sleep(Duration::from_millis(SETTLE_MS));
+                    }
+                    if let Some(ctx2) = cached_walk(automation, &root, fg_opt) {
+                        if ctx2.total > *warm_total {
+                            *warm_total = ctx2.total;
+                        }
+                        if !(*warm_total > 50 && ctx2.total * 2 < *warm_total) {
+                            // The tree settled into a full population
+                            // while we waited — publish the cached set.
+                            if STARVED_QUIET.swap(false, Ordering::Relaxed) {
+                                tracing::info!(
+                                    "tracker: tree back to full population ({} nodes)",
+                                    ctx2.total
+                                );
+                            }
+                            let (specs, dump) = ctx_to_specs(ctx2);
+                            return (specs, dump, false, false);
+                        }
+                    }
+                    tracing::info!("tracker: still starved after wake — expedited live walk");
+                    let (specs, dump, total) = live_discover(automation, &root, ctx.fg, false);
+                    *warm_total = total; // the live walk is ground truth
+                    if STARVED_QUIET.swap(false, Ordering::Relaxed) {
+                        tracing::info!("tracker: full tree restored ({total} nodes)");
+                    }
+                    return (specs, dump, true, false);
+                }
+                if !STARVED_QUIET.swap(true, Ordering::Relaxed) {
+                    tracing::info!(
+                        "tracker: cached walk starved ({}/{} nodes), live walk cooling down — holding the last trusted hole set (sticky) instead of partial-tree rects",
+                        ctx.total,
+                        *warm_total
                     );
                 }
-                let (specs, dump) = ctx_to_specs(ctx);
-                return (specs, dump, false);
+                return (Vec::new(), String::new(), false, true);
             }
-            if !FALLBACK_LOGGED.swap(true, Ordering::Relaxed) {
+            if STARVED_QUIET.swap(false, Ordering::Relaxed) {
                 tracing::info!(
-                    "tracker: cached walk saw only {} node(s) — CachedChildren empty (Gecko) — permanent live fallback engaged",
+                    "tracker: tree back to full population ({} nodes)",
                     ctx.total
                 );
             }
+            let (specs, dump) = ctx_to_specs(ctx);
+            return (specs, dump, false, false);
+        }
+        if !FALLBACK_LOGGED.swap(true, Ordering::Relaxed) {
+            tracing::info!(
+                "tracker: cached walk saw only {} node(s) — CachedChildren empty (Gecko) — permanent live fallback engaged",
+                ctx.total
+            );
         }
         // Cache failed OR cached walk came back empty → live walk.
     }
@@ -684,7 +864,7 @@ unsafe fn discover(
     tracing::debug!("tracker: cached walk unavailable — live fallback");
     let (specs, dump, total) = live_discover(automation, &root, fg_opt, true);
     *warm_total = total; // the live walk is ground truth
-    (specs, dump, false)
+    (specs, dump, false, false)
 }
 
 /// Flat live FindAll walk: enumerate ALL descendants, classify each.
@@ -761,6 +941,28 @@ fn walk_cached(el: &IUIAutomationElement, in_doc: bool, depth: u32, ctx: &mut Wa
                 let name = el.CachedName().map(|s| s.to_string()).unwrap_or_default();
                 let rect = el.CachedBoundingRectangle().unwrap_or_default();
                 offer_candidate(classify(ct, &lct), &rect, &name, ctx);
+            } else if ct != UIA_ImageControlTypeId && ct != UIA_HyperlinkControlTypeId {
+                // alpha.13 CANARY: if Chromium ever flags the VISIBLE
+                // player as IsOffscreen, the alpha.12 filter would eat
+                // the video hole on every walk — the "holes gone"
+                // report with no starved ticks to explain it. Cached
+                // reads are bundle-local (free); log the first offense.
+                let lct = el
+                    .CachedLocalizedControlType()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                if classify(ct, &lct) == Some(MediaKind::Video)
+                    && !OFFSCREEN_VIDEO.swap(true, Ordering::Relaxed)
+                {
+                    let r = el.CachedBoundingRectangle().unwrap_or_default();
+                    tracing::warn!(
+                        "tracker: VIDEO element flagged IsOffscreen and suppressed — {}x{} @({},{}) — if the video hole is missing, this is why",
+                        r.right - r.left,
+                        r.bottom - r.top,
+                        r.left,
+                        r.top
+                    );
+                }
             }
         }
 
