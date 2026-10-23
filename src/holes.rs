@@ -29,6 +29,16 @@
 //     hallucinated MagSetWindowColorEffect in the F11 probe)
 //   · RAW CreateWindowExW + null-check (the crate's Result wrapper
 //     produces "failed successfully" false errors)
+//   · v0.3.0-alpha.4 — HOSTS MUST BE WS_EX_TOPMOST. Non-topmost hosts
+//     live in the normal Z band: the moment the user activates the
+//     browser, the app raises ABOVE the hole windows and the pump
+//     never re-raises them (ShowWindow only fires on the hidden→shown
+//     transition). Result: holes vanish the first time anything gets
+//     focused — exactly the "hole appeared then disappeared" report.
+//     Fix: show via SetWindowPos(HWND_TOPMOST, SWP_SHOWWINDOW |
+//     SWP_NOACTIVATE) and re-assert topmost on the static refresh
+//     cadence. Click-through is unaffected (WS_EX_TRANSPARENT +
+//     WM_NCHITTEST→HTTRANSPARENT still pass input through).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -39,8 +49,9 @@ use windows::Win32::Foundation::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, DestroyWindow, MoveWindow, RegisterClassW,
-    SetLayeredWindowAttributes, ShowWindow,
-    LAYERED_WINDOW_ATTRIBUTES_FLAGS, SHOW_WINDOW_CMD, WNDCLASSW,
+    SetLayeredWindowAttributes, SetWindowPos, ShowWindow, HWND_TOPMOST,
+    LAYERED_WINDOW_ATTRIBUTES_FLAGS, SHOW_WINDOW_CMD, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, WNDCLASSW,
 };
 use windows::core::{w, PCWSTR};
 
@@ -87,6 +98,7 @@ const WS_POPUP: u32 = 0x8000_0000;
 const WS_CHILD: u32 = 0x4000_0000;
 const WS_VISIBLE: u32 = 0x1000_0000;
 const WS_DISABLED: u32 = 0x0800_0000;
+const WS_EX_TOPMOST: u32 = 0x0000_0001;
 const WS_EX_LAYERED: u32 = 0x0008_0000;
 const WS_EX_TRANSPARENT: u32 = 0x0000_0020;
 const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
@@ -94,7 +106,6 @@ const WS_EX_NOACTIVATE: u32 = 0x0800_0000;
 const LWA_ALPHA_FLAG: LAYERED_WINDOW_ATTRIBUTES_FLAGS =
     LAYERED_WINDOW_ATTRIBUTES_FLAGS(2);
 const SW_HIDE_CMD: SHOW_WINDOW_CMD = SHOW_WINDOW_CMD(0);
-const SW_SHOWNOACTIVATE_CMD: SHOW_WINDOW_CMD = SHOW_WINDOW_CMD(4);
 pub const PUMP_MS: u32 = 30;      // pump cadence (SetTimer, ms)
 const STATIC_EVERY: u64 = 20;     // static holes refresh ~1.7Hz
 pub const MAX_HOLES: usize = 16;
@@ -226,20 +237,47 @@ impl HolePool {
 
             unsafe {
                 // Visibility reconcile — the pump is the single writer.
+                // SHOW must go through SetWindowPos(HWND_TOPMOST, …):
+                // a plain ShowWindow leaves the host at whatever Z
+                // position it last had, and the freshly-activated
+                // browser sits ABOVE it → invisible hole. Topmost band
+                // cannot be covered by any normal app window.
                 if want_visible && !h.visible {
-                    let _ = ShowWindow(h.host, SW_SHOWNOACTIVATE_CMD);
+                    let _ = SetWindowPos(
+                        h.host,
+                        HWND_TOPMOST,
+                        0, 0, 0, 0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    );
                     h.visible = true;
+                    tracing::info!(
+                        "holes: #{} shown @({},{}) {}x{}{}",
+                        i, spec.x, spec.y, spec.w, spec.h,
+                        if h.dynamic { " dyn" } else { "" }
+                    );
                 } else if !want_visible && h.visible {
                     let _ = ShowWindow(h.host, SW_HIDE_CMD);
                     h.visible = false;
+                    tracing::info!("holes: #{} hidden", i);
                 }
 
                 // Tiered refresh: dynamic every tick, static ~1.7Hz.
+                // The static cadence also re-asserts topmost — if any
+                // other topmost popup slipped above us, the hole
+                // recovers within ~600ms without user action.
                 if want_visible
                     && h.visible
                     && (h.dynamic || tick.is_multiple_of(STATIC_EVERY))
                 {
                     let _ = MagSetWindowSource(h.mag, h.source);
+                    if tick.is_multiple_of(STATIC_EVERY) {
+                        let _ = SetWindowPos(
+                            h.host,
+                            HWND_TOPMOST,
+                            0, 0, 0, 0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                        );
+                    }
                 }
             }
         }
@@ -301,7 +339,7 @@ unsafe fn create_pool() -> HolePool {
     let mut pool: Vec<PoolHole> = Vec::with_capacity(MAX_HOLES);
     for _ in 0..MAX_HOLES {
         let host = CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW
+            WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW
                 | WS_EX_NOACTIVATE,
             HOST_CLASS.as_ptr(),
             w!("Invertonator hole").as_ptr(),

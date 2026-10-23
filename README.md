@@ -4,11 +4,14 @@
 
 ![Invertonator](icon.svg)
 
-> **Status: v0.3.0-alpha.3** — Windows: UIA media tracker + Magnifier-API
+> **Status: v0.3.0-alpha.4** — Windows: UIA media tracker + Magnifier-API
 > true-color holes proven on hardware (1,152-node cache-request walks ·
 > 164 media elements classified · MagSetColorEffect/Source/Transform all
 > verified). Gecko browsers (Firefox/LibreWolf) supported via automatic
-> live-walk fallback when a provider leaves CachedChildren empty. Linux (X11): global gamma-ramp inversion shipped — the
+> live-walk fallback when a provider leaves CachedChildren empty.
+> alpha.4 hardening: holes are topmost overlays (no longer buried when
+> the browser gets focus), hole rects are clamped to the visible window
+> area, and the tracker logs a discovery summary for field diagnosis. Linux (X11): global gamma-ramp inversion shipped — the
 > XComposite true-color-hole overlay is the next milestone. For the
 > **fully-featured C# edition**, see
 > [Invertonator](https://github.com/Phoenix1504e/Invertonator).

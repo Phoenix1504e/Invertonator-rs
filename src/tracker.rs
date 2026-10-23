@@ -42,7 +42,11 @@ use windows::Win32::UI::Accessibility::{
     UIA_LocalizedControlTypePropertyId, UIA_NamePropertyId,
     UIA_CONTROLTYPE_ID,
 };
-use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetForegroundWindow, GetSystemMetrics, GetWindowTextW, GetWindowRect,
+    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN,
+};
 
 use crate::holes::{HoleSpec, Holes, MAX_HOLES};
 
@@ -51,6 +55,8 @@ const MIN_MEDIA: i32 = 40;   // image/graphic min w and h (px)
 const MIN_LINK: i32 = 96;    // hyperlink min w and h (px)
 const MAX_NODES: u32 = 100_000;
 const MAX_DEPTH: u32 = 25;
+const SUMMARY_EVERY_MS: u64 = 2_000;  // state-change summary throttle
+const HEARTBEAT_MS: u64 = 10_000;     // unconditional liveness line
 
 /// One-shot flag: the Gecko live-fallback notice is logged exactly once
 /// per process (discovery ticks every 400ms — per-tick logs would spam
@@ -132,16 +138,55 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
     tracing::info!("tracker: alive (discovery every {DISCOVERY_MS}ms)");
 
     let mut had_specs = false;
+    let mut last_log = std::time::Instant::now();
+    let mut last_key = String::new();
     while !stop.load(Ordering::Relaxed) {
         if enabled.load(Ordering::Relaxed) {
             let fg = unsafe { GetForegroundWindow() };
-            let specs = if fg.is_invalid() {
-                Vec::new()
+            let (specs, nodes, cands) = if fg.is_invalid() {
+                (Vec::new(), 0, 0)
             } else {
                 unsafe { discover(&automation, fg) }
             };
             had_specs = !specs.is_empty();
-            holes.set_specs(specs);
+            holes.set_specs(specs.clone());
+
+            // Throttled discovery summary — the alpha.3 log proved the
+            // PROBE sees media but said nothing about what the TRACKER
+            // produced. This line closes that observability gap: one
+            // line per state change, plus a 10s heartbeat.
+            let now = std::time::Instant::now();
+            let elapsed = now.duration_since(last_log).as_millis() as u64;
+            let title = if fg.is_invalid() {
+                String::new()
+            } else {
+                // SAFETY: fg valid, plain HWND read (GetWindowTextW).
+                unsafe { window_title(fg) }
+            };
+            let key = format!("{}\u{1}{}", title, specs.len());
+            if elapsed >= HEARTBEAT_MS || (elapsed >= SUMMARY_EVERY_MS && key != last_key) {
+                last_log = now;
+                last_key = key;
+                let rects: Vec<String> = specs
+                    .iter()
+                    .take(6)
+                    .map(|s| {
+                        format!(
+                            "({},{}) {}x{}{}",
+                            s.x, s.y, s.w, s.h,
+                            if s.dynamic { " dyn" } else { "" }
+                        )
+                    })
+                    .collect();
+                tracing::info!(
+                    "tracker: fg=\"{}\" nodes={} cands={} holes={} [{}]",
+                    title,
+                    nodes,
+                    cands,
+                    specs.len(),
+                    rects.join(" ")
+                );
+            }
         } else if had_specs {
             // Disabled while holes were out — clear once.
             holes.set_specs(Vec::new());
@@ -168,6 +213,9 @@ struct Candidate {
     y: i32,
     w: i32,
     h: i32,
+    /// Size gate this candidate must keep passing after on-screen
+    /// clamping (MIN_MEDIA / MIN_LINK / 1 for video).
+    min: i32,
     dynamic: bool,
 }
 
@@ -177,11 +225,15 @@ struct WalkCtx {
     candidates: Vec<Candidate>,
 }
 
-/// Walk the foreground window and return the desired hole set.
-unsafe fn discover(automation: &IUIAutomation, fg: HWND) -> Vec<HoleSpec> {
+/// Walk the foreground window and return the desired hole set plus
+/// walk counters for the summary log.
+unsafe fn discover(automation: &IUIAutomation, fg: HWND) -> (Vec<HoleSpec>, u32, u32) {
     let Ok(root) = automation.ElementFromHandle(fg) else {
-        return Vec::new();
+        return (Vec::new(), 0, 0);
     };
+    // Hole rects are clamped to the foreground window ∩ virtual screen
+    // (see clip_rect). Computed once per discovery tick.
+    let clip = clip_rect(fg);
 
     // Cached walk (the probe's proven main path).
     if let Ok(cache) = automation.CreateCacheRequest() {
@@ -197,7 +249,10 @@ unsafe fn discover(automation: &IUIAutomation, fg: HWND) -> Vec<HoleSpec> {
             // root element. Don't hand back an empty hole set then;
             // drop to the live walk, which works on every provider.
             if ctx.total > 1 {
-                return ctx_to_specs(ctx);
+                let nodes = ctx.total;
+                let cands = ctx.candidates.len() as u32;
+                let specs = ctx_to_specs(ctx, clip);
+                return (specs, nodes, cands);
             }
             if !FALLBACK_LOGGED.swap(true, Ordering::Relaxed) {
                 tracing::info!(
@@ -213,12 +268,12 @@ unsafe fn discover(automation: &IUIAutomation, fg: HWND) -> Vec<HoleSpec> {
     // — gates still apply). Same shape as the probe's fallback.
     tracing::debug!("tracker: cached walk unavailable — live fallback");
     let Ok(true_cond) = automation.CreateTrueCondition() else {
-        return Vec::new();
+        return (Vec::new(), 0, 0);
     };
     let Ok(all) = root.FindAll(TreeScope_Descendants, &true_cond) else {
-        return Vec::new();
+        return (Vec::new(), 0, 0);
     };
-    let Ok(len) = all.Length() else { return Vec::new() };
+    let Ok(len) = all.Length() else { return (Vec::new(), 0, 0) };
     let mut ctx = WalkCtx { total: 0, docs: 0, candidates: Vec::new() };
     for i in 0..len {
         if ctx.total > MAX_NODES {
@@ -228,7 +283,42 @@ unsafe fn discover(automation: &IUIAutomation, fg: HWND) -> Vec<HoleSpec> {
             classify_live(&el, &mut ctx);
         }
     }
-    ctx_to_specs(ctx)
+    let nodes = ctx.total;
+    let cands = ctx.candidates.len() as u32;
+    (ctx_to_specs(ctx, clip), nodes, cands)
+}
+
+/// Visible-area clip for hole rects: the foreground window's rect
+/// intersected with the virtual screen (all monitors, physical px).
+/// UIA rects for scrolled-out or transform-mangled elements regularly
+/// land partly or wholly off-screen (alpha.3 log: a "video player"
+/// image at (-218,-109), a stray element at y=-11526) — a hole whose
+/// source is off-screen captures garbage or nothing. None = window
+/// rect was degenerate; the caller then skips clamping.
+unsafe fn clip_rect(fg: HWND) -> Option<RECT> {
+    let mut wr = RECT::default();
+    GetWindowRect(fg, &mut wr).ok()?;
+    let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    let clip = RECT {
+        left: wr.left.max(vx),
+        top: wr.top.max(vy),
+        right: wr.right.min(vx + GetSystemMetrics(SM_CXVIRTUALSCREEN)),
+        bottom: wr.bottom.min(vy + GetSystemMetrics(SM_CYVIRTUALSCREEN)),
+    };
+    if clip.right <= clip.left || clip.bottom <= clip.top {
+        return None;
+    }
+    Some(clip)
+}
+
+/// Truncated foreground-window title for the summary log. Char-boundary
+/// safe (multi-byte titles — see the trunc lesson in win_main).
+unsafe fn window_title(hwnd: HWND) -> String {
+    let mut buf = [0u16; 128];
+    let n = GetWindowTextW(hwnd, &mut buf).max(0) as usize;
+    let s = String::from_utf16_lossy(&buf[..n.min(buf.len())]);
+    s.chars().take(48).collect()
 }
 
 /// Cached-walk recursion. `in_doc` = we are inside a Document subtree —
@@ -323,10 +413,10 @@ fn offer_candidate(kind: Option<MediaKind>, rect: &RECT, ctx: &mut WalkCtx) {
     if w <= 0 || h <= 0 {
         return;
     }
-    let passes = match kind {
-        MediaKind::Image => w >= MIN_MEDIA && h >= MIN_MEDIA,
-        MediaKind::Link => w >= MIN_LINK && h >= MIN_LINK,
-        MediaKind::Video => true,
+    let (passes, min) = match kind {
+        MediaKind::Image => (w >= MIN_MEDIA && h >= MIN_MEDIA, MIN_MEDIA),
+        MediaKind::Link => (w >= MIN_LINK && h >= MIN_LINK, MIN_LINK),
+        MediaKind::Video => (true, 1),
     };
     if !passes {
         return;
@@ -336,6 +426,7 @@ fn offer_candidate(kind: Option<MediaKind>, rect: &RECT, ctx: &mut WalkCtx) {
         y: rect.top,
         w,
         h,
+        min,
         dynamic: kind == MediaKind::Video,
     });
 }
@@ -350,13 +441,22 @@ impl Candidate {
     }
 }
 
-fn ctx_to_specs(ctx: WalkCtx) -> Vec<HoleSpec> {
-    if ctx.candidates.is_empty() {
+fn ctx_to_specs(ctx: WalkCtx, clip: Option<RECT>) -> Vec<HoleSpec> {
+    // On-screen clamp first (final hole geometry), then merge, then cap.
+    let cands = match clip {
+        Some(clip) => ctx
+            .candidates
+            .into_iter()
+            .filter_map(|c| clamp_candidate(c, &clip))
+            .collect(),
+        None => ctx.candidates,
+    };
+    if cands.is_empty() {
         return Vec::new();
     }
 
     // Largest first.
-    let mut cands = ctx.candidates;
+    let mut cands = cands;
     cands.sort_by_key(|c| std::cmp::Reverse(c.w as i64 * c.h as i64));
 
     // Overlap merge: an <img> inside an <a> is ONE thumbnail. A new
@@ -390,4 +490,28 @@ fn ctx_to_specs(ctx: WalkCtx) -> Vec<HoleSpec> {
     kept.into_iter()
         .map(|k| HoleSpec { x: k.x, y: k.y, w: k.w, h: k.h, dynamic: k.dynamic })
         .collect()
+}
+
+/// Clamp a candidate to the visible clip rect. Drops it when the
+/// visible remainder falls below the candidate's own size gate or
+/// shows less than half the original element (a sliver of a mostly
+/// off-screen image is not worth a hole).
+fn clamp_candidate(mut c: Candidate, clip: &RECT) -> Option<Candidate> {
+    let l = c.x.max(clip.left);
+    let t = c.y.max(clip.top);
+    let r = (c.x + c.w).min(clip.right);
+    let b = (c.y + c.h).min(clip.bottom);
+    let (w, h) = (r - l, b - t);
+    if w < c.min || h < c.min {
+        return None;
+    }
+    let orig = c.w as i64 * c.h as i64;
+    if orig > 0 && (w as i64 * h as i64) * 2 < orig {
+        return None;
+    }
+    c.x = l;
+    c.y = t;
+    c.w = w;
+    c.h = h;
+    Some(c)
 }
