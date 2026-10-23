@@ -4,25 +4,27 @@
 
 ![Invertonator](icon.svg)
 
-> **Status: v0.3.0-alpha.8** — Windows: UIA media tracker + Magnifier-API
+> **Status: v0.3.0-alpha.9** — Windows: UIA media tracker + Magnifier-API
 > true-color holes proven on hardware (1,152-node cache-request walks ·
 > 164 media elements classified · MagSetColorEffect/Source/Transform all
 > verified). Gecko browsers (Firefox/LibreWolf) supported via automatic
 > live-walk fallback when a provider leaves CachedChildren empty.
-> alpha.8 hole-merge fix: candidates cluster transitively, but the gap
-> tolerance is NAME-GATED — unnamed media layers (player canvas/poster
-> tiles) merge across seams up to ~6% of their size, so a fragmented
-> player becomes the ONE big hole it should be, while named media
-> (titled grid thumbnails) never leave the 8px floor and cannot chain
-> across page gutters into a mega-hole. Plus a giant-candidate filter
-> (a non-video candidate covering ≥85% of the window is dropped).
-> alpha.6 refresh-model fix kept: holes are poked with InvalidateRect
-> every tick (video ~33Hz) so in-hole video is live without the laggy
-> MagSetWindowSource reset spam. Plus: per-window UIA warm-up (Chromium
-> hands out a partial tree — sidebar/watch media was never seen), 64px
-> media gates (kills holes on UI icons), candidate-level hole logging,
-> and F10 copies the whole diagnostic report to the CLIPBOARD (paste
-> it into the bug report — no log.txt hunting).
+> alpha.9 fixes the two alpha.8 symptoms: (1) hole-merge is SAME-NAME
+> gated — unnamed fragments AND fragments sharing one accessible name
+> merge across seams up to ~6% of their size (alpha.8's named→8px floor
+> fragmented the player again), while differently-named media keeps the
+> 8px floor so grid thumbnails can never chain into a mega-hole; (2)
+> lag is gone by construction — every hole is poked ~33Hz regardless of
+> classification (a video fragment mislabeled as image/graphic used to
+> refresh at 6.6Hz), the static self-heal moved 6s → 18s, discovery
+> breathes at 1–3s while a video hole is live, and the starvation
+> live-walk cooldown widened 2s → 5s.
+> Diagnostics now deliver THEMSELVES: 3s after inversion comes ON (or
+> on F10) the full report goes to the clipboard AND a Desktop file
+> (invertonator-diagnostics.txt) — paste it into the bug report.
+> alpha.6-8 fixes kept: per-window UIA warm-up (Chromium hands out a
+> partial tree), 64px media gates, deterministic hole ordering, giant
+> candidate filter, F10 clipboard reports.
 > Linux (X11): global gamma-ramp inversion shipped — the
 > XComposite true-color-hole overlay is the next milestone. For the
 > **fully-featured C# edition**, see

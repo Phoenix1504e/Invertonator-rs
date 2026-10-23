@@ -34,9 +34,9 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow, GetMessageW,
-    GetWindowRect, LoadCursorW, LoadImageW, PostQuitMessage, RegisterClassW, TranslateMessage,
-    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, HICON, IDC_ARROW, IMAGE_ICON, LR_DEFAULTSIZE, MSG,
-    WM_DESTROY, WNDCLASSW,
+    GetWindowRect, KillTimer, LoadCursorW, LoadImageW, PostQuitMessage, RegisterClassW, SetTimer,
+    TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, HICON, IDC_ARROW, IMAGE_ICON,
+    LR_DEFAULTSIZE, MSG, WM_DESTROY, WNDCLASSW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, SetWindowLongPtrW, GWLP_USERDATA,
@@ -768,6 +768,80 @@ fn copy_to_clipboard(text: &str) -> bool {
     }
 }
 
+/// Write the diagnostic report to a file the tester can find WITHOUT
+/// opening log.txt: Desktop first, fallback %LOCALAPPDATA%\Invertonator.
+/// Returns the path that was written (for the tray tip).
+fn write_diag_file(report: &str) -> Option<String> {
+    if let Some(home) = std::env::var_os("USERPROFILE") {
+        let p = std::path::PathBuf::from(home)
+            .join("Desktop")
+            .join("invertonator-diagnostics.txt");
+        if std::fs::write(&p, report).is_ok() {
+            return Some(p.to_string_lossy().into_owned());
+        }
+    }
+    if let Some(la) = std::env::var_os("LOCALAPPDATA") {
+        let dir = std::path::PathBuf::from(la).join("Invertonator");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("diagnostics.txt");
+        if std::fs::write(&p, report).is_ok() {
+            return Some(p.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
+/// Diagnostics delivery (alpha.9): probe the foreground window on a
+/// BACKGROUND thread — the probe's warm-up + 800ms settle + walk stalls
+/// its calling thread for seconds, and on main that froze the hole pump
+/// — then copy the report to the CLIPBOARD and write it to a Desktop
+/// file. F10 and the F5 auto-dump share this path.
+fn run_diagnostics(hwnd: HWND, holes: &Holes) {
+    let target = unsafe { GetForegroundWindow() };
+    // HWND wraps a raw pointer (not Send) — cross the thread boundary
+    // as usize and rebuild the wrappers inside.
+    let hwnd_raw = hwnd.0 as usize;
+    let target_raw = target.0 as usize;
+    let holes = holes.clone();
+    let _ = std::thread::Builder::new()
+        .name("diagnostics".into())
+        .spawn(move || {
+            let hwnd = HWND(hwnd_raw as *mut _);
+            let target = HWND(target_raw as *mut _);
+            let (total, media, samples) = uia::probe(target);
+            tracing::info!("uia-probe: total={total} media={media}");
+            for s in &samples {
+                tracing::info!("  media sample: {s}");
+            }
+            let hole_specs = holes.shared.specs.lock().unwrap().clone();
+            let report = probe_report(target, total, media, &samples, &hole_specs);
+            let copied = copy_to_clipboard(&report);
+            let file = write_diag_file(&report);
+            tracing::info!("uia-probe: report copied={copied} file={file:?}");
+            let tip = match (copied, &file) {
+                (true, Some(f)) => format!("Invertonator — diagnostics COPIED + saved: {f}"),
+                (true, None) => "Invertonator — diagnostics COPIED (Ctrl+V pastes them)".into(),
+                (false, Some(f)) => format!("Invertonator — diagnostics saved: {f}"),
+                (false, None) => "Invertonator — diagnostics FAILED (see log.txt)".into(),
+            };
+            // Tray tip from THIS thread: a self-contained NID, NIF_TIP
+            // only — no shared state with the main-thread tray struct.
+            let mut nid = NOTIFYICONDATAW {
+                cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+                hWnd: hwnd,
+                uID: 1,
+                uFlags: NIF_TIP,
+                ..Default::default()
+            };
+            let wide: Vec<u16> = tip.encode_utf16().take(127).collect();
+            nid.szTip[..wide.len()].copy_from_slice(&wide);
+            nid.szTip[wide.len()] = 0;
+            unsafe {
+                let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+            }
+        });
+}
+
 // =====================================================================
 // Window procedure
 // =====================================================================
@@ -809,10 +883,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 _ => {}
             }
         }
-        windows::Win32::UI::WindowsAndMessaging::WM_TIMER
-            if wparam.0 == 1 =>
-        {
+        windows::Win32::UI::WindowsAndMessaging::WM_TIMER if wparam.0 == 1 => {
             state.pump_tick();
+        }
+        // alpha.9 auto-diagnostics: F5 arms this 3s one-shot when
+        // inversion comes ON (see the TOGGLE branch). Skipped if the
+        // user already toggled back off within the window.
+        windows::Win32::UI::WindowsAndMessaging::WM_TIMER if wparam.0 == 2 => {
+            let _ = KillTimer(Some(&hwnd), 2);
+            let active = state.invert_on.load(Ordering::Relaxed) && state.mode == ScreenMode::Invert;
+            if active {
+                run_diagnostics(hwnd, &state.holes);
+            }
         }
         _ => {}
     }
@@ -821,6 +903,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         state.toggle();
         let tip_text = format!("Invertonator — {}", state.mode_text());
         update_tray_tip(&mut state.tray_nid, &tip_text);
+        // alpha.9 — BREAK THE FEEDBACK LOOP FOR GOOD: three rounds in a
+        // row the tester reported symptoms but never pasted the F10
+        // diagnostics. F5 is the key they press every single time, so
+        // 3s after inversion comes ON, diagnostics deliver THEMSELVES:
+        // clipboard + Desktop file, tray tip says where. F10 stays as
+        // the manual re-dump.
+        if state.invert_on.load(Ordering::Relaxed) && state.mode == ScreenMode::Invert {
+            let _ = SetTimer(Some(&hwnd), 2, 3000, None);
+        }
     }
     if CYCLE_REQUEST.swap(false, Ordering::Relaxed) {
         state.cycle_mode();
@@ -836,32 +927,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         update_tray_tip(&mut state.tray_nid, &tip_text);
     }
     if PROBE_REQUEST.swap(false, Ordering::Relaxed) {
-        let target = GetForegroundWindow();
-        let (total, media, samples) = uia::probe(target);
-        tracing::info!("uia-probe: total={total} media={media}");
-        for s in &samples {
-            tracing::info!("  media sample: {s}");
-        }
-        // alpha.7: the report goes to the CLIPBOARD — the tester
-        // pastes it straight into the bug report. The tray tip tells
-        // them it worked without ever opening log.txt.
-        let holes = state.holes.shared.specs.lock().unwrap().clone();
-        let report = probe_report(target, total, media, &samples, &holes);
-        let copied = copy_to_clipboard(&report);
-        tracing::info!(
-            "uia-probe: report {}",
-            if copied {
-                "COPIED to clipboard — paste it into the bug report"
-            } else {
-                "clipboard copy FAILED (report is in log.txt only)"
-            }
-        );
-        let tip = if copied {
-            "Invertonator — diagnostics COPIED (Ctrl+V pastes them)"
-        } else {
-            "Invertonator — diagnostics copy FAILED (see log.txt)"
-        };
-        update_tray_tip(&mut state.tray_nid, tip);
+        // alpha.9: F10 and the F5 auto-dump share one path — background
+        // probe, clipboard + Desktop file, tray tip.
+        run_diagnostics(hwnd, &state.holes);
     }
     if MAGPROBE_REQUEST.swap(false, Ordering::Relaxed) {
         magprobe::run();

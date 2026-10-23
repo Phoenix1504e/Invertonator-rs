@@ -5,12 +5,18 @@
 //   INVERT color effect — media under a hole passes through the OS
 //   inversion twice and renders in TRUE colors.
 //
-//   REFRESH MODEL (alpha.6): the Magnifier child re-captures ONLY when
+//   REFRESH MODEL (alpha.9): the Magnifier child re-captures ONLY when
 //   its paint is poked — InvalidateRect — which is what Microsoft's
-//   windowed-magnifier sample does every ~16ms. The pump therefore
-//   pokes every visible hole on its tick: video holes ~33Hz, static
-//   holes ~6.6Hz. MagSetWindowSource (expensive pipeline rebuild) is
-//   reserved for rect changes, re-shows and the rare static self-heal.
+//   windowed-magnifier sample does every ~16ms. alpha.6..8 poked DYNAMIC
+//   holes every tick but static ones only every 5th (~6.6Hz): any video
+//   fragment misclassified as image/graphic then updated at 6.6Hz —
+//   video-in-hole read as LAG, exactly the alpha.8 complaint. alpha.9
+//   pokes EVERY visible hole EVERY tick (~33Hz): the poke is just a
+//   repaint flag, the capture cost scales with hole AREA (not window
+//   count), and Microsoft's own sample pokes a fullscreen magnifier at
+//   60Hz. Classification can no longer throttle live content.
+//   MagSetWindowSource (expensive pipeline rebuild) is reserved for
+//   rect changes, re-shows and the rare static self-heal.
 //
 //   THREADING MODEL (v0.2.0-alpha.3 — the "F11 rule"):
 //   · Hole windows are created on the MAIN thread and stay there.
@@ -101,8 +107,9 @@ const LWA_ALPHA_FLAG: LAYERED_WINDOW_ATTRIBUTES_FLAGS = LAYERED_WINDOW_ATTRIBUTE
 const SW_HIDE_CMD: SHOW_WINDOW_CMD = SHOW_WINDOW_CMD(0);
 const SW_SHOWNOACTIVATE_CMD: SHOW_WINDOW_CMD = SHOW_WINDOW_CMD(4);
 pub const PUMP_MS: u32 = 30; // pump cadence (SetTimer, ms)
-const STATIC_EVERY: u64 = 200; // static-hole capture re-arm ~6s
-const STATIC_POKE_EVERY: u64 = 5; // static-hole repaint poke ~6.6Hz
+const STATIC_EVERY: u64 = 600; // static-hole self-heal ~18s (was ~6s —
+                               // a pipeline reset on a misclassified
+                               // video hole is a visible 6s stutter)
 pub const MAX_HOLES: usize = 16;
 
 // CAPTURE MODEL (alpha.6 — measured, not assumed):
@@ -114,16 +121,17 @@ pub const MAX_HOLES: usize = 16;
 // MagSetWindowSource and only re-armed on rect change — the holes
 // froze on their first captured frame ("nope not working").
 //
-// So the pump now pokes EVERY visible hole with InvalidateRect:
-//   · dynamic (video) holes — every tick (~33Hz live content)
-//   · static holes (thumbnails) — every 5th tick (~6.6Hz)
+// So the pump pokes EVERY visible hole with InvalidateRect EVERY tick
+// (~33Hz) — no dynamic/static split. That one rule fixes:
+//   · "video in the hole is frozen" (alpha.5 — no poke at all)
+//   · "video in the hole is very laggy" (alpha.4 — reset spam)
+//   · "video is still laggy" (alpha.8 — a video fragment classified
+//     img/graphic was a STATIC hole: 6.6Hz poke + a ~6s pipeline-reset
+//     self-heal; live content behind a static-classified hole)
 // InvalidateRect is CHEAP (just a repaint flag — no pipeline reset).
 // MagSetWindowSource — the expensive call that tears down and rebuilds
 // the DWM frame source — stays reserved for what only it can do:
 // pointing the hole at a new rect (move / re-show / rare self-heal).
-// That split is the fix for BOTH "video in the hole is frozen"
-// (alpha.5) and "video in the hole is very laggy" (alpha.4's 33
-// MagSetWindowSource resets per second).
 
 // =====================================================================
 // Public API
@@ -137,8 +145,10 @@ pub struct HoleSpec {
     pub y: i32,
     pub w: i32,
     pub h: i32,
-    /// true = video-adjacent: capture is (re-)armed ONLY on a real rect
-    /// change or a re-show. false = additionally self-heals ~0.17Hz.
+    /// true = video-adjacent: discovery walks stay at the fast cadence
+    /// while it exists (tracker-side) and it never self-heals. Content
+    /// refresh no longer depends on it — alpha.9 pokes every hole at
+    /// ~33Hz regardless.
     pub dynamic: bool,
 }
 
@@ -265,20 +275,18 @@ impl HolePool {
                     h.visible = false;
                 }
 
-                // LIVE-CONTENT POKE (alpha.6 — the real refresh model).
+                // LIVE-CONTENT POKE (alpha.9 — every hole, every tick).
                 // The Magnifier control re-captures ONLY when repainted
-                // (see the capture-model note above). Without this poke
-                // a hole shows one static frame forever — the alpha.5
-                // regression. With it, video holes repaint at ~33Hz
-                // WITHOUT any MagSetWindowSource pipeline reset.
+                // (see the capture-model note above). Without a poke a
+                // hole shows one static frame forever — the alpha.5
+                // regression; without EVERY-tick pokes a static-
+                // classified hole showing live content updates at 6.6Hz
+                // — the alpha.8 "video is still laggy" regression.
                 if want_visible && h.visible {
-                    let every = if h.dynamic { 1 } else { STATIC_POKE_EVERY };
-                    if tick.is_multiple_of(every) {
-                        let _ = InvalidateRect(h.mag, None, false);
-                    }
+                    let _ = InvalidateRect(h.mag, None, false);
                 }
 
-                // Static-hole self-heal (~6s): a rare MagSetWindowSource
+                // Static-hole self-heal (~18s): a rare MagSetWindowSource
                 // re-arm in case a display-mode change froze the frame
                 // source entirely. Video holes never get one — their
                 // content is kept live by the poke above, and a source

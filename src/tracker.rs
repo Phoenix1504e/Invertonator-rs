@@ -40,24 +40,31 @@
 //   · Clamp to the foreground window + 4px quantize: off-screen
 //     garbage rects never become holes, and UIA's ±1-3px rect wobble
 //     no longer moves holes / re-arms captures every walk.
-//   · Merge (alpha.8 — name-gated clustering, fixes BOTH merge
-//     complaints): transitive union-find clustering over near()
-//     pairs, but the gap tolerance depends on the ELEMENT NAMES:
+//   · Merge (alpha.9 — SAME-NAME clustering): transitive union-find
+//     clustering over near() pairs; the gap tolerance keys on the
+//     accessible NAMES:
 //     · both candidates UNNAMED (empty accessible name — player
 //       canvas/poster/tile layers): tolerance = max(8px, 6.25% of
 //       the smaller fragment's larger axis) — seams up to ~45px on
-//       a 720p media merge into the ONE big hole the user expects
-//       (the alpha.6 "3-4 rectangles side by side" complaint).
-//     · either candidate NAMED (grid thumbnails carry video titles):
-//       tolerance stays at the 8px floor. A named candidate can
-//       never chain across a real page gutter — this kills the
-//       alpha.7 mega-hole ("a big rectangle which covers anything
-//       and everything"): the scaled tolerance chained thumbnails
-//       through their 8-13px gutters into one page-sized hole.
-//       Geometry alone cannot separate player seams from grid
-//       gutters (both live in 8-40px); the accessible name is the
-//       signal that can: fragments of one media are nameless, grid
-//       items are titled.
+//       a 720p media merge into the ONE big hole the user expects.
+//     · both named AND THE SAME NAME (alpha.9): same scaled
+//       tolerance. alpha.8 sent every named pair to the 8px floor
+//       and the player fragmented AGAIN — its fragments evidently
+//       CARRY names (the tester's own dump showed the hole split as
+//       soon as the floor landed). Fragments of one rendered media
+//       share its title; distinct titles are distinct page items.
+//     · any other pairing (one named, or two DIFFERENT names):
+//       the 8px floor. A differently-named candidate can never
+//       chain across a real page gutter — this keeps the alpha.7
+//       mega-hole dead: grid thumbnails carry distinct video
+//       titles, so no transitive chain can cross a gutter.
+//   · Walk-tax discipline (alpha.9 — the "video is still laggy"
+//     half): every walk makes the provider (Chromium) serialize its
+//     a11y tree, and that tax competes with the video renderer. So:
+//     while a DYNAMIC hole is live the cadence floor is 1000ms and
+//     the stable backoff cap is 3000ms (a playing video's layout is
+//     static — 2.5Hz re-discovery bought nothing and stuttered the
+//     page), and the starvation live-walk cooldown widened 2s → 5s.
 //   · Giant filter: a NON-dynamic candidate covering ≥ 85% of the
 //     foreground window is clamped garbage or a page wrapper — it
 //     would absorb the entire clustering. Dropped.
@@ -89,18 +96,26 @@ use crate::holes::{HoleSpec, Holes, MAX_HOLES};
 
 const DISCOVERY_MS: u64 = 400; // active cadence (page changing)
 const MAX_DISCOVERY_MS: u64 = 1500; // idle backoff cap (page stable)
+                                    // alpha.9 — while a DYNAMIC hole is live (video playing) the walk tax
+                                    // lands on the browser's renderer. The player's layout does not change
+                                    // while it plays, so discovery can breathe: 1s floor, 3s backoff cap.
+const DISCOVERY_PLAYING_MS: u64 = 1000;
+const MAX_DISCOVERY_PLAYING_MS: u64 = 3000;
 const MIN_MEDIA: i32 = 64; // image/graphic AND video min w and h (px)
 const MIN_LINK: i32 = 96; // hyperlink min w and h (px)
 const MIN_HOLE: i32 = 32; // final hole min — degenerate slivers out
 const MERGE_GAP: i32 = 8; // gap-tolerance floor (named media + small media)
-                          // Unnamed pairs (fragments of one media) scale above the floor with
-                          // the SMALLER fragment's larger axis (÷16 ≈ 6.25%). Named pairs never
+                          // Unnamed pairs (fragments of one media) AND same-name
+                          // pairs scale above the floor with the SMALLER fragment's
+                          // larger axis (÷16 ≈ 6.25%). Distinct-named pairs never
                           // leave the floor — see the merge notes in the header.
 const GIANT_SHARE: f64 = 0.85; // non-dynamic candidate vs fg window area
 const QUANTUM: i32 = 4; // rect quantization grid (px)
 const MAX_NODES: u32 = 100_000;
 const MAX_DEPTH: u32 = 60; // alpha.4 capped at 25 — YouTube runs deeper
-const LIVE_COOLDOWN_MS: u64 = 2000; // starvation live-walk throttle
+const LIVE_COOLDOWN_MS: u64 = 5000; // starvation live-walk throttle
+                                    // (alpha.9: was 2s — the live FindAll is the
+                                    // HEAVIEST walk; every 2s it stuttered the video)
 
 /// One-shot flag: the Gecko live-fallback notice is logged exactly once
 /// per process (discovery ticks every 400ms — per-tick logs would spam
@@ -268,19 +283,27 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
             }
 
             had_specs = !specs.is_empty();
+            // alpha.9: video-aware cadence — decide BEFORE handing the
+            // specs to the pump.
+            let has_dyn = specs.iter().any(|s| s.dynamic);
             holes.set_specs(specs);
 
-            // ADAPTIVE CADENCE: a stable page (same fg window, same
-            // hole set) backs the walk off 400 → 1500ms in doubling
-            // steps; ANY change snaps it back to 400ms. The walk is
-            // not free — the provider serializes its a11y tree for
-            // every read, and that tax on a playing video used to be
-            // paid 2.5×/s forever.
+            // ADAPTIVE CADENCE (alpha.9 — video-aware): a stable page
+            // (same fg window, same hole set) backs the walk off in
+            // doubling steps; ANY change snaps it back to the base.
+            // The base/cap depend on whether a video hole is live:
+            // its tax competes with the renderer, so while one plays
+            // discovery breathes at 1s/3s instead of 400ms/1.5s.
+            let (base, cap) = if has_dyn {
+                (DISCOVERY_PLAYING_MS, MAX_DISCOVERY_PLAYING_MS)
+            } else {
+                (DISCOVERY_MS, MAX_DISCOVERY_MS)
+            };
             let stable = rects == last_rects && fg.0 as usize == last_fg;
             if stable {
-                interval = (interval * 2).min(MAX_DISCOVERY_MS);
+                interval = (interval * 2).min(cap);
             } else {
-                interval = DISCOVERY_MS;
+                interval = base;
             }
             last_fg = fg.0 as usize;
             last_rects = rects;
@@ -362,7 +385,7 @@ enum MediaKind {
     Video,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Candidate {
     x: i32,
     y: i32,
@@ -371,8 +394,12 @@ struct Candidate {
     dynamic: bool,
     /// Accessible name present (non-blank)? Named media = a real page
     /// item (titled thumbnail); unnamed media = a layer/tile of one
-    /// rendered media. The merge tolerance keys on this — see near().
+    /// rendered media. The merge tolerance keys on this — see gap_tol().
     named: bool,
+    /// The accessible name itself, trimmed and truncated (24 chars) —
+    /// SAME-NAME pairs merge at the scaled tolerance (alpha.9); blank
+    /// = an unnamed fragment.
+    name: String,
     /// "img" | "lnk" | "vid" — for the candidate observability dump.
     kind: &'static str,
 }
@@ -594,6 +621,9 @@ fn offer_candidate(kind: Option<MediaKind>, rect: &RECT, name: &str, ctx: &mut W
         MediaKind::Video => "vid",
     };
     let named = !name.trim().is_empty();
+    // Keep the name for the same-name merge rule: trimmed, truncated
+    // to 24 chars (locale-safe — chars, never byte-sliced).
+    let name: String = name.trim().chars().take(24).collect();
     let mut x = rect.left;
     let mut y = rect.top;
     let mut w = rect.right - rect.left;
@@ -653,6 +683,7 @@ fn offer_candidate(kind: Option<MediaKind>, rect: &RECT, name: &str, ctx: &mut W
         h,
         dynamic: kind == MediaKind::Video,
         named,
+        name,
         kind: kind_tag,
     });
 }
@@ -662,21 +693,25 @@ fn offer_candidate(kind: Option<MediaKind>, rect: &RECT, name: &str, ctx: &mut W
 // =====================================================================
 
 impl Candidate {
-    /// Gap tolerance for the pair (alpha.8 — NAME-GATED):
-    /// · either candidate named → the 8px floor. Named media is a real
-    ///   page item (a titled thumbnail); it must never chain across a
-    ///   page gutter no matter how small the gutter is — that chain is
+    /// Gap tolerance for the pair (alpha.9 — SAME-NAME):
+    /// · both candidates unnamed (player canvas/poster/tile layers), OR
+    ///   both named with the IDENTICAL name (fragments of one titled
+    ///   media — alpha.8 sent every named pair to the 8px floor and the
+    ///   player fragmented again):
+    ///   tolerance = max(8px, 6.25% of the smaller fragment's larger
+    ///   axis). Seams up to ~45px on a 720p media merge.
+    /// · any other pairing (one named, or two DIFFERENT names — grid
+    ///   thumbnails carry distinct titles): the 8px floor. Different
+    ///   names must never chain across a page gutter — that chain is
     ///   exactly the alpha.7 "one hole covers everything" regression.
-    /// · both unnamed → max(8px, 6.25% of the smaller fragment's larger
-    ///   axis). Unnamed media are layers/tiles of ONE rendered media
-    ///   (canvas, poster, video strips); their seams scale with the
-    ///   media — up to ~45px on a 720p player.
     fn gap_tol(&self, o: &Candidate) -> i32 {
-        if self.named || o.named {
-            return MERGE_GAP;
+        let both_unnamed = !self.named && !o.named;
+        let same_name = self.named && o.named && self.name == o.name;
+        if both_unnamed || same_name {
+            let smaller_max = self.w.max(self.h).min(o.w.max(o.h));
+            return MERGE_GAP.max(smaller_max / 16);
         }
-        let smaller_max = self.w.max(self.h).min(o.w.max(o.h));
-        MERGE_GAP.max(smaller_max / 16)
+        MERGE_GAP
     }
 
     /// Gap-tolerant proximity: two rects whose edges come within the
@@ -690,12 +725,19 @@ impl Candidate {
             && o.y < self.y + self.h + g
     }
 
-    /// Union rect of two candidates (dynamic = either, named = either).
+    /// Union rect of two candidates (dynamic = either; the cluster
+    /// name keeps the first non-blank — only the DUMP ever reads it,
+    /// pairing decisions run on the pre-merge candidates).
     fn union(self, o: Candidate) -> Candidate {
         let x = self.x.min(o.x);
         let y = self.y.min(o.y);
         let r = (self.x + self.w).max(o.x + o.w);
         let b = (self.y + self.h).max(o.y + o.h);
+        let name = if self.name.is_empty() {
+            o.name
+        } else {
+            self.name
+        };
         Candidate {
             x,
             y,
@@ -703,6 +745,7 @@ impl Candidate {
             h: b - y,
             dynamic: self.dynamic || o.dynamic,
             named: self.named || o.named,
+            name,
             kind: if self.dynamic { self.kind } else { o.kind },
         }
     }
@@ -717,17 +760,26 @@ fn ctx_to_specs(ctx: WalkCtx) -> (Vec<HoleSpec>, String) {
         return (Vec::new(), String::new());
     }
 
-    // CANDIDATE DUMP (alpha.6): the gated candidate set BEFORE merging
-    // — kind, `*` = named, size, position. This is what turns the next
+    // CANDIDATE DUMP (alpha.6, name-tagged in alpha.9): the gated
+    // candidate set BEFORE merging — kind, `*` = named, `[name…]` = the
+    // accessible name's first 6 chars (the same-name merge rule lives
+    // or dies on this), size, position. This is what turns the next
     // "holes are in the wrong place" report into a precise diagnosis:
     // the log will show exactly which element produced which rect.
     let mut dump = String::new();
     for (i, c) in ctx.candidates.iter().enumerate().take(12) {
+        let name_tag = if c.named {
+            let head: String = c.name.chars().take(6).collect();
+            format!("[{head}…]")
+        } else {
+            String::new()
+        };
         dump.push_str(&format!(
-            "{}{}{} {}x{}@({},{})  ",
+            "{}{}{}{} {}x{}@({},{})  ",
             c.kind,
             if c.named { "*" } else { "" },
             i,
+            name_tag,
             c.w,
             c.h,
             c.x,
@@ -789,13 +841,17 @@ fn ctx_to_specs(ctx: WalkCtx) -> (Vec<HoleSpec>, String) {
             }
         }
     }
-    let mut clusters: Vec<Option<Candidate>> = (0..n).map(|i| Some(cands[i])).collect();
+    let mut clusters: Vec<Option<Candidate>> = cands.into_iter().map(Some).collect();
     for i in 0..n {
         let r = find(&mut parent, i);
         if r != i {
             let frag = clusters[i].take();
             if let Some(f) = frag {
-                clusters[r] = clusters[r].map(|acc| acc.union(f));
+                // Candidate is no longer Copy (it carries the accessible
+                // name) — take/replace instead of Option::map.
+                if let Some(acc) = clusters[r].take() {
+                    clusters[r] = Some(acc.union(f));
+                }
             }
         }
     }
