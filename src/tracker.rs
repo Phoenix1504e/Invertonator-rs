@@ -150,6 +150,41 @@
 //     context (tab switch / alt-tab / retitle) hides unconfirmed holes
 //     within 4s — the alpha.10 guarantee, now context-scoped and twice
 //     as fast as the old blanket TTL.
+//   · ANTI-FLAP HYSTERESIS (alpha.15 — the "a random square comes and
+//     goes in the center of the screen" report): until now the publish
+//     path mirrored trusted-walk output 1:1 — on a chronically starved
+//     page (YouTube) the trusted walks are the LIVE FindAlls every 5s,
+//     and any live-to-live difference in what Chromium reports toggled
+//     a hole instantly on/off (an element seen in one live walk and
+//     missed by the next = a square that shows for ~5s, hides, comes
+//     back). The publish path now runs a two-bucket smoother:
+//     · SHOW: a rect new to the screen publishes on the FIRST trusted
+//       walk only when the previous trusted walk was empty (fresh
+//       page — the player still appears on the first live walk, the
+//       hard-won alpha.13/14 path) or this is a WAKE walk (scroll end,
+//       tab switch, F5 — user-initiated freshness stays instant).
+//       Otherwise it needs TWO consecutive trusted sightings — a
+//       one-walk wonder never shows at all.
+//     · HIDE: a rect the trusted walk no longer sees is kept for ONE
+//       missed trusted walk (grace) and dropped only when two
+//       consecutive trusted walks lack it — one flaky live walk that
+//       misses the player no longer blanks it for 5s.
+//     · MATCHING is geometric ("same hole"): intersection ≥ 50% of
+//       the smaller rect — identical rects match trivially, a
+//       scrolled/moved hole matches its old rect (the new geometry
+//       publishes immediately — position tracking needs no
+//       confirmation), distinct grid items across a gutter share
+//       almost nothing.
+//     · WAKE WALKS FLUSH the smoother (publish raw, reset buckets) —
+//       tab switches clear old holes the same tick (the alpha.10
+//       guarantee), scroll ends re-sync positions instantly (the
+//       alpha.9 guarantee), F5-ON still shows holes in ~50ms.
+//     Bounds: shows are never SLOWER than alpha.14 except a brand-new
+//     non-dynamic rect on a steady tick (+1 trusted walk — a
+//     thumbnail, imperceptible); hides are slower by exactly one
+//     trusted walk and never across a context change. VSCodium-class
+//     stable pages hit the matched fast path every walk — no-op.
+//     Counters: hyst_saves / hyst_held in the diagnostics report.
 //   · Giant filter: a NON-dynamic candidate covering ≥ 85% of the
 //     foreground window is clamped garbage or a page wrapper — it
 //     would absorb the entire clustering. Dropped.
@@ -227,10 +262,21 @@ static STARVED_QUIET: AtomicBool = AtomicBool::new(false);
 /// (win_main::probe_report). STARVED_TICKS = suppressed starved ticks
 /// since process start — a big number next to a healthy walk count is
 /// the "cached walk is chronically half-tree on this page" signature
-/// (the YouTube failure mode). STICKY_HELD = hole specs currently held
-/// by the sticky-trust bridge.
+/// (the YouTube failure mode). STICKY_HELD = hole specs currently on
+/// screen via the starved-tick bridge (alpha.13) as smoothed by the
+/// alpha.15 hysteresis.
 pub static STARVED_TICKS: AtomicU64 = AtomicU64::new(0);
 pub static STICKY_HELD: AtomicUsize = AtomicUsize::new(0);
+
+/// alpha.15 anti-flap telemetry (probe report): HYST_SAVES = holes kept
+/// on screen through one missed trusted walk (the "flaky live walk"
+/// signature — a climbing count while a square comes and goes means
+/// this filter is catching it); HYST_HELD = first-appearance candidates
+/// held back for a second confirming walk (one-walk wonders suppressed).
+pub static HYST_SAVES: AtomicU64 = AtomicU64::new(0);
+pub static HYST_HELD: AtomicU64 = AtomicU64::new(0);
+static HYST_SAVED_LOGGED: AtomicBool = AtomicBool::new(false);
+static HYST_HELD_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// alpha.14 fail-open telemetry: OFFSCREEN_ADMITS counts elements
 /// offered despite IsOffscreen=true (the fail-open path — see
@@ -359,11 +405,16 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
     let mut warm_key_last = String::new();
     let mut warm_total: u32 = 0;
     let mut last_live = std::time::Instant::now();
-    // alpha.13 sticky trust: the last TRUSTED hole set (live-walk or
-    // full-cached result). A starved tick re-publishes this instead of
-    // empty — holes must not vanish just because Chromium's cached
-    // tree is half-materialized between live walks.
-    let mut sticky_specs: Vec<HoleSpec> = Vec::new();
+    // alpha.13 sticky trust + alpha.15 anti-flap hysteresis: PUBLISHED
+    // is the smoothed hole set currently on screen (starved ticks
+    // re-publish it instead of empty — holes must not vanish just
+    // because Chromium's cached tree is half-materialized between live
+    // walks). PREV_TRUSTED is the raw output of the previous trusted
+    // walk (live FindAll or full cached) — the second sight a new
+    // candidate needs before it may show, and the second absence a
+    // dropped rect needs before it may hide. See hysteresis() below.
+    let mut published: Vec<HoleSpec> = Vec::new();
+    let mut prev_trusted: Vec<HoleSpec> = Vec::new();
     // consecutive suppressed starved ticks (heartbeat telemetry)
     let mut starved_run: u32 = 0;
     // alpha.13 wake reasons, raised by the nap loop, consumed by the
@@ -433,17 +484,23 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
                     last_live = std::time::Instant::now();
                 }
                 if starved {
-                    // STICKY TRUST (alpha.13): keep the last trusted set
-                    // on screen — an empty publish here is what made the
+                    // STICKY TRUST (alpha.13): keep the SMOOTHED set on
+                    // screen — an empty publish here is what made the
                     // holes "go gone" on YouTube between live walks.
                     starved_run = starved_run.saturating_add(1);
                     STARVED_TICKS.fetch_add(1, Ordering::Relaxed);
-                    (sticky_specs.clone(), String::new())
+                    (published.clone(), String::new())
                 } else {
+                    // TRUSTED walk (alpha.15): smooth it through the
+                    // hysteresis before anything reaches the pump.
+                    // WAKE walks (expedite) flush — user-initiated
+                    // freshness must never wait out a confirmation.
                     starved_run = 0;
-                    sticky_specs = s.clone();
-                    STICKY_HELD.store(sticky_specs.len(), Ordering::Relaxed);
-                    (s, dump)
+                    let smoothed = hysteresis(&mut published, &prev_trusted, &s, expedite);
+                    prev_trusted = s;
+                    published = smoothed;
+                    STICKY_HELD.store(published.len(), Ordering::Relaxed);
+                    (published.clone(), dump)
                 }
             };
             let walk_ms = t0.elapsed().as_millis();
@@ -553,8 +610,9 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
             // Disabled while holes were out — clear once.
             holes.set_specs(Vec::new());
             had_specs = false;
-            // alpha.13: nothing is trusted across an F5-OFF/ON cycle.
-            sticky_specs.clear();
+            // alpha.13/15: nothing is trusted across an F5-OFF/ON cycle.
+            published.clear();
+            prev_trusted.clear();
             STICKY_HELD.store(0, Ordering::Relaxed);
         }
         // WAKE LOOP (alpha.10 — the "random places" fix): nap in 50ms
@@ -653,6 +711,100 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
         }
     }
     tracing::info!("tracker: stopped");
+}
+
+/// alpha.15 — "same hole" geometric match: intersection ≥ 50% of the
+/// smaller rect's area. Identical rects match trivially (100%); a
+/// scrolled/moved hole still overlaps its old rect by most of its
+/// area (and the NEW geometry publishes immediately — position
+/// tracking never waits for a confirmation); distinct page items
+/// across a real gutter share almost nothing. UIA's ±1-3px wobble is
+/// already quantized to 4px upstream, so identical elements match
+/// exactly every walk.
+fn same_hole(a: &HoleSpec, b: &HoleSpec) -> bool {
+    let ix = a.x.max(b.x);
+    let iy = a.y.max(b.y);
+    let ir = (a.x + a.w).min(b.x + b.w);
+    let ib = (a.y + a.h).min(b.y + b.h);
+    if ir <= ix || ib <= iy {
+        return false;
+    }
+    let inter = (ir - ix) as i64 * (ib - iy) as i64;
+    let amin = (a.w as i64 * a.h as i64).min(b.w as i64 * b.h as i64);
+    amin > 0 && inter * 2 >= amin
+}
+
+/// alpha.15 — anti-flap hysteresis between trusted walks and the pump
+/// (see the header — ANTI-FLAP HYSTERESIS). `published` is updated in
+/// place to the new smoothed set, which is also returned.
+/// `prev_trusted` = raw output of the previous trusted walk;
+/// `curr` = raw output of THIS trusted walk; `flush` = wake walk
+/// (scroll end / wheel / fg move-resize-change / title change / F5-ON)
+/// — publish raw and reset both buckets: every user-initiated fast
+/// path from alpha.9/10/11 is preserved verbatim.
+fn hysteresis(
+    published: &mut Vec<HoleSpec>,
+    prev_trusted: &[HoleSpec],
+    curr: &[HoleSpec],
+    flush: bool,
+) -> Vec<HoleSpec> {
+    if flush {
+        *published = curr.to_vec();
+        return curr.to_vec();
+    }
+    let mut out: Vec<HoleSpec> = Vec::with_capacity(curr.len());
+    // SHOW: matched (same hole already on screen — new geometry
+    // publishes instantly) or confirmed (also seen in the previous
+    // trusted walk) — or a fresh page (previous trusted walk empty:
+    // the first live walk after navigation must keep its alpha.13/14
+    // immediacy). Everything else is a one-walk wonder: held.
+    for c in curr {
+        let matched = published.iter().any(|p| same_hole(p, c));
+        let confirmed =
+            prev_trusted.is_empty() || prev_trusted.iter().any(|p| same_hole(p, c));
+        if matched || confirmed {
+            out.push(*c);
+        } else {
+            HYST_HELD.fetch_add(1, Ordering::Relaxed);
+            if !HYST_HELD_LOGGED.swap(true, Ordering::Relaxed) {
+                tracing::info!(
+                    "tracker: hysteresis held a first-appearance candidate ({}x{} @({},{})) — needs 2 consecutive trusted walks (one-walk wonders never show)",
+                    c.w,
+                    c.h,
+                    c.x,
+                    c.y
+                );
+            }
+        }
+    }
+    // HIDE GRACE: a published rect this walk no longer sees is kept
+    // for ONE missed trusted walk and dropped only when the previous
+    // trusted walk lacked it too (two consecutive absences). One
+    // flaky live walk that misses the player no longer blanks it.
+    for p in published.iter() {
+        if !curr.iter().any(|c| same_hole(p, c))
+            && !prev_trusted.is_empty()
+            && prev_trusted.iter().any(|q| same_hole(q, p))
+        {
+            out.push(*p);
+            HYST_SAVES.fetch_add(1, Ordering::Relaxed);
+            if !HYST_SAVED_LOGGED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "tracker: hysteresis kept a hole ({}x{} @({},{})) through one missed trusted walk — live-walk flakiness smoothed (second consecutive miss will drop it)",
+                    p.w,
+                    p.h,
+                    p.x,
+                    p.y
+                );
+            }
+        }
+    }
+    // Restore the deterministic order ctx_to_specs guarantees (graced
+    // survivors are appended after confirmed output) — an unchanged
+    // set must keep its pump index mapping (no window churn).
+    out.sort_by_key(|k| (k.y, k.x, k.w, k.h));
+    *published = out.clone();
+    out
 }
 
 /// Locale-safe foreground title for the observability line.

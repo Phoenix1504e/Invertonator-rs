@@ -727,18 +727,24 @@ fn probe_report(
             if s.dynamic { " dyn" } else { "" }
         ));
     }
-    // alpha.13/14 — starvation + fail-open telemetry: on a heavy page
-    // (YouTube) the cached walk is chronically half-tree; STARVED_TICKS
-    // climbing while holes are held by sticky trust is that signature.
-    // OFFSCREEN_ADMITS counts elements offered despite IsOffscreen=true
-    // (the alpha.14 fail-open path): a climbing count next to missing
-    // holes = Chromium flags visible media offscreen; ZERO next to
-    // missing holes rules that path out.
+    // alpha.13/14/15 — starvation, fail-open and anti-flap telemetry:
+    // on a heavy page (YouTube) the cached walk is chronically
+    // half-tree; STARVED_TICKS climbing while holes are held by sticky
+    // trust is that signature. OFFSCREEN_ADMITS counts elements offered
+    // despite IsOffscreen=true (the alpha.14 fail-open path): a
+    // climbing count next to missing holes = Chromium flags visible
+    // media offscreen; ZERO next to missing holes rules that path out.
+    // HYST_SAVES = holes kept through one missed trusted walk
+    // (alpha.15) — a climbing count while a square "comes and goes"
+    // means live-walk flakiness is being smoothed; HYST_HELD =
+    // first-appearance candidates suppressed (one-walk wonders).
     r.push_str(&format!(
-        "tracker: starved_ticks={} sticky_held={} offscreen_admits={}\r\n",
+        "tracker: starved_ticks={} sticky_held={} offscreen_admits={} hyst_saves={} hyst_held={}\r\n",
         crate::tracker::STARVED_TICKS.load(Ordering::Relaxed),
         crate::tracker::STICKY_HELD.load(Ordering::Relaxed),
-        crate::tracker::OFFSCREEN_ADMITS.load(Ordering::Relaxed)
+        crate::tracker::OFFSCREEN_ADMITS.load(Ordering::Relaxed),
+        crate::tracker::HYST_SAVES.load(Ordering::Relaxed),
+        crate::tracker::HYST_HELD.load(Ordering::Relaxed)
     ));
     r
 }

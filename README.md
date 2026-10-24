@@ -4,33 +4,39 @@
 
 ![Invertonator](icon.svg)
 
-> **Status: v0.3.0-alpha.14** — Windows: UIA media tracker + Magnifier-API
+> **Status: v0.3.0-alpha.15** — Windows: UIA media tracker + Magnifier-API
 > true-color holes proven on hardware (1,152-node cache-request walks ·
 > 164 media elements classified · MagSetColorEffect/Source/Transform all
 > verified). Gecko browsers (Firefox/LibreWolf) supported via automatic
 > live-walk fallback when a provider leaves CachedChildren empty.
-> alpha.14 fixes the residual "no hole in youtube" (VSCodium perfect,
-> YouTube empty) two ways: (1) FAIL-OPEN OFFSCREEN — the alpha.12
-> IsOffscreen gate is now a HINT: Chromium flags visible media offscreen
-> on some pages, and the YouTube hole is built from exactly the
-> image-kind poster/player layers that got silently suppressed on BOTH
-> walk paths (the alpha.13 canary only watched video-kind). An
-> offscreen-flagged element is now still offered when its geometry is
-> independently usable (non-empty, inside the fg window, video-kind, or
-> at least a quarter of the window's smaller dimension); the clamp, size
-> gates and giant filter re-judge every rect on its own merits.
-> Admissions are counted in the diagnostics report (`offscreen_admits`).
-> (2) CONTEXT-AWARE EVIDENCE — the old 8s TTL hid holes whenever walks
-> stopped completing for 8s, even when nothing on screen had changed.
-> The pump now keeps holes while the foreground context (hwnd + page
-> title hash) still matches the context the specs were published for —
-> a slow-but-alive provider can no longer blank an unchanged page — and
-> hides unconfirmed holes within 4s of any context change (tab switch /
-> alt-tab / retitle), so stale holes after tab switches stay
-> structurally impossible, now twice as fast.
-> alpha.13 kept: sticky trust (starved ticks re-publish the last trusted
-> hole set) + expedited live walk (wake walks never queue behind the 5s
-> idle cooldown); starved/sticky counters in the diagnostics report.
+> alpha.15 fixes "a random square comes and goes in the center of the
+> screen": until now the publish path mirrored trusted-walk output 1:1,
+> and on a chronically starved page (YouTube) the trusted walks are the
+> live FindAlls every 5s — any live-to-live difference in what Chromium
+> reports toggled a hole instantly on/off. The publish path now runs an
+> ANTI-FLAP HYSTERESIS: a brand-new rect needs two consecutive trusted
+> sightings to show (one-walk wonders never show at all; a fresh page
+> and wake walks — scroll end / tab switch / F5 — still show instantly),
+> and a rect one walk stopped seeing is kept for exactly one missed
+> trusted walk before it hides (one flaky live walk can no longer blank
+> the player). Matching is geometric (intersection ≥ 50% of the smaller
+> rect), so scrolled/moved holes update instantly without confirmation;
+> tab switches still clear holes the same tick; VSCodium-class stable
+> pages hit the matched fast path every walk — the smoothing is a
+> no-op there. New telemetry: `hyst_saves` / `hyst_held` in the
+> diagnostics report (a climbing hyst_saves while a square comes and
+> goes = live-walk flakiness caught and smoothed).
+> alpha.14 kept: fail-open offscreen (IsOffscreen is a HINT — Chromium
+> flags visible media offscreen on some pages; the YouTube hole is
+> built from exactly the image-kind layers the old hard gate ate) and
+> context-aware evidence (the pump hides on staleness only when the
+> foreground context changed; a slow-but-alive provider can no longer
+> blank an unchanged page, and unconfirmed holes die within 4s of a
+> tab switch).
+> alpha.13 kept: sticky trust (starved ticks re-publish the last
+> trusted hole set) + expedited live walk (wake walks never queue
+> behind the 5s idle cooldown); starved/sticky counters in the
+> diagnostics report.
 > alpha.12 kept: ~64Hz unlayered pump (timeBeginPeriod(1)), warm-up
 > re-keyed on title change.
 > alpha.11 kept: evidence rule (holes never outlive their context) and
