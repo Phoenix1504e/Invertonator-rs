@@ -125,6 +125,31 @@
 //     by construction and must not queue behind it. Tab switches and
 //     alt-tabs settle SETTLE_MS first — the same teardown window the
 //     alpha.11 title wake used to walk straight into.
+//   · FAIL-OPEN OFFSCREEN (alpha.14 — "no hole in youtube", round 2):
+//     the alpha.12 IsOffscreen gate hard-suppressed elements on BOTH
+//     walk paths, and the alpha.13 canary covered only video-kind —
+//     but the tester's own dumps show the YouTube hole is built from
+//     IMAGE-kind poster/player layers (img*3[YouTu…]). Chromium flags
+//     exactly those offscreen on some pages, so every walk returned
+//     ZERO candidates and the holes were gone everywhere, forever,
+//     while VSCodium (never flagged, never starved) stayed perfect.
+//     The flag is now a HINT: an offscreen-flagged element is still
+//     offered when its geometry is independently usable (see
+//     offscreen_trust) — the fg clamp, 64px size gates, giant filter
+//     and merge all re-judge the rect on its own merits. Admissions
+//     are counted (OFFSCREEN_ADMITS, in the diagnostics report) and
+//     the first one logs its kind + rect.
+//   · CONTEXT-AWARE EVIDENCE (alpha.14 — holes.rs STALE_SPEC_AGE):
+//     the alpha.11 TTL hid holes 8s after the last completed walk,
+//     whatever the reason — a chronically slow provider (YouTube under
+//     load) hid holes that were still CORRECT. The pump now hides on
+//     staleness only when the foreground CONTEXT changed since the
+//     publish (fg identity = hwnd + fnv1a(title), tracker::fg_identity).
+//     Same context = the screen still shows what the specs describe —
+//     slow walks can no longer blank an unchanged page. Changed
+//     context (tab switch / alt-tab / retitle) hides unconfirmed holes
+//     within 4s — the alpha.10 guarantee, now context-scoped and twice
+//     as fast as the old blanket TTL.
 //   · Giant filter: a NON-dynamic candidate covering ≥ 85% of the
 //     foreground window is clamped garbage or a page wrapper — it
 //     would absorb the entire clustering. Dropped.
@@ -207,12 +232,17 @@ static STARVED_QUIET: AtomicBool = AtomicBool::new(false);
 pub static STARVED_TICKS: AtomicU64 = AtomicU64::new(0);
 pub static STICKY_HELD: AtomicUsize = AtomicUsize::new(0);
 
-/// alpha.13 canary: logs the FIRST video-kind element the alpha.12
-/// offscreen gate suppresses. If Chromium ever flags a visible player
-/// as IsOffscreen, this line in log.txt is the answer to a "video hole
-/// missing" report — without it the filter is unfalsifiable from the
-/// outside.
-static OFFSCREEN_VIDEO: AtomicBool = AtomicBool::new(false);
+/// alpha.14 fail-open telemetry: OFFSCREEN_ADMITS counts elements
+/// offered despite IsOffscreen=true (the fail-open path — see
+/// offscreen_trust); OFFSCREEN_ADMIT_LOGGED rate-limits the detail
+/// line to once per process. A climbing count while holes are missing
+/// elsewhere is the "Chromium flags visible media offscreen"
+/// fingerprint; a count of ZERO next to missing holes rules this path
+/// out. (The alpha.13 video-only canary could not see image-kind
+/// suppressions — and image layers are what the YouTube hole is built
+/// from — which is exactly why the gate went fail-open instead.)
+pub static OFFSCREEN_ADMITS: AtomicU64 = AtomicU64::new(0);
+static OFFSCREEN_ADMIT_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// alpha.10 — wake signal: the discovery nap ends early whenever this
 /// is set. Raised by set_enabled(true) so F5-ON produces holes in ~50ms
@@ -467,7 +497,13 @@ fn discovery_loop(holes: Holes, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>)
             // alpha.9: video-aware cadence — decide BEFORE handing the
             // specs to the pump.
             let has_dyn = specs.iter().any(|s| s.dynamic);
-            holes.set_specs(specs);
+            // alpha.14 — publish WITH the context it describes (fg hwnd
+            // + page-title hash): the pump's evidence rule keys on it
+            // (see holes.rs — CONTEXT-AWARE EVIDENCE). `title` is the
+            // string this walk actually saw — the honest stamp for
+            // these specs, even if the user alt-tabs DURING a long walk.
+            let fg_ctx = (fg.0 as usize, fnv1a(&title));
+            holes.set_specs_ctx(specs, fg_ctx);
 
             // ADAPTIVE CADENCE (alpha.9 — video-aware): a stable page
             // (same fg window, same hole set) backs the walk off in
@@ -627,6 +663,38 @@ fn window_title(hwnd: HWND) -> String {
         let s = String::from_utf16_lossy(&buf[..n.min(buf.len())]);
         s.chars().take(40).collect()
     }
+}
+
+/// alpha.14 — CONTEXT identity of a window: (hwnd, fnv1a(title)). The
+/// cheap, UIA-free fingerprint of "which window + which page" a spec
+/// set describes. The tracker stamps it into every publish; the pump
+/// samples the CURRENT context at ~2Hz and keeps holes on screen while
+/// the two match (see holes.rs — CONTEXT-AWARE EVIDENCE). The title is
+/// the same 40-char truncation the wake loop compares, so both sides
+/// hash identical strings.
+pub fn fg_identity(hwnd: HWND) -> (usize, u64) {
+    if hwnd.is_invalid() || hwnd.0 as usize == 0 {
+        return (0, 0);
+    }
+    let title = window_title(hwnd);
+    (hwnd.0 as usize, fnv1a(&title))
+}
+
+/// alpha.14 — context of the CURRENT foreground window (pump-side
+/// sampling; the main thread has no UIA state and this costs one
+/// GetWindowTextW on a cached caption — no message is sent).
+pub fn fg_identity_current() -> (usize, u64) {
+    unsafe { fg_identity(GetForegroundWindow()) }
+}
+
+/// FNV-1a 64-bit — stable, allocation-free page-title fingerprint.
+fn fnv1a(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
 }
 
 /// First-contact warm-up (alpha.6): count the provider's REAL element
@@ -925,44 +993,33 @@ fn walk_cached(el: &IUIAutomationElement, in_doc: bool, depth: u32, ctx: &mut Wa
         let in_doc_child = in_doc || is_doc;
 
         if in_doc && !is_doc {
-            // OFFSCREEN FILTER (alpha.12): IsOffscreen=true elements
-            // are display:none, scrolled out, or virtualized
-            // placeholders. Their BoundingRectangles are stale or huge
-            // (probe history has full-window rects from virtualized
-            // reads), and clamping a huge rect into the fg window pins
-            // a hole to a "random place". Recursion continues — every
-            // element is judged on its own flag.
+            // OFFSCREEN HINT (alpha.14 — fail-open; was a hard filter in
+            // alpha.12/13): IsOffscreen=true usually means display:none,
+            // scrolled out, or a virtualized placeholder — stale or huge
+            // rects. But Chromium also flags VISIBLE media offscreen on
+            // some pages (the alpha.13 "no hole in youtube" report: the
+            // player's IMAGE layers were suppressed on BOTH walk paths,
+            // and the video-only canary could not even log it). The flag
+            // is now a HINT: the candidate is still offered when its
+            // geometry is independently usable (offscreen_trust) — the
+            // fg clamp, size gates, giant filter and merge all re-judge
+            // the rect on its own merits. Recursion continues — every
+            // element is judged on its own flag. Cached reads are
+            // bundle-local: the unconditional lct/name/rect reads here
+            // are free.
             let offscreen = el.CachedIsOffscreen().is_ok_and(|b| b.as_bool());
-            if !offscreen {
-                let lct = el
-                    .CachedLocalizedControlType()
-                    .map(|s| s.to_string())
-                    .unwrap_or_default();
-                let name = el.CachedName().map(|s| s.to_string()).unwrap_or_default();
-                let rect = el.CachedBoundingRectangle().unwrap_or_default();
-                offer_candidate(classify(ct, &lct), &rect, &name, ctx);
-            } else if ct != UIA_ImageControlTypeId && ct != UIA_HyperlinkControlTypeId {
-                // alpha.13 CANARY: if Chromium ever flags the VISIBLE
-                // player as IsOffscreen, the alpha.12 filter would eat
-                // the video hole on every walk — the "holes gone"
-                // report with no starved ticks to explain it. Cached
-                // reads are bundle-local (free); log the first offense.
-                let lct = el
-                    .CachedLocalizedControlType()
-                    .map(|s| s.to_string())
-                    .unwrap_or_default();
-                if classify(ct, &lct) == Some(MediaKind::Video)
-                    && !OFFSCREEN_VIDEO.swap(true, Ordering::Relaxed)
-                {
-                    let r = el.CachedBoundingRectangle().unwrap_or_default();
-                    tracing::warn!(
-                        "tracker: VIDEO element flagged IsOffscreen and suppressed — {}x{} @({},{}) — if the video hole is missing, this is why",
-                        r.right - r.left,
-                        r.bottom - r.top,
-                        r.left,
-                        r.top
-                    );
+            let lct = el
+                .CachedLocalizedControlType()
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            let name = el.CachedName().map(|s| s.to_string()).unwrap_or_default();
+            let rect = el.CachedBoundingRectangle().unwrap_or_default();
+            let kind = classify(ct, &lct);
+            if !offscreen || offscreen_trust(kind, &rect, ctx.fg) {
+                if offscreen {
+                    note_offscreen_admit(kind, &rect);
                 }
+                offer_candidate(kind, &rect, &name, ctx);
             }
         }
 
@@ -988,8 +1045,26 @@ fn walk_cached(el: &IUIAutomationElement, in_doc: bool, depth: u32, ctx: &mut Wa
 fn classify_live(el: &IUIAutomationElement, ctx: &mut WalkCtx) {
     unsafe {
         ctx.total += 1;
-        // OFFSCREEN FILTER (alpha.12 — see walk_cached).
+        // OFFSCREEN HINT (alpha.14 — see walk_cached / offscreen_trust).
+        // The live path is where YouTube's candidates actually come
+        // from (chronically starved cached tree), so the fail-open
+        // matters MOST here. Offscreen elements pay the extra Current
+        // reads only when the flag is set; the onscreen majority pays
+        // one extra property read over the alpha.12 code.
         if el.CurrentIsOffscreen().is_ok_and(|b| b.as_bool()) {
+            let rect = el.CurrentBoundingRectangle().unwrap_or_default();
+            let ct = el.CurrentControlType().unwrap_or(UIA_CONTROLTYPE_ID(0));
+            let lct = el
+                .CurrentLocalizedControlType()
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            let kind = classify(ct, &lct);
+            if !offscreen_trust(kind, &rect, ctx.fg) {
+                return;
+            }
+            note_offscreen_admit(kind, &rect);
+            let name = el.CurrentName().map(|s| s.to_string()).unwrap_or_default();
+            offer_candidate(kind, &rect, &name, ctx);
             return;
         }
         let ct = el.CurrentControlType().unwrap_or(UIA_CONTROLTYPE_ID(0));
@@ -1028,6 +1103,67 @@ fn classify(ct: UIA_CONTROLTYPE_ID, lct: &str) -> Option<MediaKind> {
         return Some(MediaKind::Link);
     }
     None
+}
+
+/// alpha.14 — geometric trust decision for IsOffscreen=true elements.
+/// Chromium's offscreen bit lies for visible media (custom players,
+/// z-order quirks) — the alpha.12/13 hard gate silently ate the
+/// YouTube player on BOTH walk paths. The gate is now a hint; an
+/// offscreen-flagged element is still offered when its geometry is
+/// independently usable:
+///   · empty rect → unusable (offer_candidate would reject it anyway);
+///   · fully outside the fg window → unusable (scrolled-out garbage —
+///     the clamp would kill it too, this just skips the reads);
+///   · video-kind → trusted (the player itself — offer_candidate's
+///     64px gate and the clamp still apply);
+///   · anything else → trusted only when LARGE: both axes at least a
+///     quarter of the fg window's smaller dimension (≥270px on 1080p).
+///     Stale virtualized-list thumbnails — the alpha.12 "random holes"
+///     generator — are far smaller and stay suppressed.
+fn offscreen_trust(kind: Option<MediaKind>, rect: &RECT, fg: Option<RECT>) -> bool {
+    let w = rect.right - rect.left;
+    let h = rect.bottom - rect.top;
+    if w <= 0 || h <= 0 {
+        return false;
+    }
+    let Some(fg) = fg else {
+        return true; // no anchor to judge against — let the clamp decide
+    };
+    let outside = rect.right <= fg.left
+        || rect.left >= fg.right
+        || rect.bottom <= fg.top
+        || rect.top >= fg.bottom;
+    if outside {
+        return false;
+    }
+    if kind == Some(MediaKind::Video) {
+        return true;
+    }
+    let bar = ((fg.right - fg.left).min(fg.bottom - fg.top) / 4).max(MIN_MEDIA);
+    w >= bar && h >= bar
+}
+
+/// alpha.14 — counter + one-line canary for the fail-open path (see
+/// offscreen_trust). The count lands in the diagnostics report; the
+/// detail line logs once per process.
+fn note_offscreen_admit(kind: Option<MediaKind>, rect: &RECT) {
+    OFFSCREEN_ADMITS.fetch_add(1, Ordering::Relaxed);
+    if !OFFSCREEN_ADMIT_LOGGED.swap(true, Ordering::Relaxed) {
+        let kind_tag = match kind {
+            Some(MediaKind::Video) => "video",
+            Some(MediaKind::Image) => "image",
+            Some(MediaKind::Link) => "link",
+            None => "?",
+        };
+        tracing::warn!(
+            "tracker: offscreen-flagged {} element ADMITTED by geometry ({}x{} @({},{})) — Chromium's IsOffscreen flag disputed; if holes appear where none should, this path is why",
+            kind_tag,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            rect.left,
+            rect.top
+        );
+    }
 }
 
 /// Size gates + fg-window clamp + 4px quantize + zero-rect rejection.

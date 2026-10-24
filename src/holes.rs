@@ -18,13 +18,20 @@
 //   MagSetWindowSource (expensive pipeline rebuild) is reserved for
 //   rect changes, re-shows and the rare static self-heal.
 //
-//   EVIDENCE RULE (alpha.11): specs are TRUSTED ONLY WHILE FRESH —
-//   the pump hides every hole whose spec set has not been
-//   re-confirmed by a completed walk within STALE_SPEC_AGE. A hole
-//   can therefore never outlive its evidence, whatever happens to
-//   the tracker thread (a UIA walk wedged in a tearing-down browser
-//   provider is the classic case — it used to freeze the last hole
-//   set on screen forever).
+//   EVIDENCE RULE (alpha.11, CONTEXT-AWARE since alpha.14): specs are
+//   TRUSTED ONLY WHILE FRESH — but "fresh" now keys on CONTEXT. The
+//   pump hides every hole whose spec set (a) has not been re-confirmed
+//   by a completed walk within STALE_SPEC_AGE AND (b) describes a
+//   foreground context that has since changed (fg hwnd + title hash,
+//   see tracker::fg_identity). Same context = the screen still shows
+//   what the specs describe — a chronically slow provider (YouTube
+//   under load) may take seconds per walk, and that must not blank a
+//   page that has not changed (the alpha.13 "no hole in youtube"
+//   residual). Changed context (tab switch / alt-tab / retitle) hides
+//   unconfirmed holes within 4s — the alpha.10 danger (stale holes
+//   outliving their page) stays structurally impossible, but a hole
+//   CAN now outlive the clock while the screen it describes is still
+//   on screen.
 //
 //   REFRESH RATE (alpha.12): the pump runs at 15ms (≈64Hz with
 //   timeBeginPeriod(1)) and hole hosts are NOT layered. The 30ms
@@ -137,19 +144,21 @@ const STATIC_EVERY: u64 = 1200; // static-hole self-heal, in ticks
                                 // a pipeline reset on a misclassified
                                 // video hole is a visible stutter)
 pub const MAX_HOLES: usize = 16;
-// EVIDENCE TTL (alpha.11): a published hole set is only trusted for
-// this long since the LAST completed walk re-confirmed it. Normal
-// publish gaps are ≤1.5s (backoff cap) + walk time; a wedged provider
-// (tab teardown is the classic case — cross-process UIA calls into a
-// browser that is destroying/rebuilding its accessibility tree can
-// block for a very long time) stops publishes entirely, and the pump
-// would otherwise keep showing the last spec set FOREVER — the
-// "holes are permanent even after shifting tabs" report. With the TTL
-// a hole can never outlive its evidence: 8s after the last completed
-// walk every hole hides until fresh specs arrive. 8s sits well above
-// the worst legitimate gap (1.5s backoff + a pathological ~3s walk)
-// yet caps the damage of a wedged walk.
-const STALE_SPEC_AGE: Duration = Duration::from_millis(8000);
+// EVIDENCE TTL (alpha.11 → CONTEXT-AWARE in alpha.14): how long a
+// published hole set stays trusted without a fresh confirming walk —
+// but ONLY when the foreground context changed since the publish (see
+// the pump). Normal publish gaps are ≤1.5s (backoff cap) + walk time;
+// a wedged provider (tab teardown is the classic case) stops
+// publishes entirely, and the pump would otherwise keep showing the
+// last spec set FOREVER — the "holes are permanent even after shifting
+// tabs" report. alpha.14 splits the outcomes:
+//   · context UNCHANGED (slow-but-alive provider, video still there):
+//     holes STAY — a slow walk must not blank an unchanged page (the
+//     alpha.13 "no hole in youtube" residual);
+//   · context CHANGED (tab switch, alt-tab, retitle): unconfirmed
+//     holes hide within 4s — half the old 8s, because the
+//     same-context grace no longer has to be priced into the window.
+const STALE_SPEC_AGE: Duration = Duration::from_millis(4000);
 
 // CAPTURE MODEL (alpha.6 — measured, not assumed):
 // the "Magnifier" control does NOT stream its source region on its
@@ -206,10 +215,13 @@ pub struct HolesShared {
     /// called exactly once per COMPLETED walk — empty results count —
     /// so this is the pump's independent evidence clock: it advances
     /// only while the tracker thread is alive AND its walks complete.
-    /// The pump expires the whole hole set when the stamp ages past
-    /// STALE_SPEC_AGE, whatever wedged the tracker (hung provider,
-    /// panicking thread — both freeze specs without it).
     pub published_at: Mutex<Instant>,
+    /// alpha.14 — the foreground CONTEXT (hwnd, fnv1a(title)) the
+    /// published specs describe, stamped by set_specs_ctx. The pump
+    /// samples the CURRENT context at ~2Hz; equality = "the screen
+    /// still shows what the specs describe" (see pump_tick —
+    /// CONTEXT-AWARE EVIDENCE). (0,0) = contextless (clear paths).
+    pub published_fg: Mutex<(usize, u64)>,
     pub active: AtomicBool, // false = holes hidden (Dim/Off)
     pub pierce: AtomicBool, // manual hide-all (F7)
     pub hold: AtomicBool,   // scroll-hold (holes hidden during flicks)
@@ -227,6 +239,7 @@ impl Holes {
         let shared = Arc::new(HolesShared {
             specs: Mutex::new(Vec::new()),
             published_at: Mutex::new(Instant::now()),
+            published_fg: Mutex::new((0, 0)),
             active: AtomicBool::new(true),
             pierce: AtomicBool::new(false),
             hold: AtomicBool::new(false),
@@ -235,14 +248,22 @@ impl Holes {
         (Self { shared }, pool)
     }
 
-    /// Replace the desired hole set (screen physical px). Call at
-    /// discovery cadence. Surplus holes are hidden automatically.
-    /// ALSO re-stamps the evidence clock — every completed walk (even
-    /// one that found nothing) is fresh evidence that the tracker is
-    /// alive and its view of the screen is current.
+    /// Replace the desired hole set WITHOUT context (clear paths —
+    /// the specs are empty, so the evidence context is moot).
     pub fn set_specs(&self, specs: Vec<HoleSpec>) {
+        self.set_specs_ctx(specs, (0, 0));
+    }
+
+    /// Replace the desired hole set (screen physical px) STAMPED with
+    /// the foreground context it describes (tracker::fg_identity).
+    /// Call at discovery cadence. Surplus holes are hidden
+    /// automatically. ALSO re-stamps the evidence clock — every
+    /// completed walk (even one that found nothing) is fresh evidence
+    /// that the tracker is alive and its view of the screen is current.
+    pub fn set_specs_ctx(&self, specs: Vec<HoleSpec>, fg_ctx: (usize, u64)) {
         *self.shared.specs.lock().unwrap() = specs;
         *self.shared.published_at.lock().unwrap() = Instant::now();
+        *self.shared.published_fg.lock().unwrap() = fg_ctx;
     }
 
     /// Scroll-hold: holes vanish while set (manual API; the automatic
@@ -271,6 +292,10 @@ pub struct HolePool {
     /// alpha.11 — logs the stale-latch and recovery transitions once
     /// each instead of every 30ms tick.
     stale_latched: bool,
+    /// alpha.14 — the CURRENT foreground context, sampled at ~2Hz
+    /// (the identity read is one GetWindowTextW on a cached caption;
+    /// sampling at the full 64Hz would be 60+ pointless reads/s).
+    cur_fg: (usize, u64),
     /// alpha.12 — pump-rate heartbeat window (actual delivery Hz is
     /// the number that decides whether video in the hole looks
     /// smooth; a sagging rate = the main thread is starved).
@@ -285,24 +310,44 @@ impl HolePool {
         self.tick += 1;
         let tick = self.tick;
 
-        // EVIDENCE TTL (alpha.11): the pump never trusts a spec set
-        // older than STALE_SPEC_AGE. This is deliberately judged HERE,
-        // on the main thread, from its own wall clock — independent of
-        // the tracker thread's health. A wedged tracker (cross-process
-        // UIA call into a tearing-down browser blocks indefinitely; a
-        // panicking thread) freezes the last specs, and without this
-        // check the pump would show them forever — the "holes are
-        // permanent even after shifting tabs" report.
-        let fresh = shared.published_at.lock().unwrap().elapsed() < STALE_SPEC_AGE;
-        if !fresh && !self.stale_latched {
+        // EVIDENCE (alpha.11 → CONTEXT-AWARE in alpha.14): the pump
+        // never trusts a spec set older than STALE_SPEC_AGE — unless
+        // the foreground context still matches the one the specs
+        // describe. This is deliberately judged HERE, on the main
+        // thread, from its own wall clock — independent of the tracker
+        // thread's health:
+        //   · fresh publish → holes on (unchanged from alpha.11);
+        //   · stale publish + SAME context → holes STAY: a
+        //     slow-but-alive provider (YouTube under load) or even a
+        //     wedged walk cannot blank a page that has not changed —
+        //     the alpha.13 "no hole in youtube" residual. The video
+        //     the specs describe is provably still the thing on
+        //     screen (same hwnd, same title);
+        //   · stale publish + CHANGED context (tab switch, alt-tab,
+        //     retitle) → holes hide — the alpha.10 stale-holes danger
+        //     (old page's holes outliving their page) stays covered,
+        //     now within 4s instead of 8s.
+        if tick.is_multiple_of(32) {
+            self.cur_fg = crate::tracker::fg_identity_current();
+        }
+        let age = shared.published_at.lock().unwrap().elapsed();
+        let fresh = age < STALE_SPEC_AGE;
+        let same_context = {
+            let pub_fg = *shared.published_fg.lock().unwrap();
+            pub_fg != (0usize, 0u64) && pub_fg == self.cur_fg
+        };
+        let evidence_ok = fresh || same_context;
+        if !evidence_ok && !self.stale_latched {
             self.stale_latched = true;
             tracing::warn!(
-                "holes: spec evidence stale (no completed walk in {}s) — hiding all holes until the tracker publishes fresh evidence",
-                STALE_SPEC_AGE.as_secs()
+                "holes: spec evidence stale ({:.1}s) AND fg context changed — hiding all holes until a fresh walk re-confirms the current page",
+                age.as_secs_f32()
             );
-        } else if fresh && self.stale_latched {
+        } else if evidence_ok && self.stale_latched {
             self.stale_latched = false;
-            tracing::info!("holes: fresh spec evidence — holes re-enabled");
+            tracing::info!(
+                "holes: spec evidence ok (fresh walk or unchanged context) — holes re-enabled"
+            );
         }
 
         // want_visible — the pump is the SINGLE writer of hole visibility.
@@ -311,7 +356,7 @@ impl HolePool {
             && !shared.pierce.load(Ordering::Relaxed)
             && !shared.hold.load(Ordering::Relaxed)
             && !crate::scrollhook::hold_active()
-            && fresh;
+            && evidence_ok;
 
         let specs = shared.specs.lock().unwrap().clone();
 
@@ -521,6 +566,7 @@ unsafe fn create_pool() -> HolePool {
         pool,
         tick: 0,
         stale_latched: false,
+        cur_fg: (0, 0),
         beat_tick: 0,
         beat_at: Instant::now(),
     }
