@@ -1,31 +1,35 @@
 # Invertonator-rs
 
-**System-wide dark mode that websites cannot see — Rust edition for Windows & Linux (X11).**
+**System-wide dark mode that websites cannot see — Rust edition for Windows, Linux (X11) & GNOME/Wayland.**
 
 ![Invertonator](icon.svg)
 
-> **Status: v0.3.0-alpha.15** — Windows: UIA media tracker + Magnifier-API
-> true-color holes proven on hardware (1,152-node cache-request walks ·
-> 164 media elements classified · MagSetColorEffect/Source/Transform all
-> verified). Gecko browsers (Firefox/LibreWolf) supported via automatic
-> live-walk fallback when a provider leaves CachedChildren empty.
-> alpha.15 fixes "a random square comes and goes in the center of the
-> screen": until now the publish path mirrored trusted-walk output 1:1,
-> and on a chronically starved page (YouTube) the trusted walks are the
-> live FindAlls every 5s — any live-to-live difference in what Chromium
-> reports toggled a hole instantly on/off. The publish path now runs an
-> ANTI-FLAP HYSTERESIS: a brand-new rect needs two consecutive trusted
-> sightings to show (one-walk wonders never show at all; a fresh page
-> and wake walks — scroll end / tab switch / F5 — still show instantly),
-> and a rect one walk stopped seeing is kept for exactly one missed
-> trusted walk before it hides (one flaky live walk can no longer blank
-> the player). Matching is geometric (intersection ≥ 50% of the smaller
-> rect), so scrolled/moved holes update instantly without confirmation;
-> tab switches still clear holes the same tick; VSCodium-class stable
-> pages hit the matched fast path every walk — the smoothing is a
-> no-op there. New telemetry: `hyst_saves` / `hyst_held` in the
-> diagnostics report (a climbing hyst_saves while a square comes and
-> goes = live-walk flakiness caught and smoothed).
+> **Status: v0.3.0-alpha.16** — Linux cooking release. **GNOME/Wayland is now a
+> supported platform:** modern Fedora (43+) ships GNOME with the X11 session
+> REMOVED — no "GNOME on Xorg" login option exists — and Mutter silently
+> discards XWayland gamma writes, so the gamma-ramp binary can never work
+> there. The new backend is a bundled **GNOME Shell extension**
+> (`shell-extension/`, plain JS, installed by `shell-extension/install.sh`):
+> a fragment-shader effect (`1.0 - color`) applied to the compositor's
+> stage — inversion happens INSIDE gnome-shell, strictly after every app
+> and its web content rendered, so the web layer cannot detect it (same
+> anti-detection property as the Windows Magnifier and X11 gamma
+> backends). Super+I toggles, a panel indicator shows the state, the
+> state survives reboots (`start-enabled`), and the binding is
+> reconfigurable via gsettings. The X11 binary gained session awareness:
+> it now refuses with actionable guidance on a Wayland-only session and
+> warns through the XWayland path instead of failing silently. CI now
+> ships `Invertonator-gnome-extension-latest` next to the binaries.
+> Wayland true-color holes (per-window-actor inversion with a picked
+> un-inverted window) are the v2 milestone.
+> alpha.15 kept (Windows): ANTI-FLAP HYSTERESIS for "a random square
+> comes and goes in the center of the screen": the publish path no longer
+> mirrors trusted-walk output 1:1 — a brand-new rect needs two consecutive
+> trusted sightings to show (fresh pages and wake walks still show
+> instantly), and a rect one walk stopped seeing is kept for one missed
+> walk before it hides. Matching is geometric (intersection ≥ 50% of the
+> smaller rect); telemetry `hyst_saves` / `hyst_held` in the diagnostics
+> report.
 > alpha.14 kept: fail-open offscreen (IsOffscreen is a HINT — Chromium
 > flags visible media offscreen on some pages; the YouTube hole is
 > built from exactly the image-kind layers the old hard gate ate) and
@@ -54,7 +58,9 @@
 > Desktop file (invertonator-diagnostics.txt) — paste it into the bug
 > report.
 > Linux (X11): global gamma-ramp inversion shipped — the
-> XComposite true-color-hole overlay is the next milestone. For the
+> XComposite true-color-hole overlay is the next milestone. Linux (GNOME
+> Wayland): compositor-level inversion shipped as a Shell extension —
+> see [docs/LINUX-TESTING.md](docs/LINUX-TESTING.md). For the
 > **fully-featured C# edition**, see
 > [Invertonator](https://github.com/Phoenix1504e/Invertonator).
 
@@ -64,16 +70,19 @@
 |---|---|---|---|
 | Windows 10+ | Magnifier API (compositor) | ✅ UIA tracker | `Ctrl+Alt+F5` invert · `F6` mode · `F7` pierce · `F2` quit |
 | Linux (X11) | XRandR CRTC gamma | 🚧 v2 (XComposite overlay) — media inverts too for now | `Ctrl+Alt+I` toggle · `Ctrl+Alt+Q` quit |
-| Linux (Wayland) | needs compositor backends (KWin effect / GNOME ext) | ❌ | — |
+| Linux (GNOME/Wayland) | Shell extension — compositor shader | 🚧 v2 (per-window-actor inversion + picked hole) | `Super+I` toggle · panel menu |
+| Linux (KDE/Wayland) | KWin's built-in Invert effect | ❌ | user-bound |
 | macOS | ❌ unsupported | ❌ | — |
 
-If a Linux run is killed while inverted, the ramp persists until you run
-`invertonator --restore` (pushes identity ramps and exits).
+If a Linux X11 run is killed while inverted, the ramp persists until you
+run `invertonator --restore` (pushes identity ramps and exits). The
+Wayland extension restores colors automatically on disable/quit.
 
 No Linux box of your own? Run `invertonator --self-test` on any Linux
 machine — it prints a paste-back diagnostic report (session type, gamma
 hardware, live invert/restore round-trip, hotkey availability). Full
-tester runbook: [docs/LINUX-TESTING.md](docs/LINUX-TESTING.md).
+tester runbook — Wayland extension install, X11 binary, KDE note:
+[docs/LINUX-TESTING.md](docs/LINUX-TESTING.md).
 
 ## The problem
 
@@ -212,8 +221,10 @@ Tor Browser) cannot detect it — there is nothing in the web layer to detect.
   media holes + browser-chrome preservation
 - **v0.3** — event-driven UIA (instant discovery), auto-Dim on video,
   Firefox support
-- **v2.0** — Linux/X11 backend (XRandR inversion, AT-SPI2 discovery)
-- **research** — Wayland, compositor-level video handling
+- **v2.0** — Linux true-color holes (X11 XComposite overlay · GNOME/Wayland
+  per-window-actor inversion with a picked un-inverted window), AT-SPI2
+  discovery
+- **research** — compositor-level video handling, other Wayland compositors
 
 ## Credits & thanks
 

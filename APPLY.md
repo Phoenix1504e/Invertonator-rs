@@ -1,146 +1,172 @@
-# Invertonator-rs — Full Source Package (v0.3.0-alpha.15, cross-platform)
+# Invertonator-rs — Full Source Package (v0.3.0-alpha.16, Linux cooking release)
 
 Complete repo at a fixed state — extract over your clone, commit, push.
 No `.git` inside, your history is untouched.
 
 ---
 
-## Apply
+## What alpha.16 is (the Fedora release)
 
-Easiest path (clone already on disk at `C:\Users\admin\invertonator-push`):
+You moved to Fedora — this release moves the app to Fedora:
+
+- **NEW backend: GNOME Shell extension (Wayland).** Fedora 43+ ships GNOME
+  with the X11 session REMOVED — there is no "GNOME on Xorg" gear option
+  anymore — and Mutter silently discards gamma writes from XWayland, so
+  the gamma-ramp binary could never work there. The extension applies a
+  fragment-shader effect (`1.0 - color`) to the compositor's stage:
+  inversion happens INSIDE gnome-shell, strictly after every app (and its
+  web content) rendered → websites cannot see it, the same anti-detection
+  property as the Windows Magnifier and X11 gamma backends. Super+I
+  toggles, a panel indicator shows the state, the state survives reboots,
+  binding is reconfigurable via gsettings.
+- **The X11 binary gained session awareness:** on a Wayland-only session
+  it refuses with actionable guidance (instead of "no X display"), and
+  through the XWayland path it warns that the ramp write will be a no-op
+  before attempting it. `--self-test` verdicts now point at the extension
+  where relevant.
+- **CI** now ships `Invertonator-gnome-extension-latest` next to the
+  binaries.
+- **Windows side: untouched** — alpha.15 code, version bump only. The
+  alpha.15 test protocol (YouTube hole stability, hysteresis telemetry)
+  remains valid for the exe.
+
+---
+
+## Apply on Fedora (your new daily machine)
+
+```bash
+sudo dnf install -y unzip git   # if missing
+cd ~/invertonator-push          # your clone; or clone fresh first
+unzip -o ~/Downloads/Invertonator-rs-full-source.zip -d .
+git add -A
+git commit -m "alpha.16: GNOME/Wayland shell extension backend (Fedora release)"
+git push origin HEAD
+```
+
+CI then rebuilds all artifacts for the repo history; on Fedora you can
+also skip CI and build the X11 binary locally:
+
+```bash
+sudo dnf install -y rust cargo
+cargo build --release           # → target/release/invertonator
+```
+
+## Use it on Fedora — pick by your session
+
+```bash
+echo $XDG_SESSION_TYPE
+```
+
+**`wayland` (Fedora default → almost certainly this one):**
+
+```bash
+bash shell-extension/install.sh
+```
+
+then **log out and log back in once** (GNOME loads new extensions at
+login; Alt+F2 `r` does not restart the shell on Wayland). After login:
+
+- a small brightness icon appears in the top-right panel — Invertonator;
+- **Super+I** flips inversion; press again to restore;
+- the menu item reads "Inversion: ON / OFF".
+
+**`x11` (other spins/desktops):**
+
+```bash
+./target/release/invertonator --self-test   # paste the WHOLE report back
+./target/release/invertonator               # Ctrl+Alt+I toggle, Ctrl+Alt+Q quit
+```
+
+**KDE/Wayland:** KWin ships a built-in Invert effect (Shortcuts → Window
+Management → Desktop Effects → "Invert Effect") — works today, no
+Invertonator integration yet.
+
+---
+
+## Test protocol — Fedora (5 minutes, Wayland)
+
+1. After logout/login, panel icon present, **Super+I inverts instantly**;
+   text is perfectly crisp (compositor shader, not a magnifier hack).
+2. Open YouTube and play a video: it renders inverted — **expected** in
+   v1 (global inversion); true-color holes are the v2 milestone
+   (per-window-actor inversion with a picked un-inverted window).
+3. Toggle off/on a few times — no flicker, no stale rectangles.
+4. Reboot with inversion ON (toggle it on, then reboot): the session
+   comes back inverted.
+5. Bind check: `gsettings get org.gnome.shell.extensions.invertonator
+   toggle-invert` → `['<Super>i']`.
+
+Report back ONE line per item: invert works, crisp, flicker none, reboot
+state, session+version (`echo $XDG_SESSION_TYPE $XDG_CURRENT_DESKTOP; gnome-shell --version`).
+
+If anything is off:
+
+```bash
+gnome-extensions info invertonator@phoenix1504e
+journalctl --user -b /usr/bin/gnome-shell | grep -i -E 'invertonator|error' | tail -20
+```
+
+— paste both outputs.
+
+---
+
+## Windows machine (if you still boot it)
+
+Same flow as every alpha — from PowerShell:
 
 ```powershell
 cd C:\Users\admin\invertonator-push
 Expand-Archive -Path "$env:USERPROFILE\Downloads\Invertonator-rs-full-source.zip" -DestinationPath . -Force
 git add -A
-git commit -m "alpha.15: anti-flap hysteresis (random square comes and goes)"
+git commit -m "alpha.16: GNOME/Wayland shell extension backend (Fedora release)"
 git push origin HEAD
 ```
 
-After the push, the Actions tab builds BOTH artifacts (Windows exe + Linux
-binary). Keep the `.gitignore` this package ships (`/target`, `*.exe`) —
-without it, `git add -A` after a local build would sweep thousands of
-`target/` build artifacts into your GitHub repo.
-
-**IMPORTANT — verify you are running the new build:** the FIRST line of
-`%LOCALAPPDATA%\Invertonator\log.txt` must read
-`=== Invertonator-rs v0.3.0-alpha.15 ===`. If it says alpha.14, the old
-exe ran — re-download the CI artifact and start that one.
+Verify the exe: first line of `%LOCALAPPDATA%\Invertonator\log.txt` must
+read `=== Invertonator-rs v0.3.0-alpha.16 ===`. The Windows behavior is
+alpha.15-identical (hysteresis fixes) — the alpha.15 test protocol and
+the Desktop `invertonator-diagnostics.txt` escalation still apply there.
 
 ---
 
-## What alpha.15 fixes (your latest report)
-
-> "a random square comes and goes in the center of the screen"
-
-Root cause found in the code: the publish path had NO smoothing. Every
-trusted walk result went to the pump 1:1 — a rect seen in one walk
-appeared instantly, and a rect the next walk missed was dropped
-instantly. On YouTube the trusted walks are the heavy LIVE walks every
-5s (the cached walk is chronically half-tree there — alpha.13's
-diagnosis), so any live-to-live difference in what Chromium reports
-toggled a hole on/off with a ~5s period. One square, center screen,
-comes and goes — that is the exact signature. VSCodium's candidate set
-is identical every walk, which is why it stayed perfect.
-
-**Now:** the publish path runs an anti-flap hysteresis (two buckets):
-
-1. **Show needs 2 sightings** — a rect brand-new to the screen publishes
-   only after two consecutive trusted walks saw it. A one-walk wonder
-   (Chromium reporting an element exactly once) never shows at all.
-   Two fast exceptions, on purpose: a fresh page (previous walk saw
-   nothing — the player still appears on the FIRST live walk after
-   navigation) and WAKE walks (scroll end, tab switch, alt-tab, F5 —
-   user-initiated freshness stays instant, the alpha.9/10/11 fast
-   paths are untouched).
-
-2. **Hide needs 2 absences** — a rect one walk stopped seeing stays on
-   screen for exactly one missed trusted walk. One flaky live walk
-   that misses the player no longer blanks it for 5s. The second
-   consecutive miss drops it, so nothing lingers forever.
-
-Matching is geometric ("same hole" = intersection ≥ 50% of the smaller
-rect): identical rects match trivially, a scrolled/moved hole matches
-its old rect and takes the NEW geometry immediately (position tracking
-never waits), and distinct grid items across a gutter share almost
-nothing so they can't mask each other.
-
-Guarantees kept: tab switches clear old holes the same tick (wake
-flush); scroll ends re-sync positions instantly (wake flush); F5-ON
-shows holes in ~50ms (wake flush); the pump's 4s context TTL is still
-the last-resort backstop. VSCodium: every walk matches the previous —
-the hysteresis is a no-op there.
-
-New telemetry: the diagnostics report now ends with
-`tracker: starved_ticks= sticky_held= offscreen_admits= hyst_saves=
-hyst_held=`. A climbing `hyst_saves` while a square comes and goes =
-live-walk flakiness caught and smoothed (proof the fix engaged);
-`hyst_held` counts suppressed one-walk wonders. The log also records
-the first save and the first hold with rects.
-
----
-
-## Test protocol (2 minutes)
-
-1. Start the new exe, confirm log line 1 = `v0.3.0-alpha.15`.
-2. Open YouTube, play a video, F5. The player hole must appear as fast
-   as alpha.14 (first live walk, ~1-2s) and STAY — no blink-out when
-   nothing is happening, no random square anywhere.
-3. Scroll the page: holes follow immediately after the scroll ends.
-4. Switch tabs (Ctrl+Tab / click) away and back: the old holes clear
-   within ~4s worst case (usually ~1s), the new page's holes appear
-   promptly, NO stale rectangles at any point.
-5. Alt-tab VSCodium ↔ browser: VSCodium stays as perfect as you
-   reported; YouTube hole stays alive the whole time.
-6. Watch the center square specifically: it should either never appear
-   again or (if it was a real element) appear and STAY stable instead
-   of cycling.
-
-## If ANYTHING is still off — one paste, full diagnosis
-
-**Drag the Desktop `invertonator-diagnostics.txt` straight into the
-chat** (auto-written 10s after launch and 3s after every F5; F10
-regenerates it any time on the affected window). It now includes
-`hyst_saves= hyst_held=` plus everything from alpha.14 — one paste
-tells me whether the flapping is live-walk misses (hyst_saves
-climbing), suppressed phantoms (hyst_held climbing), or something else
-entirely. Six rounds of symptom sentences have carried the bug this
-far; the file ends it in one round.
-
-## File map (18 files, latest state)
+## File map (23 files, latest state)
 
 ```
-.github/workflows/build.yml  CI: windows+ubuntu artifacts per push
+.github/workflows/build.yml  CI: windows+ubuntu artifacts + GNOME extension bundle
 .gitignore                   /target, *.exe — keep, protects your clone
 APPLY.md                     this file
-Cargo.toml                   0.3.0-alpha.15 (windows+linux deps)
+Cargo.toml                   0.3.0-alpha.16 (windows+linux deps)
 Cargo.lock                   pinned
 Invertonator-rs-v0.2.0-alpha.2.exe  legacy artifact (safe to git rm)
 LICENSE                      MIT
-README.md                    status + platform matrix + hotkeys
-docs/LINUX-TESTING.md        X11 runbook (--self-test + live checklist)
+README.md                    status + platform matrix (5 platforms) + roadmap
+docs/LINUX-TESTING.md        Fedora-first runbook (Wayland ext / X11 / KDE)
 icon.ico / icon.svg          logo (tray + README)
 src/main.rs                  cross-platform entry (cfg dispatcher)
 src/common.rs                settings.json + logging + VERSION
 src/win_main.rs              Windows backend (tray, hotkeys, probe, DPI,
-                             auto-diagnostics, timer resolution,
-                             starvation + offscreen + hysteresis telemetry)
-src/holes.rs                 hole pool + main-thread pump (15ms ≈64Hz,
-                             unlayered hosts, context-aware evidence,
-                             pump heartbeat)
-src/tracker.rs               UIA media discovery (cached+live walks,
-                             same-name merge, wake loop, fail-open
-                             offscreen, sticky trust + expedited live,
-                             ANTI-FLAP HYSTERESIS)
+                             auto-diagnostics, hysteresis telemetry)
+src/holes.rs                 hole pool + main-thread pump (≈64Hz, context-
+                             aware evidence, pump heartbeat)
+src/tracker.rs               UIA media discovery (cached+live walks, same-
+                             name merge, wake loop, fail-open offscreen,
+                             sticky trust, ANTI-FLAP HYSTERESIS)
 src/scrollhook.rs            low-level wheel hook (scroll-hold, page-dirty)
-src/linux.rs                 X11 XRandR gamma-ramp inversion + --self-test
+src/linux.rs                 X11 XRandR gamma inversion + --self-test +
+                             Wayland session awareness
+shell-extension/install.sh                       one-command installer
+shell-extension/invertonator@phoenix1504e/metadata.json    uuid, v16, shells 45–51
+shell-extension/invertonator@phoenix1504e/extension.js     compositor shader
+                                                           inversion, Super+I,
+                                                           panel indicator,
+                                                           reboot persistence
+shell-extension/invertonator@phoenix1504e/schemas/org.gnome.shell.extensions.invertonator.gschema.xml
+shell-extension/invertonator@phoenix1504e/schemas/gschemas.compiled
 ```
 
 ## After testing
 
-Reply with what you saw (one line is enough — e.g. "square gone,
-youtube hole stays, vscodium still perfect" or "still X"), and if
-anything is off, drag the Desktop `invertonator-diagnostics.txt` into
-the chat. That file plus the log's `hysteresis kept/held` /
-`starved=` / `SLOW walk` lines pinpoint any remaining issue in ONE
-round.
+Reply with what you saw (one line is enough — e.g. "wayland, super+i
+works, crisp, youtube inverted" or "extension failed, journal says …").
+The Windows hole saga (YouTube stability) resumes exactly where alpha.15
+left it whenever you boot Windows again.

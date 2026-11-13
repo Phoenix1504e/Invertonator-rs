@@ -11,8 +11,11 @@
 //       the v2 XComposite + XShm overlay backend (browser window
 //       pixmaps stay un-inverted, so hole regions can be blitted in
 //       original colors on an ARGB overlay — design note at EOF).
-//     * X11 sessions only. Native Wayland needs compositor backends
-//       (KWin effect / GNOME extension) — on the roadmap.
+//     * X11 sessions only for THIS backend. Native Wayland is covered by
+//       the companion GNOME Shell extension (shell-extension/ — ships with
+//       the repo, installed by shell-extension/install.sh): Mutter discards
+//       CRTC gamma writes from XWayland, so on a Wayland desktop the
+//       extension is the correct backend.
 //     * If the process is SIGKILLed while inverted the ramp persists;
 //       run `invertonator --restore` to reset to identity.
 //
@@ -427,14 +430,42 @@ pub fn run() {
     tracing::info!("clean exit — colors restored");
 }
 
+/// True when the desktop session is Wayland (XDG_SESSION_TYPE=wayland,
+/// or WAYLAND_DISPLAY set with no X display at all). Under a Wayland
+/// compositor, CRTC gamma writes through XWayland are discarded by
+/// Mutter — inversion silently does nothing even though every API call
+/// "succeeds". The GNOME Shell extension in shell-extension/ is the
+/// Wayland backend.
+fn wayland_session() -> bool {
+    if std::env::var("XDG_SESSION_TYPE").as_deref() == Ok("wayland") {
+        return true;
+    }
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() && std::env::var_os("DISPLAY").is_none() {
+        return true;
+    }
+    false
+}
+
 fn x11_run(restore_only: bool) -> Result<(), String> {
     if std::env::var_os("WAYLAND_DISPLAY").is_some() && std::env::var_os("DISPLAY").is_none() {
         return Err(
             "Wayland session detected (WAYLAND_DISPLAY set, DISPLAY empty). \
-             This backend needs an X11 session — native Wayland support \
-             (KWin effect / GNOME extension) is on the roadmap."
+             This backend drives X11 only. On GNOME use the bundled Wayland \
+             backend instead: shell-extension/install.sh (see docs/LINUX-TESTING.md \
+             — it inverts inside the compositor)."
                 .into(),
         );
+    }
+    if wayland_session() {
+        // XWayland IS present (DISPLAY set), but the session is Wayland:
+        // proceed anyway, but say exactly what will happen so a no-op
+        // gamma write is never mistaken for a bug.
+        let msg = "Wayland session detected — Mutter discards CRTC gamma writes \
+                   from XWayland, so inversion will likely be a no-op. Use the \
+                   bundled GNOME Shell backend instead: shell-extension/install.sh \
+                   (docs/LINUX-TESTING.md). Continuing with the X11 attempt anyway…";
+        tracing::warn!("linux: {msg}");
+        println!("Invertonator: WARNING — {msg}");
     }
 
     let mut session = Session::open().map_err(|e| format!("x11 init: {e}"))?;
@@ -514,6 +545,11 @@ fn self_test() -> i32 {
         let val = std::env::var(key).unwrap_or_else(|_| "<unset>".into());
         println!("  {key:19} = {val}");
     }
+    if wayland_session() {
+        println!("  -> Wayland session: use the GNOME extension backend");
+        println!("     (shell-extension/install.sh) — gamma writes via XWayland");
+        println!("     are discarded by Mutter.");
+    }
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -563,7 +599,7 @@ fn self_test() -> i32 {
             println!("  connection          : FAILED — $DISPLAY unset or no X server reachable");
             println!();
             println!("[verdict]");
-            println!("  ENV UNAVAILABLE — no X11 display. On a Wayland-only session (GNOME\n  default on modern distros) log out and pick the '… on Xorg' session type.");
+            println!("  ENV UNAVAILABLE — no X11 display. On a Wayland-only session (GNOME\n  default on modern distros; Fedora 43+ GNOME has NO Xorg login option at\n  all) use the bundled GNOME Shell backend instead: shell-extension/install.sh.");
             return 2;
         }
         let scr = (xlib.XScreenCount)(dpy);
@@ -746,11 +782,11 @@ fn self_test() -> i32 {
     println!();
     println!("[verdict]");
     let (line, code) = if tested == 0 {
-        ("FAIL — no output exposes a usable gamma LUT. If XDG_SESSION_TYPE above\n  says 'wayland', Invertonator needs an Xorg/X11 session for now.", 1)
+        ("FAIL — no output exposes a usable gamma LUT. If XDG_SESSION_TYPE above\n  says 'wayland', this machine has no usable X11 gamma path — use the\n  GNOME Shell backend (shell-extension/install.sh).", 1)
     } else if rejected == tested {
         ("FAIL — the X server rejected every gamma write (driver/compositor\n  blocks CRTC gamma changes).", 1)
     } else if inverted_ok == 0 {
-        ("FAIL — gamma writes were accepted but the ramp never changed\n  (typical for XWayland nested in a Wayland session). Run on a real\n  X11 session.", 1)
+        ("FAIL — gamma writes were accepted but the ramp never changed\n  (typical for XWayland nested in a Wayland session — Mutter discards\n  them). Use the GNOME Shell backend (shell-extension/install.sh), or\n  run the binary on a real X11 session.", 1)
     } else if restore_ok < inverted_ok {
         ("PARTIAL PASS — inversion works; restore verification was imprecise\n  (usually 8-bit LUT quantization, visually harmless). App should work.", 0)
     } else {

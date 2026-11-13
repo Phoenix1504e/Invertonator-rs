@@ -38,6 +38,16 @@ jobs:
       - name: Build release
         run: cargo build --release --locked
 
+      # GNOME Shell extension (Wayland backend) ships alongside the Linux
+      # binary so testers can grab ONE artifact on Fedora/Ubuntu.
+      - name: Bundle GNOME extension (linux)
+        if: runner.os == 'Linux'
+        run: |
+          cd shell-extension
+          zip -r ../target/invertonator-gnome-extension.zip invertonator@phoenix1504e
+          cd ..
+          sha256sum target/invertonator-gnome-extension.zip
+
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
@@ -50,4 +60,12 @@ jobs:
         with:
           name: ${{ matrix.artifact }}-latest
           path: target/release/${{ matrix.exe }}
+          if-no-files-found: error
+
+      - name: Upload GNOME extension (linux)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Invertonator-gnome-extension-latest
+          path: target/invertonator-gnome-extension.zip
           if-no-files-found: error

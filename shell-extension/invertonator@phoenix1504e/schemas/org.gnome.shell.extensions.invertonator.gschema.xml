@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+    <schema id="org.gnome.shell.extensions.invertonator"
+            path="/org/gnome/shell/extensions/invertonator/">
+        <key name="toggle-invert" type="as">
+            <default><![CDATA[['<Super>i']]]></default>
+            <summary>Toggle full-screen inversion</summary>
+            <description>Global keybinding that flips inversion on/off. Super+I by
+            default; plain F5 is deliberately NOT used because a shell-level grab
+            would shadow the browser's refresh shortcut. Change with gsettings:
+            gsettings set org.gnome.shell.extensions.invertonator toggle-invert
+            "['&lt;Alt&gt;i']"</description>
+        </key>
+        <key name="start-enabled" type="b">
+            <default>false</default>
+            <summary>Inversion state</summary>
+            <description>Written automatically on every toggle and re-applied on
+            login, so the screen comes back inverted after a reboot if that is
+            how you left it.</description>
+        </key>
+    </schema>
+</schemalist>

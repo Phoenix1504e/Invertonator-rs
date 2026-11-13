@@ -1,106 +1,173 @@
 # Testing Invertonator on Linux — a 10-minute runbook
 
-The maintainer develops on Windows, so Linux confirmation has to come from
-real machines. This runbook is written so **anyone with a Linux desktop**
-can test the app in ten minutes and send back a useful report — no build
-tools, no Rust, no special knowledge required.
+Invertonator has TWO Linux backends. Pick by your session type:
+
+| Your `$XDG_SESSION_TYPE` | Backend | This runbook |
+|---|---|---|
+| `wayland` (Fedora default!) | **GNOME Shell extension** (`shell-extension/`) | Part 1 |
+| `x11` | Rust binary — XRandR gamma ramp | Part 2 |
+
+Check yours with:
+
+```bash
+echo $XDG_SESSION_TYPE
+```
+
+**Fedora note (important):** Fedora 43+ ships GNOME with the X11 session
+REMOVED — there is no "GNOME on Xorg" gear option at the login screen
+anymore. If you installed Fedora Workstation recently, you are on Wayland
+and Part 1 is the only backend that works. (KDE spin users: see Part 3.)
 
 ---
 
-## What you need
+## Part 1 — Wayland (GNOME): the Shell extension
 
-- Any Linux desktop running an **X11 session** (Ubuntu/Xorg, Linux Mint,
-  XFCE, KDE on X11, i3, Cinnamon … all fine).
-- Nothing else. The binary loads `libX11`/`libXrandr` at runtime — every
-  desktop distro already ships them.
-- On a **Wayland** session? See the Wayland section at the bottom first.
+Nothing to build, nothing to compile, no Rust required — the extension is
+plain JavaScript that runs inside gnome-shell itself. It inverts every
+pixel in the compositor, AFTER all apps (and their web content) rendered,
+so the web layer cannot see it — the same anti-detection property as the
+Windows Magnifier backend and the X11 gamma ramp.
+
+### Get the extension
+
+Either from the repo you already have:
+
+```bash
+bash shell-extension/install.sh
+```
+
+or from CI (no git needed): GitHub → **Actions** → latest **Build** →
+download artifact **`Invertonator-gnome-extension-latest`**, unzip it, then
+inside the unpacked folder:
+
+```bash
+unzip invertonator-gnome-extension.zip
+bash install.sh
+```
+
+### Activate
+
+1. **First install on Wayland: log out and log back in once.** GNOME only
+   loads newly installed extensions at login (Alt+F2 `r` does NOT restart
+   the shell on Wayland).
+2. After logging in you will see a small brightness icon in the top-right
+   panel — that is Invertonator.
+3. Press **Super+I**. The whole screen snaps to inverted. Press again to
+   restore. The panel menu item reads "Inversion: ON / OFF".
+
+Why Super+I and not F5? A shell-level grab of a plain F-key would shadow
+the browser's refresh shortcut system-wide. You can rebind:
+
+```bash
+gsettings set org.gnome.shell.extensions.invertonator toggle-invert "['<Alt>i']"
+```
+
+The extension remembers its state across reboots (toggling writes
+`start-enabled`, which is re-applied at login).
+
+### Verify + report back
+
+Send me one line per item:
+
+1. Did the screen invert on Super+I? (yes / no)
+2. Text crispness — this is a compositor shader, text should be perfectly
+   crisp. (crisp / blurry)
+3. Any flicker when the effect toggles? (none / flicker on…)
+4. Does YouTube/video render inverted? (expected: YES — global inversion
+   is v1; per-window true-color "holes" are the v2 milestone, tracked in
+   the repo roadmap)
+5. Session + version: `echo $XDG_SESSION_TYPE $XDG_CURRENT_DESKTOP` and
+   `gnome-shell --version`.
+
+### Troubleshooting
+
+- **No icon in the panel, Super+I dead** — the extension did not load.
+  Check: `gnome-extensions info invertonator@phoenix1504e`. If it says
+  ERROR, send me the output of
+  `journalctl --user -b /usr/bin/gnome-shell | grep -i -E 'invertonator|error'`.
+- **"Extension version must be 45–51"** — `metadata.json` lists
+  shell-version 45–51; if your GNOME is older/newer, edit that array to
+  include your version and re-run install.sh.
+- **HDR enabled?** Compositor effects assume SDR; if colors look wrong,
+  disable HDR first.
+- **Uninstall**: `gnome-extensions disable invertonator@phoenix1504e &&
+  rm -rf ~/.local/share/gnome-shell/extensions/invertonator@phoenix1504e`
 
 ---
 
-## Step 1 — get the binary (no build needed)
+## Part 2 — X11 session: the gamma-ramp binary
 
-1. Open the repo on GitHub → the **Actions** tab → the latest **Build** run.
-2. Download the artifact **`Invertonator-rs-linux-x64-latest`**.
-3. Unzip it and make it executable:
+Works on any desktop running an X11 session (KDE on X11, XFCE, Mint,
+Cinnamon, i3 …). Inversion happens in the display hardware's gamma LUT —
+below every application.
+
+### Step 1 — get the binary
+
+GitHub → **Actions** → latest **Build** → artifact
+**`Invertonator-rs-linux-x64-latest`**:
 
 ```bash
 unzip Invertonator-rs-linux-x64-latest.zip
 chmod +x invertonator
 ```
 
-(Alternative: build from source — `cargo build --release`. The result is
-the same binary.)
+(Or build from source: `cargo build --release`.)
 
-## Step 2 — the one-command diagnostic
+### Step 2 — the one-command diagnostic
 
 ```bash
 ./invertonator --self-test
 ```
 
-This prints a full report: session type, X server identity, every output
-with its gamma hardware, a live invert/restore round-trip (this catches
-drivers that silently ignore gamma changes), and whether the hotkeys are
-free. It changes nothing visually — ramps are restored within the test.
+Prints a full paste-back report: session type, X server identity, every
+output with its gamma hardware, a live invert/restore round-trip (catches
+drivers that silently ignore gamma changes), and hotkey availability.
+Exit code `0` = machine supports gamma inversion, `1` = real failure,
+`2` = environment unavailable. **Send back the ENTIRE output.**
 
-**Send back the ENTIRE output.** Exit code `0` means the machine supports
-gamma inversion; `1` means a real failure; `2` means the environment
-wasn't available (e.g. no X display).
-
-## Step 3 — the visual test (any browser — literally any)
-
-Inversion happens at the display (gamma LUT) level, *below* every
-application — so the browser brand genuinely does not matter here.
+### Step 3 — the visual test
 
 ```bash
 ./invertonator
 ```
 
-1. The screen should invert **immediately** on launch.
-2. Open any browser — Firefox, Chromium, Chrome, LibreWolf, Falkon,
-   anything — and browse normally. Text should be crisp (this is a
-   hardware LUT, not a blurry magnifier hack).
-3. Images/videos appear inverted too — **expected for now**; true-color
-   media holes are the v2 milestone on Linux.
-4. `Ctrl+Alt+I` → colors snap back; press again → inverted.
-5. Multi-monitor: every connected monitor should invert.
-6. `Ctrl+Alt+Q` → colors restore and the app exits cleanly.
+1. Screen inverts **immediately** on launch.
+2. Any browser, any desktop — text stays crisp (hardware LUT, not a
+   magnifier hack).
+3. Images/videos invert too — expected in v1; true-color media holes are
+   the v2 XComposite milestone on Linux.
+4. `Ctrl+Alt+I` → toggle. `Ctrl+Alt+Q` → restore + exit.
+5. Multi-monitor: every connected monitor inverts.
 
-## Step 4 — the crash-recovery drill
+### Step 4 — crash-recovery drill
 
 ```bash
 ./invertonator &          # start inverted
-pkill -9 invertonator     # simulate a crash — the ramp PERSISTS (expected)
-./invertonator --restore  # pushes identity ramps — colors come back
+pkill -9 invertonator     # simulate a crash — ramp PERSISTS (expected)
+./invertonator --restore  # identity ramps — colors come back
 ```
-
-## What to send back
-
-- The **full `--self-test` output** (most important).
-- Distro and desktop: `cat /etc/os-release` and
-  `echo $XDG_CURRENT_DESKTOP $XDG_SESSION_TYPE`.
-- GPU: `lspci | grep -iE 'vga|3d'`.
-- One line on: text crispness, any flicker, whether all monitors inverted.
 
 ---
 
-## If you're on Wayland
+## Part 3 — KDE on Wayland
 
-Modern Ubuntu/Fedora default to Wayland. Invertonator v1 needs X11:
+KWin ships its own compositor-level **Invert** effect (the same
+post-render inversion property): System Settings → Keyboard → Shortcuts →
+Window Management → Desktop Effects → "Invert Effect", bind a key there.
+It does not integrate with Invertonator's hotkeys/logs, but it works
+today. A dedicated KWin script backend remains on the roadmap.
 
-1. The binary will refuse with a clear message if there is no X display.
-2. Log out → click your user → **gear icon** (bottom-right on GNOME) →
-   pick **"Ubuntu on Xorg"** (or "Plasma (X11)") → log in → retry.
-3. Native Wayland support (KDE KWin invert effect / GNOME extension
-   backends) is on the roadmap.
+## What to send back (either backend)
 
-## No Linux machine? (maintainer note)
+- Backend + session: `echo $XDG_SESSION_TYPE $XDG_CURRENT_DESKTOP`,
+  `gnome-shell --version` (Wayland) or the full `--self-test` report (X11).
+- GPU: `lspci | grep -iE 'vga|3d'`.
+- One line on: inversion works, text crispness, flicker, all monitors.
 
-- **You don't need one.** CI builds the Linux binary on every push; any
-  Linux user can test it by following this runbook.
-- Want to see it yourself: install VirtualBox on Windows, boot an Ubuntu
-  24.04 ISO (live session is enough), choose **"Ubuntu on Xorg"** in the
-  login gear menu, then follow Steps 1–4. Inside the VM, `--self-test`
-  and the visual inversion both work against VirtualBox's emulated GPU.
-- WSLg is **not** representative: it is Wayland/XWayland, and CRTC gamma
-  writes are intercepted — the self-test will correctly report
-  RAMP-UNCHANGED there.
+## No Linux box? (maintainer note)
+
+- CI builds the Linux binary on every push; any Linux tester can follow
+  Parts 2–3. The GNOME extension can be smoke-tested in a GNOME Boxes /
+  VirtualBox VM running Fedora Workstation (Wayland by default — Part 1).
+- WSLg is **not** representative: it is Wayland/XWayland and intercepts
+  CRTC gamma writes — the self-test will correctly report RAMP-UNCHANGED.
