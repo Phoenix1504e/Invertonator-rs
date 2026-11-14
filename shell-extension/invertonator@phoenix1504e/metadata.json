@@ -3,6 +3,6 @@
     "name": "Invertonator",
     "description": "System-wide screen inversion that websites cannot see — the GNOME/Wayland backend of Invertonator-rs. Inverts every pixel inside the compositor, AFTER applications (and their web content) rendered, so the web layer cannot detect it. Super+I toggles; a panel indicator shows the state. Companion to the Invertonator-rs X11 gamma-ramp binary.",
     "url": "https://github.com/Phoenix1504e/Invertonator-rs",
-    "version": 17,
+    "version": 18,
     "shell-version": ["45", "46", "47", "48", "49", "50", "51"]
 }

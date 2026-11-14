@@ -4,21 +4,19 @@
 
 ![Invertonator](icon.svg)
 
-> **Status: v0.3.0-alpha.17** — GNOME extension hotfix. alpha.16's extension
-> failed to LOAD on every GNOME version — journal fingerprint:
-> `SyntaxError: The requested module 'resource:///org/gnome/shell/ui/main.js'
-> doesn't provide an export named: 'default'`. The shell's ui modules
-> (main.js, panelMenu.js, popupMenu.js) export NAMED bindings only and have
-> NO default export; the canonical ESM template imports them as
-> `import * as Main`. All three imports fixed (extension now reaches
-> enable(): State ACTIVE, panel icon, Super+I), and the ShaderEffect
-> constructor property moved to the canonical camelCase `shaderType`.
-> install.sh no longer silently skips enabling on a pre-login install: when
-> `gnome-extensions enable` cannot see the fresh extension it whitelists
-> the uuid in org.gnome.shell enabled-extensions via gsettings, so the next
-> login comes up ACTIVE with zero manual steps (alpha.16 field finding:
-> the pre-login enable was swallowed and the extension loaded DISABLED
-> forever).
+> **Status: v0.3.0-alpha.18** — GNOME extension shader fix. alpha.17's ESM
+> import fix proved out on Fedora 45 / GNOME 51 (module loads, enable()
+> runs, indicator + Super+I all fire — the journal showed every keypress),
+> but GNOME 51's GJS exposes NO `set_shader_source()` on Clutter.ShaderEffect
+> (journal fingerprint: `TypeError: effect.set_shader_source is not a
+> function`) — the effect was never created, so nothing inverted.
+> alpha.18 sets the GLSL through the GObject property `shader-source`
+> (stable since Clutter 1.10) with a read-back guard, and install.sh now
+> says honestly when a relogin is required after a reinstall.
+> alpha.17 kept: canonical `import * as Main` ESM imports (alpha.16's
+> default-import SyntaxError) + install.sh gsettings whitelist fallback
+> for pre-login installs (the pre-login enable was swallowed and the
+> extension loaded DISABLED forever).
 > alpha.16 kept: GNOME/Wayland backend shipped (compositor-level
 > fragment-shader stage inversion, Super+I, panel indicator, reboot
 > persistence) + X11 binary session awareness + CI extension artifact.

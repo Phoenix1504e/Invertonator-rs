@@ -70,7 +70,17 @@ function makeInvertEffect() {
                  (Clutter.ShaderType && Clutter.ShaderType.FRAGMENT_SHADER);
     const params = FRAG !== undefined ? { shaderType: FRAG } : {};
     const effect = new Clutter.ShaderEffect(params);
-    effect.set_shader_source(INVERT_FRAGMENT);
+    // GNOME 51 field finding: GJS exposes NO set_shader_source() on
+    // ShaderEffect (TypeError) — the GLSL source is the GObject property
+    // "shader-source", stable since Clutter 1.10. Set it through the raw,
+    // always-available set_property() and read it back so a dropped
+    // property fails loudly in the journal instead of silently.
+    effect.set_property('shader-source', INVERT_FRAGMENT);
+    const got = effect.get_property('shader-source');
+    if (got !== INVERT_FRAGMENT) {
+        throw new Error('shader-source property did not stick (' +
+            (got === null ? 'null' : typeof got) + ')');
+    }
     return effect;
 }
 

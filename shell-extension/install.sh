@@ -34,7 +34,12 @@ fi
 
 if gnome-extensions enable "$UUID" 2>/dev/null; then
     echo "enabled LIVE — the running shell already knew the extension"
-    echo "no logout needed; press Super+I now"
+    # alpha.18 honesty rule: a live enable re-imports from disk when the
+    # shell transitions ERROR -> enabled, but a REINSTALL over a module
+    # the shell already executes keeps running the previous copy until
+    # restart. Say both; never overpromise.
+    echo "  first install this session -> press Super+I now"
+    echo "  reinstall over a loaded copy -> log out and back in once"
     NEEDS_RELOGIN="no"
 else
     # The running shell has never scanned this directory (first install,
