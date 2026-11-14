@@ -1,4 +1,4 @@
-# Invertonator-rs worklog (sandbox-local, untracked)
+# Invertonator-rs worklog (repo-tracked project memory since alpha.18)
 
 ## Task 18 — alpha.17: extension import crash fix + installer enable fallback
 
@@ -97,8 +97,91 @@ v18. cargo toolchain absent (sandbox recycle) → Cargo.lock hand-synced
 Delivered: zip comment `Invertonator-rs bfb49b3 0.3.0-alpha.18`, mirror
 24 files byte-verified. Awaiting: user push + Super+I field report.
 
+### Field finding #5 — RESOLVED in alpha.19 (sandbox **4ba123c**)
+Journal: `ClutterShaderEffect has no property named 'shader-source'` → BOTH
+classic GLSL routes dead in GNOME 51. Research: gjs.guide "Port to GNOME 51"
+— Shell.GLSLEffect removed; Clutter.ShaderEffect takes GLSL from
+vfunc_get_static_snippet() -> Cogl.Snippet.set_replace(). Proven pattern
+copied from murat-cileli/gnome-shell-extension-shader-effects (whole-desktop
+GLSL, tested GNOME 48 + 51): dual-API effect (GLSLEffect ≤49 /
+ShaderEffect+snippet 50+), attach to Main.layoutManager.uiGroup (NOT
+global.stage), sample via auto-provided cogl_sampler0 (never re-declare).
+GLSL: `vec4 c = texture2D(cogl_sampler0, cogl_tex_coord_in[0].xy);
+cogl_color_out = vec4(1.0 - c.rgb, c.a);` (bare body, no main()).
+enable() journals effect base for one-line diagnostics.
+Delivered: zip `Invertonator-rs 4ba123c 0.3.0-alpha.19`, 24 files verified.
+Awaiting field report #2.
+
+### FIELD REPORT (alpha.19) — v1 CONFIRMED on GNOME 51
+User: "**inversion works no holes tho**". Fedora 45 / GNOME 51 / Wayland:
+Super+I flips the whole screen, compositor-level, post-render, web-invisible —
+parity with the Windows Magnifier backend achieved. "No holes" = expected:
+Linux v1 is global inversion by design; true-color holes are the v2 milestone
+and are now UNBLOCKED — the alpha.19 effect machinery (dual-API effect class,
+snippet GLSL, per-actor attach) is exactly the plumbing v2 needs (apply the
+effect per-window-actor + pointer-pick exemption = F7 analog).
+Awaiting: one-line protocol completion (crisp / flicker / reboot persistence).
+NEXT: alpha.20 = Linux v2 true-color holes — USER GO received
+("lets goon v2"). See Task 19.
+
 CONFIRMED: alpha.17 pushed — user-side SHA **f86bfa5** (308b0cb..f86bfa5 → main;
 sandbox tree 11239ef byte-identical, 8-file delta as predicted). install.sh printed
 **"enabled LIVE"** — but see finding #3: that only whitelisted; the module stayed
 cached-failed from the alpha.16 ERROR, so a relogin was still required. Awaiting
 field report: Super+I invert / text crisp / flicker / State: ACTIVE.
+
+## Task 19 — alpha.20: Linux v2 true-color holes (F7 pierce)
+
+### Design (user go: "lets goon v2", 2025-11)
+- Windows F7-pierce analog. Hole = the SAME inversion shader attached a SECOND
+  time to the picked Meta.WindowActor. Inversion is an involution (1−x): the
+  window is painted inverted by its own effect, then painted again by uiGroup's
+  global pass → TRUE COLOR. The hole IS the window: moves/resizes/fullscreen
+  follow automatically; zero rectangle tracking, zero overlay windows.
+  Clutter paints parent effects over the already-painted subtree, so uiGroup's
+  pass sees post-hole pixels — that ordering is the whole trick.
+- Alternative rejected: hole-rect uniforms in the global shader (per-effect
+  uniforms on the GNOME 51 snippet pipeline are unproven, and rect tracking is
+  exactly the complexity the actor approach deletes).
+- Note: this works on GNOME X11 sessions too (same actor path) — no
+  XComposite/XShm needed for GNOME; the X11 design stays for the raw binary.
+  KWin/KDE backend unchanged on roadmap.
+- UX contract: F7 = toggle hole on TOPMOST window under pointer (schema key
+  toggle-pierce, default ['<F7>'], rebindable); F7 with inversion off =
+  notification, no-op; inversion OFF clears all holes (else the hole window
+  would be the only inverted thing on screen); panel menu pierce/clear items;
+  indicator "Inversion: ON · N holes"; Main.notify confirms each pierce with
+  window title; window closed with hole on → 'destroy' drops the map entry.
+- Topmost pick: frame-rect hit-test over global.get_window_actors()
+  (minimized / !showing_on_its_workspace filtered), last hit wins; wrapped in
+  sort_windows_by_stacking() when available (try/catch fallback). Journal logs
+  wm_class + title per pierce for one-shot forensics.
+- Deliberately NOT in alpha.20 (scope discipline, one variable per round):
+  AT-SPI2 auto-media holes (UIA analog) → v2.1 (auto-pierce known player
+  wm_classes: mpv, totem, vlc, celluloid...); hover-live preview → later.
+
+### Implementation (sandbox, alpha.20)
+- extension.js: Indicator +pierce/clear menu items, setState(inverted, holes);
+  Extension: _holes Map (Meta.Window → {actor, mw, effect, destroyId}),
+  _addBinding helper (both bindings, separate journal per binding), pierce(),
+  clearHoles(), _addHole()/_removeHole(), setInverted(false) clears holes,
+  disable() removes 'toggle-pierce' + drops map. Effect machinery untouched.
+- gschema: + toggle-pierce as ['<F7>']; gschemas.compiled recompiled in-sandbox
+  (glib-compile-schemas present). install.sh: F7 mentions in both echo paths.
+- metadata v20; Cargo.toml/common.rs/Cargo.lock → 0.3.0-alpha.20 (lock hand-
+  synced, cargo toolchain absent again post-recycle; CI builds fresh).
+  README: status headline, platform matrix row → ✅ v2 shipped, roadmap,
+  hole-transience note. node --check (ESM) on extension.js: SYNTAX OK.
+- Delivered: zip `Invertonator-rs <sha> 0.3.0-alpha.20` + full mirror
+  byte-verified; APPLY.md rewritten (alpha.20 test protocol, 8 steps).
+- Awaiting field report #3: pierce on a real player (mpv/Firefox/totem),
+  overlap behavior, drag-follow, clear-all, invert-off auto-clear.
+
+### Risk table for round 6 (pre-registered branches, journal decides)
+- hole ON logged, NO visual change → effect on Meta.WindowActor no-ops
+  (offscreen/shadow path) → attach to actor.get_surface() (texture actor)
+  instead of the WindowActor.
+- hole lands on the WRONG window on overlap → sort_windows_by_stacking
+  direction flipped → take sorted[0].
+- F7 swallowed (laptop media row) → rebind via gsettings; panel item covers.
+- JS ERROR on F7 → paste decides; vfuncs untouched (alpha.19-proven).

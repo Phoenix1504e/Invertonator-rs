@@ -40,6 +40,7 @@ if gnome-extensions enable "$UUID" 2>/dev/null; then
     # restart. Say both; never overpromise.
     echo "  first install this session -> press Super+I now"
     echo "  reinstall over a loaded copy -> log out and back in once"
+    echo "  holes: invert first (Super+I), then F7 over a window"
     NEEDS_RELOGIN="no"
 else
     # The running shell has never scanned this directory (first install,
@@ -92,10 +93,12 @@ fi
 echo
 if [ "$NEEDS_RELOGIN" = "yes" ]; then
     echo "LAST STEP: log out and log back in ONCE (Wayland only loads new"
-    echo "extensions at login). Afterwards Super+I toggles inversion and a"
-    echo "brightness icon appears in the top-right panel."
+    echo "extensions at login). Afterwards Super+I toggles inversion, F7 punches"
+    echo "a true-color hole into the window under the pointer, and a brightness"
+    echo "icon appears in the top-right panel."
 else
     echo "Press Super+I (or use the panel indicator) to invert."
+    echo "Holes: F7 over a window while inverted."
 fi
 echo
 echo "uninstall: gnome-extensions disable $UUID && rm -rf '$DEST'"

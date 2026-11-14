@@ -1,37 +1,36 @@
-# Invertonator-rs — Full Source Package (v0.3.0-alpha.19, snippet-based inversion)
+# Invertonator-rs — Full Source Package (v0.3.0-alpha.20, Linux v2 holes)
 
 Complete repo at a fixed state — extract over your clone, commit, push.
 No `.git` inside, your history is untouched.
 
 ---
 
-## What alpha.19 fixes (your latest report)
+## What alpha.20 adds (your "no holes tho")
 
-> Journal: `object class 'ClutterShaderEffect' has no property named
-> 'shader-source'`
+Linux v2 true-color holes are IN. Global inversion (alpha.19) is
+untouched; on top of it:
 
-GNOME 51 gutted BOTH classic ways of handing GLSL to `Clutter.ShaderEffect`
-— the `set_shader_source()` method (alpha.17's failure) AND the
-`shader-source` property (alpha.18's failure). The official "Port
-Extensions to GNOME Shell 51" guide confirms the new contract: GLSL now
-comes from a `Cogl.Snippet` returned by `vfunc_get_static_snippet()`
-(`Shell.GLSLEffect` was removed in the same sweep).
+- **F7 pierce** — hover any window (video player, image viewer,
+  whatever) and press **F7**: that window pops to TRUE COLOR while
+  everything around it stays inverted. Press F7 over the same window
+  again → hole closed. A notification confirms each pierce with the
+  window title ("Hole ON: mpv" / "Hole OFF: ...").
+- Mechanism: the hole is the SAME inversion shader attached a SECOND
+  time, to that window's actor. Inversion is an involution (1 − x), so
+  the window is inverted twice = original colors. The hole IS the
+  window — dragging, resizing, fullscreening all follow automatically.
+  No rectangle tracking, no overlay windows, nothing for a page to see.
+- Panel menu got two items: "Pierce window under pointer (F7)" and
+  "Clear all holes"; the indicator shows `Inversion: ON · N holes`.
+- Turning inversion OFF clears every hole automatically (a lone hole
+  would be the only inverted thing on screen) — re-pierce after
+  toggling back on.
+- F7 grabbed by your keyboard's media row? Rebind:
+  `gsettings set org.gnome.shell.extensions.invertonator toggle-pierce "['<Super>h']"`
 
-alpha.19 adopts the full proven pattern — copied from an extension that
-ships whole-desktop GLSL effects and is TESTED on GNOME 48 + 51 Wayland:
-
-- dual-API effect class: `Shell.GLSLEffect` (≤49) vs
-  `Clutter.ShaderEffect` + snippet (50+), so shell-version 45–51 is
-  genuinely covered, not just tolerated;
-- effect attached to `Main.layoutManager.uiGroup` (the tree holding
-  windows, wallpaper and panel) instead of `global.stage` — the
-  whole-desktop target that pattern uses;
-- texture sampled via `cogl_sampler0` (auto-provided by Cogl — never
-  re-declared);
-- enable() journal now prints which effect base was chosen, so the next
-  report pins the API in one line.
-
-alpha.18 kept: install.sh honesty lines, zip-freshness gate below.
+Known v2 scope: holes are MANUAL (your pick). The Windows UIA
+auto-media-hole analog (AT-SPI2 discovery) is v2.1 — trivial once this
+round is field-proven.
 
 Windows side: untouched (alpha.15 code, version bump only).
 
@@ -46,8 +45,8 @@ The filename is the SAME across versions. An older download in
 unzip -z ~/Downloads/Invertonator-rs-full-source.zip
 ```
 
-It must print **`Invertonator-rs <sha> 0.3.0-alpha.19`**. If it
-prints alpha.18 or older, re-download the zip from the chat first.
+It must print **`Invertonator-rs <sha> 0.3.0-alpha.20`**. If it
+prints alpha.19 or older, re-download the zip from the chat first.
 
 ## Apply on Fedora — paste this whole block
 
@@ -58,7 +57,7 @@ git reset --hard origin/main && \
 unzip -o ~/Downloads/Invertonator-rs-full-source.zip -d . && \
 git status --short && \
 git add -A && \
-git commit -m "alpha.19: snippet-based inversion (GNOME 51 ShaderEffect API) + uiGroup attach" && \
+git commit -m "alpha.20: Linux v2 — F7 pierce true-color holes (per-window double-invert)" && \
 git push origin HEAD && \
 bash shell-extension/install.sh
 ```
@@ -74,23 +73,29 @@ bash shell-extension/install.sh
 
 Then **log out and log back in**. You are REINSTALLING over a copy the
 running shell already executes, and Wayland cannot hot-reload extension
-code — the logout guarantees the new module actually runs. (On a
-brand-new install with the shell still in ERROR state, a live enable
-does re-import — but never gamble; the logout is 20 seconds.)
+code — the logout guarantees the new module actually runs.
 
 After login: brightness icon in the top-right panel → **Super+I** flips
-the whole screen.
+the whole screen, **F7** pierces a hole into whatever window the pointer
+is over.
 
-## Test protocol (2 minutes)
+## Test protocol (3 minutes)
 
-1. `gnome-extensions info invertonator@phoenix1504e` → **Version: 19**, State: ACTIVE.
-2. Super+I inverts instantly; text stays perfectly crisp.
-3. Toggle off/on a few times — no flicker.
-4. YouTube plays inverted (expected — global inversion is v1; true-color
-   holes are the v2 milestone).
-5. Reboot with inversion ON → session comes back inverted.
+1. `gnome-extensions info invertonator@phoenix1504e` → **Version: 20**, State: ACTIVE.
+2. Super+I → whole screen inverts (alpha.19 behavior, unchanged).
+3. Hover your video player → **F7** → the player pops to true color,
+   everything around it stays inverted; notification "Hole ON: ...".
+4. F7 again over the same window → hole closes ("Hole OFF").
+5. With a hole open: drag the player around → the hole follows (it IS
+   the window). A window stacked ABOVE the hole stays inverted —
+   correct: the hole belongs to that window's pixels only.
+6. Panel indicator shows `Inversion: ON · 1 hole`; "Clear all holes"
+   empties the set.
+7. Super+I off → holes clear automatically (indicator back to OFF).
+8. F7 while inversion is OFF → notification "Turn inversion on first".
 
-Report back ONE line: state + invert + crisp + flicker (+ `gnome-shell --version`).
+Report back ONE line: state + invert + pierce (which player) + anything
+odd (+ `gnome-shell --version`).
 
 If anything is off:
 
@@ -106,23 +111,23 @@ journalctl --user -b --no-pager | grep -iE 'invertonator|JS ERROR' | tail -30
 cd C:\Users\admin\invertonator-push
 Expand-Archive -Path "$env:USERPROFILE\Downloads\Invertonator-rs-full-source.zip" -DestinationPath . -Force
 git add -A
-git commit -m "alpha.19: snippet-based inversion (GNOME 51 ShaderEffect API) + uiGroup attach"
+git commit -m "alpha.20: Linux v2 — F7 pierce true-color holes (per-window double-invert)"
 git push origin HEAD
 ```
 
 Verify: first line of `%LOCALAPPDATA%\Invertonator\log.txt` must read
-`=== Invertonator-rs v0.3.0-alpha.19 ===`. Windows behavior is
+`=== Invertonator-rs v0.3.0-alpha.20 ===`. Windows behavior is
 alpha.15-identical; its test protocol and Desktop diagnostics still apply.
 
 ---
 
-## File map (23 files, latest state)
+## File map (24 files, latest state)
 
 ```
 .github/workflows/build.yml  CI: windows+ubuntu artifacts + GNOME extension bundle
 .gitignore                   /target, *.exe — keep, protects your clone
 APPLY.md                     this file
-Cargo.toml                   0.3.0-alpha.19 (windows+linux deps)
+Cargo.toml                   0.3.0-alpha.20 (windows+linux deps)
 Cargo.lock                   pinned
 Invertonator-rs-v0.2.0-alpha.2.exe  legacy artifact (safe to git rm)
 LICENSE                      MIT
@@ -142,11 +147,12 @@ src/scrollhook.rs            low-level wheel hook (scroll-hold, page-dirty)
 src/linux.rs                 X11 XRandR gamma inversion + --self-test +
                              Wayland session awareness
 shell-extension/install.sh                       installer + gsettings enable fallback
-shell-extension/invertonator@phoenix1504e/metadata.json    uuid, v19, shells 45–51
+shell-extension/invertonator@phoenix1504e/metadata.json    uuid, v20, shells 45–51
 shell-extension/invertonator@phoenix1504e/extension.js     compositor shader inversion
                                                            (Cogl.Snippet / dual-API effect,
                                                            uiGroup attach), Super+I,
-                                                           panel indicator
+                                                           F7 pierce holes, panel indicator
 shell-extension/invertonator@phoenix1504e/schemas/org.gnome.shell.extensions.invertonator.gschema.xml
 shell-extension/invertonator@phoenix1504e/schemas/gschemas.compiled
+worklog.md                   project memory: tasks, field findings, SHA chain
 ```

@@ -4,7 +4,12 @@
 
 ![Invertonator](icon.svg)
 
-> **Status: v0.3.0-alpha.19** — GNOME extension inversion that finally
+> **Status: v0.3.0-alpha.20 — Linux v2 holes SHIPPED (GNOME/Wayland)**:
+> F7 pierces a true-color hole into the window under the pointer while
+> everything around it stays inverted — the Windows F7-pierce analog,
+> built as a second inversion pass on the picked window actor (double
+> inversion = true color; drag/resize/fullscreen follow automatically).
+> alpha.19 baseline: GNOME extension inversion that finally
 > matches GNOME 51's shader API. Field-proven chain: alpha.16's ESM
 > default-import crash → fixed in 17 (canonical `import * as Main`);
 > alpha.17 revealed `set_shader_source()` is gone in GNOME 51; alpha.18
@@ -15,7 +20,11 @@
 > GNOME 48 + 51: dual-API effect class (`Shell.GLSLEffect` ≤49 /
 > `Clutter.ShaderEffect`+snippet 50+), attached to
 > `Main.layoutManager.uiGroup` (windows + wallpaper + panel), texture via
-> auto-provided `cogl_sampler0`.
+> auto-provided `cogl_sampler0`. alpha.20 builds v2 on that machinery:
+> the hole is the same effect attached twice (involution), toggled by
+> F7 (`toggle-pierce`, rebindable via gsettings), with panel-menu pierce
+> /clear items and hole-count in the indicator; holes clear when
+> inversion goes off; AT-SPI2 auto-media discovery is v2.1.
 > alpha.18 kept: install.sh honesty lines + APPLY zip-freshness gate.
 > alpha.16 kept: GNOME/Wayland backend shipped (compositor-level
 > fragment-shader stage inversion, Super+I, panel indicator, reboot
@@ -63,13 +72,15 @@
 |---|---|---|---|
 | Windows 10+ | Magnifier API (compositor) | ✅ UIA tracker | `Ctrl+Alt+F5` invert · `F6` mode · `F7` pierce · `F2` quit |
 | Linux (X11) | XRandR CRTC gamma | 🚧 v2 (XComposite overlay) — media inverts too for now | `Ctrl+Alt+I` toggle · `Ctrl+Alt+Q` quit |
-| Linux (GNOME/Wayland) | Shell extension — compositor shader | 🚧 v2 (per-window-actor inversion + picked hole) | `Super+I` toggle · panel menu |
+| Linux (GNOME/Wayland) | Shell extension — compositor shader | ✅ **v2 shipped** — F7 pierce (window under pointer); AT-SPI2 auto-media = v2.1 | `Super+I` invert · `F7` pierce · panel menu |
 | Linux (KDE/Wayland) | KWin's built-in Invert effect | ❌ | user-bound |
 | macOS | ❌ unsupported | ❌ | — |
 
 If a Linux X11 run is killed while inverted, the ramp persists until you
 run `invertonator --restore` (pushes identity ramps and exits). The
-Wayland extension restores colors automatically on disable/quit.
+Wayland extension restores colors automatically on disable/quit. GNOME
+holes are session-transient: toggling inversion off clears them —
+re-pierce with F7.
 
 No Linux box of your own? Run `invertonator --self-test` on any Linux
 machine — it prints a paste-back diagnostic report (session type, gamma
@@ -215,8 +226,8 @@ Tor Browser) cannot detect it — there is nothing in the web layer to detect.
 - **v0.3** — event-driven UIA (instant discovery), auto-Dim on video,
   Firefox support
 - **v2.0** — Linux true-color holes (X11 XComposite overlay · GNOME/Wayland
-  per-window-actor inversion with a picked un-inverted window), AT-SPI2
-  discovery
+  per-window-actor inversion with a picked un-inverted window — **GNOME
+  side shipped as alpha.20 F7 pierce**), AT-SPI2 discovery
 - **research** — compositor-level video handling, other Wayland compositors
 
 ## Credits & thanks
