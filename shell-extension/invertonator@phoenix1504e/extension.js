@@ -27,17 +27,28 @@
 //   F7 analog) un-inverted — the Wayland analog of the Windows
 //   Magnifier holes and the X11 XComposite overlay design.
 //
-// Tested against the GNOME 45-49 extension API surface (ESM imports,
+// Tested against the GNOME 45-51 extension API surface (ESM imports,
 // Extension.getSettings, Main.wm.addKeybinding, PanelMenu.Button).
+//
+// IMPORT STYLE — CRITICAL, this bit us in alpha.16: the shell's ui
+// modules (main.js, panelMenu.js, popupMenu.js) export NAMED bindings
+// only — they have NO default export. The canonical ESM template
+// imports them with `import * as Main from ...`. A default import dies
+// at module load with:
+//   SyntaxError: The requested module 'resource:///org/gnome/shell/ui/main.js'
+//   doesn't provide an export named: 'default'
+// and the extension never reaches enable() (State: ERROR, no icon, no
+// hotkey). gi:// namespaces (Clutter, St, ...) DO have default exports
+// and are imported plain.
 
 import Clutter from 'gi://Clutter';
 import GObject from 'gi://GObject';
 import St from 'gi://St';
 import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
-import Main from 'resource:///org/gnome/shell/ui/main.js';
-import PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
-import PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
+import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
+import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 
 const SCHEMA = 'org.gnome.shell.extensions.invertonator';
@@ -51,9 +62,14 @@ void main() {
 `;
 
 function makeInvertEffect() {
-    const effect = new Clutter.ShaderEffect({
-        shader_type: Clutter.ShaderType.FRAGMENT_SHADER,
-    });
+    // GJS has spelled the shader-type enum both ways across Clutter
+    // versions (ShaderEffectType / ShaderType) — resolve whichever this
+    // shell actually ships; omit the property entirely if neither does
+    // (the GObject default is the fragment stage anyway).
+    const FRAG = (Clutter.ShaderEffectType && Clutter.ShaderEffectType.FRAGMENT_SHADER) ??
+                 (Clutter.ShaderType && Clutter.ShaderType.FRAGMENT_SHADER);
+    const params = FRAG !== undefined ? { shaderType: FRAG } : {};
+    const effect = new Clutter.ShaderEffect(params);
     effect.set_shader_source(INVERT_FRAGMENT);
     return effect;
 }

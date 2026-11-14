@@ -4,32 +4,27 @@
 
 ![Invertonator](icon.svg)
 
-> **Status: v0.3.0-alpha.16** — Linux cooking release. **GNOME/Wayland is now a
-> supported platform:** modern Fedora (43+) ships GNOME with the X11 session
-> REMOVED — no "GNOME on Xorg" login option exists — and Mutter silently
-> discards XWayland gamma writes, so the gamma-ramp binary can never work
-> there. The new backend is a bundled **GNOME Shell extension**
-> (`shell-extension/`, plain JS, installed by `shell-extension/install.sh`):
-> a fragment-shader effect (`1.0 - color`) applied to the compositor's
-> stage — inversion happens INSIDE gnome-shell, strictly after every app
-> and its web content rendered, so the web layer cannot detect it (same
-> anti-detection property as the Windows Magnifier and X11 gamma
-> backends). Super+I toggles, a panel indicator shows the state, the
-> state survives reboots (`start-enabled`), and the binding is
-> reconfigurable via gsettings. The X11 binary gained session awareness:
-> it now refuses with actionable guidance on a Wayland-only session and
-> warns through the XWayland path instead of failing silently. CI now
-> ships `Invertonator-gnome-extension-latest` next to the binaries.
-> Wayland true-color holes (per-window-actor inversion with a picked
-> un-inverted window) are the v2 milestone.
-> alpha.15 kept (Windows): ANTI-FLAP HYSTERESIS for "a random square
-> comes and goes in the center of the screen": the publish path no longer
-> mirrors trusted-walk output 1:1 — a brand-new rect needs two consecutive
-> trusted sightings to show (fresh pages and wake walks still show
-> instantly), and a rect one walk stopped seeing is kept for one missed
-> walk before it hides. Matching is geometric (intersection ≥ 50% of the
-> smaller rect); telemetry `hyst_saves` / `hyst_held` in the diagnostics
-> report.
+> **Status: v0.3.0-alpha.17** — GNOME extension hotfix. alpha.16's extension
+> failed to LOAD on every GNOME version — journal fingerprint:
+> `SyntaxError: The requested module 'resource:///org/gnome/shell/ui/main.js'
+> doesn't provide an export named: 'default'`. The shell's ui modules
+> (main.js, panelMenu.js, popupMenu.js) export NAMED bindings only and have
+> NO default export; the canonical ESM template imports them as
+> `import * as Main`. All three imports fixed (extension now reaches
+> enable(): State ACTIVE, panel icon, Super+I), and the ShaderEffect
+> constructor property moved to the canonical camelCase `shaderType`.
+> install.sh no longer silently skips enabling on a pre-login install: when
+> `gnome-extensions enable` cannot see the fresh extension it whitelists
+> the uuid in org.gnome.shell enabled-extensions via gsettings, so the next
+> login comes up ACTIVE with zero manual steps (alpha.16 field finding:
+> the pre-login enable was swallowed and the extension loaded DISABLED
+> forever).
+> alpha.16 kept: GNOME/Wayland backend shipped (compositor-level
+> fragment-shader stage inversion, Super+I, panel indicator, reboot
+> persistence) + X11 binary session awareness + CI extension artifact.
+> Windows alpha.15 kept: ANTI-FLAP HYSTERESIS for the center-square
+> flapping (show needs 2 trusted sightings, hide needs 2 absences,
+> geometric matching; `hyst_saves` / `hyst_held` telemetry).
 > alpha.14 kept: fail-open offscreen (IsOffscreen is a HINT — Chromium
 > flags visible media offscreen on some pages; the YouTube hole is
 > built from exactly the image-kind layers the old hard gate ate) and
