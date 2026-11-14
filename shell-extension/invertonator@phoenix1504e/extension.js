@@ -11,9 +11,12 @@
 //   Magnifier backend and the Linux X11 gamma backend provide:
 //   inversion strictly after rendering.
 //
-//   Mechanism (v1): Clutter.ShaderEffect on global.stage. Clutter
-//   renders the stage into an offscreen framebuffer and runs this
-//   fragment shader over it:
+//   Mechanism (v1.1): GLSL inversion attached to Main.layoutManager.uiGroup
+//   (the tree holding windows, wallpaper and panel — the whole-desktop
+//   target proven by murat-cileli/shader-effects on GNOME 48 + 51; the
+//   stage actor itself is special-cased by the compositor and its effect
+//   path proved unreliable). Cogl runs this over uiGroup's offscreen
+//   render:
 //
 //       cogl_color_out = vec4(1.0 - c.rgb, c.a)
 //
@@ -42,6 +45,7 @@
 // and are imported plain.
 
 import Clutter from 'gi://Clutter';
+import Cogl from 'gi://Cogl';
 import GObject from 'gi://GObject';
 import St from 'gi://St';
 import Meta from 'gi://Meta';
@@ -53,35 +57,49 @@ import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 
 const SCHEMA = 'org.gnome.shell.extensions.invertonator';
 
+// The inversion GLSL — a bare fragment BODY (no main()). Cogl's template
+// wraps it; `cogl_sampler0` is AUTO-PROVIDED by Cogl and must never be
+// re-declared (duplicate declaration = compile error). Texture access
+// incantation proven in murat-cileli/shader-effects on GNOME 48 + 51.
 const INVERT_FRAGMENT = `
-uniform sampler2D tex;
-void main() {
-    vec4 c = texture2D(tex, cogl_tex_coord_in[0].xy);
-    cogl_color_out = vec4(1.0 - c.rgb, c.a);
-}
+vec4 c = texture2D(cogl_sampler0, cogl_tex_coord_in[0].xy);
+cogl_color_out = vec4(1.0 - c.rgb, c.a);
 `;
 
+// Effect machinery — dual API, mirrors murat-cileli/shader-effects
+// (whole-desktop GLSL, tested GNOME 48 + 51):
+//   GNOME <=49: Shell.GLSLEffect, GLSL injected via vfunc_build_pipeline +
+//               add_glsl_snippet(..., is_replace=true)
+//   GNOME 50+ : Shell.GLSLEffect REMOVED (gjs.guide "Port to GNOME 51") —
+//               Clutter.ShaderEffect takes its GLSL from
+//               vfunc_get_static_snippet() -> Cogl.Snippet.set_replace().
+//               alpha.18 journal proved set_shader_source() AND the
+//               shader-source property are both gone in 51.
+const EffectBase = Shell.GLSLEffect ?? Clutter.ShaderEffect;
+
+class InvertonatorEffectImpl extends EffectBase {
+}
+
+if (Shell.GLSLEffect) {
+    Object.defineProperty(InvertonatorEffectImpl.prototype, 'vfunc_build_pipeline', {
+        value() {
+            this.add_glsl_snippet(Cogl.SnippetHook.FRAGMENT, '', INVERT_FRAGMENT, true);
+        },
+    });
+} else {
+    Object.defineProperty(InvertonatorEffectImpl.prototype, 'vfunc_get_static_snippet', {
+        value() {
+            const snippet = Cogl.Snippet.new(Cogl.SnippetHook.FRAGMENT, '', null);
+            snippet.set_replace(INVERT_FRAGMENT);
+            return snippet;
+        },
+    });
+}
+
+const InvertonatorEffect = GObject.registerClass(InvertonatorEffectImpl);
+
 function makeInvertEffect() {
-    // GJS has spelled the shader-type enum both ways across Clutter
-    // versions (ShaderEffectType / ShaderType) — resolve whichever this
-    // shell actually ships; omit the property entirely if neither does
-    // (the GObject default is the fragment stage anyway).
-    const FRAG = (Clutter.ShaderEffectType && Clutter.ShaderEffectType.FRAGMENT_SHADER) ??
-                 (Clutter.ShaderType && Clutter.ShaderType.FRAGMENT_SHADER);
-    const params = FRAG !== undefined ? { shaderType: FRAG } : {};
-    const effect = new Clutter.ShaderEffect(params);
-    // GNOME 51 field finding: GJS exposes NO set_shader_source() on
-    // ShaderEffect (TypeError) — the GLSL source is the GObject property
-    // "shader-source", stable since Clutter 1.10. Set it through the raw,
-    // always-available set_property() and read it back so a dropped
-    // property fails loudly in the journal instead of silently.
-    effect.set_property('shader-source', INVERT_FRAGMENT);
-    const got = effect.get_property('shader-source');
-    if (got !== INVERT_FRAGMENT) {
-        throw new Error('shader-source property did not stick (' +
-            (got === null ? 'null' : typeof got) + ')');
-    }
-    return effect;
+    return new InvertonatorEffect();
 }
 
 const Indicator = GObject.registerClass(
@@ -114,6 +132,8 @@ export default class InvertonatorExtension extends Extension {
 
         try {
             this._effect = makeInvertEffect();
+            console.log('Invertonator: effect ready (base=' +
+                (Shell.GLSLEffect ? 'Shell.GLSLEffect' : 'Clutter.ShaderEffect') + ')');
         } catch (e) {
             this._effect = null;
             console.error(
@@ -170,10 +190,11 @@ export default class InvertonatorExtension extends Extension {
             return;
         }
         try {
+            const group = Main.layoutManager.uiGroup;
             if (on) {
-                global.stage.add_effect(this._effect);
+                group.add_effect(this._effect);
             } else {
-                global.stage.remove_effect(this._effect);
+                group.remove_effect(this._effect);
             }
         } catch (e) {
             console.error(`Invertonator: effect toggle failed (${e})`);

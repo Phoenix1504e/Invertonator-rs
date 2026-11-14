@@ -1,41 +1,37 @@
-# Invertonator-rs — Full Source Package (v0.3.0-alpha.18, shader-source fix)
+# Invertonator-rs — Full Source Package (v0.3.0-alpha.19, snippet-based inversion)
 
 Complete repo at a fixed state — extract over your clone, commit, push.
 No `.git` inside, your history is untouched.
 
 ---
 
-## What alpha.18 fixes (your latest report)
+## What alpha.19 fixes (your latest report)
 
-> Journal: `Invertonator: shader effect could not be created
-> (TypeError: effect.set_shader_source is not a function)`
+> Journal: `object class 'ClutterShaderEffect' has no property named
+> 'shader-source'`
 
-alpha.17 proved the import fix works — module loads, enable() runs,
-indicator + Super+I all live (the journal showed every one of your
-keypresses). But GNOME 51's GJS bindings for `Clutter.ShaderEffect`
-do NOT expose `set_shader_source()` — so the effect object never got
-its GLSL, construction threw, and every toggle logged
-"no shader effect — cannot invert". That is why the screen refused
-to flip while everything else worked.
+GNOME 51 gutted BOTH classic ways of handing GLSL to `Clutter.ShaderEffect`
+— the `set_shader_source()` method (alpha.17's failure) AND the
+`shader-source` property (alpha.18's failure). The official "Port
+Extensions to GNOME Shell 51" guide confirms the new contract: GLSL now
+comes from a `Cogl.Snippet` returned by `vfunc_get_static_snippet()`
+(`Shell.GLSLEffect` was removed in the same sweep).
 
-The fix: the GLSL source is a GObject property — `shader-source`,
-stable since Clutter 1.10 — so alpha.18 sets it with the raw,
-always-available `set_property()` and reads it back; if the property
-ever disappears again, it fails loudly in the journal instead of
-silently.
+alpha.19 adopts the full proven pattern — copied from an extension that
+ships whole-desktop GLSL effects and is TESTED on GNOME 48 + 51 Wayland:
 
-Also shipped here:
+- dual-API effect class: `Shell.GLSLEffect` (≤49) vs
+  `Clutter.ShaderEffect` + snippet (50+), so shell-version 45–51 is
+  genuinely covered, not just tolerated;
+- effect attached to `Main.layoutManager.uiGroup` (the tree holding
+  windows, wallpaper and panel) instead of `global.stage` — the
+  whole-desktop target that pattern uses;
+- texture sampled via `cogl_sampler0` (auto-provided by Cogl — never
+  re-declared);
+- enable() journal now prints which effect base was chosen, so the next
+  report pins the API in one line.
 
-- install.sh honesty lines: a live enable re-imports on an
-  ERROR→enabled transition, but a REINSTALL over a loaded copy keeps
-  running the previous module until restart — the script now says
-  both instead of overpromising.
-- this file grew a zip-freshness gate (step 0 below) after the
-  `<path-to-zip>` placeholder incident: the filename is identical
-  across versions, so an old download would silently apply nothing.
-
-alpha.17 kept: canonical `import * as Main` ESM imports; install.sh
-whitelist fallback for pre-login installs.
+alpha.18 kept: install.sh honesty lines, zip-freshness gate below.
 
 Windows side: untouched (alpha.15 code, version bump only).
 
@@ -50,8 +46,8 @@ The filename is the SAME across versions. An older download in
 unzip -z ~/Downloads/Invertonator-rs-full-source.zip
 ```
 
-It must print **`Invertonator-rs <sha> 0.3.0-alpha.18`**. If it
-prints alpha.17 or older, re-download the zip from the chat first.
+It must print **`Invertonator-rs <sha> 0.3.0-alpha.19`**. If it
+prints alpha.18 or older, re-download the zip from the chat first.
 
 ## Apply on Fedora — paste this whole block
 
@@ -62,7 +58,7 @@ git reset --hard origin/main && \
 unzip -o ~/Downloads/Invertonator-rs-full-source.zip -d . && \
 git status --short && \
 git add -A && \
-git commit -m "alpha.18: shader source via GObject property (GNOME 51 has no set_shader_source) + installer honesty" && \
+git commit -m "alpha.19: snippet-based inversion (GNOME 51 ShaderEffect API) + uiGroup attach" && \
 git push origin HEAD && \
 bash shell-extension/install.sh
 ```
@@ -87,7 +83,7 @@ the whole screen.
 
 ## Test protocol (2 minutes)
 
-1. `gnome-extensions info invertonator@phoenix1504e` → **Version: 18**, State: ACTIVE.
+1. `gnome-extensions info invertonator@phoenix1504e` → **Version: 19**, State: ACTIVE.
 2. Super+I inverts instantly; text stays perfectly crisp.
 3. Toggle off/on a few times — no flicker.
 4. YouTube plays inverted (expected — global inversion is v1; true-color
@@ -110,12 +106,12 @@ journalctl --user -b --no-pager | grep -iE 'invertonator|JS ERROR' | tail -30
 cd C:\Users\admin\invertonator-push
 Expand-Archive -Path "$env:USERPROFILE\Downloads\Invertonator-rs-full-source.zip" -DestinationPath . -Force
 git add -A
-git commit -m "alpha.18: shader source via GObject property (GNOME 51 has no set_shader_source) + installer honesty"
+git commit -m "alpha.19: snippet-based inversion (GNOME 51 ShaderEffect API) + uiGroup attach"
 git push origin HEAD
 ```
 
 Verify: first line of `%LOCALAPPDATA%\Invertonator\log.txt` must read
-`=== Invertonator-rs v0.3.0-alpha.18 ===`. Windows behavior is
+`=== Invertonator-rs v0.3.0-alpha.19 ===`. Windows behavior is
 alpha.15-identical; its test protocol and Desktop diagnostics still apply.
 
 ---
@@ -126,7 +122,7 @@ alpha.15-identical; its test protocol and Desktop diagnostics still apply.
 .github/workflows/build.yml  CI: windows+ubuntu artifacts + GNOME extension bundle
 .gitignore                   /target, *.exe — keep, protects your clone
 APPLY.md                     this file
-Cargo.toml                   0.3.0-alpha.18 (windows+linux deps)
+Cargo.toml                   0.3.0-alpha.19 (windows+linux deps)
 Cargo.lock                   pinned
 Invertonator-rs-v0.2.0-alpha.2.exe  legacy artifact (safe to git rm)
 LICENSE                      MIT
@@ -146,11 +142,11 @@ src/scrollhook.rs            low-level wheel hook (scroll-hold, page-dirty)
 src/linux.rs                 X11 XRandR gamma inversion + --self-test +
                              Wayland session awareness
 shell-extension/install.sh                       installer + gsettings enable fallback
-shell-extension/invertonator@phoenix1504e/metadata.json    uuid, v18, shells 45–51
-shell-extension/invertonator@phoenix1504e/extension.js     compositor shader
-                                                           inversion (GLSL set via
-                                                           shader-source property),
-                                                           Super+I, panel indicator
+shell-extension/invertonator@phoenix1504e/metadata.json    uuid, v19, shells 45–51
+shell-extension/invertonator@phoenix1504e/extension.js     compositor shader inversion
+                                                           (Cogl.Snippet / dual-API effect,
+                                                           uiGroup attach), Super+I,
+                                                           panel indicator
 shell-extension/invertonator@phoenix1504e/schemas/org.gnome.shell.extensions.invertonator.gschema.xml
 shell-extension/invertonator@phoenix1504e/schemas/gschemas.compiled
 ```

@@ -4,19 +4,19 @@
 
 ![Invertonator](icon.svg)
 
-> **Status: v0.3.0-alpha.18** — GNOME extension shader fix. alpha.17's ESM
-> import fix proved out on Fedora 45 / GNOME 51 (module loads, enable()
-> runs, indicator + Super+I all fire — the journal showed every keypress),
-> but GNOME 51's GJS exposes NO `set_shader_source()` on Clutter.ShaderEffect
-> (journal fingerprint: `TypeError: effect.set_shader_source is not a
-> function`) — the effect was never created, so nothing inverted.
-> alpha.18 sets the GLSL through the GObject property `shader-source`
-> (stable since Clutter 1.10) with a read-back guard, and install.sh now
-> says honestly when a relogin is required after a reinstall.
-> alpha.17 kept: canonical `import * as Main` ESM imports (alpha.16's
-> default-import SyntaxError) + install.sh gsettings whitelist fallback
-> for pre-login installs (the pre-login enable was swallowed and the
-> extension loaded DISABLED forever).
+> **Status: v0.3.0-alpha.19** — GNOME extension inversion that finally
+> matches GNOME 51's shader API. Field-proven chain: alpha.16's ESM
+> default-import crash → fixed in 17 (canonical `import * as Main`);
+> alpha.17 revealed `set_shader_source()` is gone in GNOME 51; alpha.18
+> revealed the `shader-source` property is gone too; the official
+> "Port to GNOME 51" guide confirms the new contract — GLSL comes from a
+> `Cogl.Snippet` via `vfunc_get_static_snippet()`. alpha.19 adopts the
+> whole-desktop pattern proven by an extension shipping GLSL effects on
+> GNOME 48 + 51: dual-API effect class (`Shell.GLSLEffect` ≤49 /
+> `Clutter.ShaderEffect`+snippet 50+), attached to
+> `Main.layoutManager.uiGroup` (windows + wallpaper + panel), texture via
+> auto-provided `cogl_sampler0`.
+> alpha.18 kept: install.sh honesty lines + APPLY zip-freshness gate.
 > alpha.16 kept: GNOME/Wayland backend shipped (compositor-level
 > fragment-shader stage inversion, Super+I, panel indicator, reboot
 > persistence) + X11 binary session awareness + CI extension artifact.

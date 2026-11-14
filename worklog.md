@@ -78,6 +78,25 @@ narrowed to the effect path. Branch table (awaiting journal):
 - No Invertonator lines → module not loaded at all (revisit whitelist/relogin).
 Discipline: no blind patching until journal says which branch.
 
+### Field finding #3 — CORRECTED by journal (alpha.18 analysis)
+The 11:15:48 journal lines (alpha.17's own wording + "Invertonator 17 enabled")
+PROVE the live enable DID re-import the new module from disk on the
+ERROR→enabled transition — no cached-import problem. The stale Extensions-app
+dialog (alpha.16 SyntaxError) was the app's UI cache, cosmetic only.
+What still needs relogin: REINSTALL over an ACTIVE (loaded) copy — the shell
+doesn't hot-reload a working module. install.sh alpha.18 now says both.
+
+### Field finding #4 — CONFIRMED + FIXED in alpha.18 (sandbox **bfb49b3**)
+Journal branch: construction threw `TypeError: effect.set_shader_source is not
+a function` → effect=null → every toggle no-op. GNOME 51 GJS exposes NO
+set_shader_source(). FIX: set GLSL via GObject property 'shader-source'
+(stable since Clutter 1.10) with read-back guard. Plus: install.sh honesty
+lines, APPLY.md unzip -z freshness gate, versions → 0.3.0-alpha.18, metadata
+v18. cargo toolchain absent (sandbox recycle) → Cargo.lock hand-synced
+(single version line, zero dep changes; CI builds fresh).
+Delivered: zip comment `Invertonator-rs bfb49b3 0.3.0-alpha.18`, mirror
+24 files byte-verified. Awaiting: user push + Super+I field report.
+
 CONFIRMED: alpha.17 pushed — user-side SHA **f86bfa5** (308b0cb..f86bfa5 → main;
 sandbox tree 11239ef byte-identical, 8-file delta as predicted). install.sh printed
 **"enabled LIVE"** — but see finding #3: that only whitelisted; the module stayed
