@@ -91,16 +91,30 @@ The lines that decide auto holes:
 
 - `AT-SPI2 ready — media lock-on roles: image,video,animation` — the
   a11y import worked. Its absence means no element holes ever.
+- `event capture on via … (N/5 listeners)` — the free event-discovery
+  path registered (alpha.25 journals which AT-SPI API ran). Its
+  `OFF` variant means only the periodic walk can find media.
 - `toolkit-accessibility was OFF — set ON` — the extension enabled it;
   apps already running needed a restart to expose their trees.
+- `a11y cache keying: path|wrap` — alpha.25 probes for stable object
+  paths; `wrap` means best-effort caching (convergence still guaranteed
+  by the queue carry-over).
 - `no AT-SPI app for pid=… class="…"` — the focused window's app could
   not be matched (event capture still applies).
-- `a11y walk "app" calls=N media=K cache=…` — one per interesting walk;
-  `media=0` on a page you KNOW has images/videos is the number to report.
+- `a11y walk "app" calls=N media=K cache=… hits=… carried=… key=…
+  complete=…` — one per interesting walk; `media=0` on a page you KNOW
+  has images/videos is the number to report. `carried>0` shows the
+  alpha.25 carry-over at work; `complete=true` means the walk drained.
+- `a11y walk converging — queue=N media=M` — the walk is budget-limited
+  on a huge page and continues next tick (alpha.25); element holes
+  publish when it drains (typically seconds, big pages up to ~30s).
 - `media lock-on N rect(s) on M window(s) (kinds)` — rects published.
 - `rect bake "class" actor@(x,y) box=(…)` — the coordinate anchor of the
   first bake per app; if holes appear SHIFTED, this + a screenshot
   pinpoints the mapping bug.
+- `ALL N element rect(s) clipped during bake` — discovery found media
+  but every rect fell outside the paint box (paint-volume mismatch
+  signature); report this line — it decides the next fix.
 - `media rects (N) beat fullscreen hole — chrome re-inverts on "…"` and
   `auto-hole ON (fullscreen, no media nodes) "…"` — the priority swap
   and the native-player fallback doing their jobs.

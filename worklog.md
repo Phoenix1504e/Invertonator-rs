@@ -419,3 +419,27 @@ Delivered: zip `Invertonator-rs <sha> 0.3.0-alpha.23` + changed-files mirror byt
 | Everything green | windowed rects glue to media; fullscreen = video true + chrome inverted; native player = whole window | v2.3 quality pass done; next = pooling beyond 6, telemetry |
 
 Delivered: zip `Invertonator-rs <sha> 0.3.0-alpha.24` + changed-files mirror byte-verified.
+
+## Task 24 — alpha.25: walker convergence + event-API hardening (field round 10 follow-up)
+
+### Field report
+- USER: "still the holes are not automatic" — immediately after a session where the WINDOWS PowerShell apply block had been pasted into Fedora bash (`cd C:\Users\admin\invertonator-push` → no such file, `Expand-Archive: command not found`, git "nothing to commit / up-to-date" — the unzip/commit/push never ran). So alpha.24 was most likely never installed; the reply must lead with the version check (`gnome-extensions info` + `unzip -z` gate) and the correct LINUX block.
+- Sandbox audit found REAL alpha.24 weaknesses that would keep element holes from ever appearing even on a correct install — fixed before shipping alpha.25:
+
+### alpha.25 changes
+- CONVERGENCE (the big one): the walker queue now CARRIES OVER between ticks for the same target window. alpha.24 restarted the BFS from the roots every 3s walk; with the cache missing (wrapper identity unguaranteed, worklog R2) the same first ~480 nodes were re-explored forever and a video deep in a big web tree was NEVER reached. alpha.25: 480 fresh nodes per tick, `complete=true` publish when the queue finally drains (holes appear), starved walks journal a throttled "a11y walk converging — queue=N media=M" line so progress is visible in the field log.
+- RE-ROOT: tree-shape events (document:load-*, children-changed) set `reRoot`, which discards the carried queue at the end of the in-flight walk (a stale queue would otherwise keep walking the OLD page and never enqueue the new content). Slow-app aborts also reset the walk state.
+- CACHE KEYING: probed once on a real node — `get_path()` string keys when the GI surface exposes it (stable across D-Bus re-fetches), wrapper identity otherwise; journaled as `key=path|wrap` in every walk line. `hits=` added to the walk diag so cache effectiveness is measurable from the field.
+- EVENT API FALLBACK: registration tries `EventListener.add_callback(cb, type)` then `EventListener.new(cb)` + `listener.register(type)`; the used API and listener count are journaled ("event capture on via … (N/5 listeners)" / "event capture OFF"). Shutdown deregisters via remove_callback / deregister_callback / listener.deregister — all best-effort.
+- BAKE DIAG: when ALL rects clip out during bake (paint-volume-mismatch signature, risk R1), a one-shot per window class journals the box + actor origin and asks for the paste-back.
+- Versions: metadata 25, Cargo/common.rs 0.3.0-alpha.25. No schema, shader, or publish-priority changes — alpha.24's rect-shader rendering stands.
+
+### Risk table for round 11 (pre-registered)
+| Branch | Evidence in field | Verdict path |
+|---|---|---|
+| C1: user never installed alpha.24/25 (Windows block again) | `gnome-extensions info` Version < 25 or `unzip -z` gate mismatch | correct LINUX block, nothing else |
+| C2: convergence works, media found late | "a11y walk converging" lines → then "media lock-on N rect(s)" within ~15-30s on huge pages | acceptable; tune tick cadence if reported slow |
+| C3: tree never exposes media roles | walk lines show media=0 forever + event capture on; browser pages with obvious images | browser a11y disabled → document Chromium --force-renderer-accessibility / Firefox about:config parity; app-level, not fixable in-shell |
+| C4: no AT-SPI app match (pid/name) | "no AT-SPI app for pid=… class=…" one-shot | event capture covers; if also dead, out-of-process helper (R4 path) |
+| C5: bake-clip line appears | holes found but nothing punches | paint-volume anchor rework (R1 path) |
+| Everything green | windowed rects glue to media; fullscreen = video true + chrome inverted; native player = whole window | v2.3 converged; next = pooling beyond 6, telemetry |

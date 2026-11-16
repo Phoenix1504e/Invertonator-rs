@@ -4,7 +4,7 @@
 
 ![Invertonator](icon.svg)
 
-> **Status: v0.3.0-alpha.24 — Linux v2.3 media lock-on rework (GNOME/Wayland)**:
+> **Status: v0.3.0-alpha.25 — Linux v2.3.1 walker convergence (GNOME/Wayland)**:
 > **Super+F7** pierces a true-color hole into the window under the
 > pointer while everything around it stays inverted — the Windows
 > F7-pierce analog (plain F7 is browser-claimed — caret browsing — so
@@ -59,6 +59,17 @@
 > (alpha.11 evidence-rule analog); hung apps blacklisted 60s; pool cap
 > 6; `auto-hole-media` gsettings opt-out; toolkit-accessibility hint
 > journaled when app trees may be dormant.
+> alpha.25 WALKER CONVERGENCE (v2.3.1 — fixes "still the holes are not
+> automatic"): alpha.24's walk restarted from the tree top every 3s; with
+> a cache miss on big pages (GI wrapper identity unguaranteed) the same
+> first ~480 nodes were explored forever and media deeper in the tree was
+> never reached. alpha.25: the BFS queue carries over between ticks — 480
+> fresh nodes per tick, the walk drains in a few ticks, then holes publish;
+> tree-shape events force a re-root (stale queue can never keep walking the
+> old page); cache keys probe for stable object paths (journaled as
+> key=path|wrap); event capture registers via add_callback with an
+> instance-listener fallback and journals which API ran; a walk that
+> starved journals "a11y walk converging — queue=N media=M".
 > alpha.24 MEDIA LOCK-ON REWORK (v2.3 — fixes "auto hole doesn't work"):
 > alpha.23's rect holes were Clutter.Clone overlays whose translation
 > anchored the cloned window content at stage (0,0) — aligned only for
@@ -306,8 +317,13 @@ Tor Browser) cannot detect it — there is nothing in the web layer to detect.
   hole doesn't work"): rect-shader holes replacing the misaligned clone
   overlay, event-capture discovery, element rects beat the fullscreen
   auto-hole (whole-window hole = native player/game fallback),
-  toolkit-accessibility auto-enable, self-journaling swaps/fallbacks;
-  still queued: per-element pooling beyond 6, tracker telemetry
+  toolkit-accessibility auto-enable, self-journaling swaps/fallbacks
+- **v2.3.1** — **walker convergence shipped as alpha.25** (fixes "still
+  the holes are not automatic"): BFS queue carry-over between ticks (a
+  starved walk makes real progress instead of restarting), stable cache
+  keying with journaled mode, re-root on tree-shape events, event-API
+  fallback, bake-clip diagnostics; still queued: per-element pooling
+  beyond 6, tracker telemetry
 - **research** — compositor-level video handling, other Wayland compositors
 
 ## Credits & thanks

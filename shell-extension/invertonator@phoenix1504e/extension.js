@@ -309,6 +309,11 @@ export default class InvertonatorExtension extends Extension {
             holes: new Map(), lastWalk: 0, lastRefresh: 0,
             publishedCount: -1, hinted: false, eventCbs: [],
             diagWalkTs: 0, diagLastFound: -1, diag: new Set(),
+            // alpha.25 walker-convergence state: the BFS queue CARRIES OVER
+            // between ticks (progress every tick even when the cache never
+            // hits), cache keys probe for a stable identity, tree-shape
+            // events force a re-root.
+            cacheKeyMode: null, cacheHits: 0, carried: 0, reRoot: false,
         };
         this._focusId = 0;
 
@@ -818,6 +823,8 @@ export default class InvertonatorExtension extends Extension {
         const types = ['object:bounds-changed', 'object:state-changed:showing',
             'document:load-complete', 'document:load-stopped',
             'object:children-changed'];
+        let ok = 0;
+        let apiName = '';
         for (const t of types) {
             try {
                 // Callback shape is binding-dependent ((listener,event) vs
@@ -826,11 +833,31 @@ export default class InvertonatorExtension extends Extension {
                     const ev = args.find(a => a && a.source !== undefined) ?? null;
                     this._mediaOnEvent(t, ev);
                 };
-                m.atspi.EventListener.add_callback(cb, t);
-                m.eventCbs.push({ cb, t });
+                let listener = null;
+                try {
+                    m.atspi.EventListener.add_callback(cb, t);
+                    apiName = 'EventListener.add_callback';
+                } catch (e1) {
+                    // alpha.25: GI surfaces without the static callback
+                    // helper — instance listener + register() instead.
+                    listener = m.atspi.EventListener.new(cb);
+                    listener.register(t);
+                    apiName = 'EventListener.register';
+                }
+                m.eventCbs.push({ cb, t, listener });
+                ok++;
             } catch (e) {
                 console.warn(`Invertonator: AT-SPI event '${t}' unavailable (${e})`);
             }
+        }
+        // alpha.25: the capture path journals itself — a silent no-op here
+        // costs a whole field round (the F7 lesson).
+        if (ok === 0) {
+            console.warn('Invertonator: event capture OFF (no listener API) — ' +
+                'element holes rely on the periodic walk only');
+        } else {
+            console.log(`Invertonator: event capture on via ${apiName} ` +
+                `(${ok}/${types.length} listeners)`);
         }
     }
 
@@ -869,6 +896,9 @@ export default class InvertonatorExtension extends Extension {
         // Tree-shape events → full (budgeted, cached) walk; move events →
         // cheap extents-only refresh (the scroll-follow path).
         if (type.startsWith('document:') || type === 'object:children-changed') {
+            // alpha.25: the tree changed shape — any carried queue is stale
+            // (old page's nodes) and the new content must be re-rooted.
+            m.reRoot = true;
             if (now - m.lastWalk > MEDIA_WALK_MIN_MS) {
                 this._mediaScheduleWalk(60);
             }
@@ -925,6 +955,9 @@ export default class InvertonatorExtension extends Extension {
         m.walkActive = false;
         m.walkComplete = false;
         m.queue = [];
+        m.seen = null;
+        m.targetMw = null;
+        m.reRoot = false;
         m.eventHits.clear();
         this._mediaClearHoles();
     }
@@ -935,9 +968,17 @@ export default class InvertonatorExtension extends Extension {
             return;
         }
         this._mediaStop();
-        for (const { cb, t } of m.eventCbs) {
+        for (const { cb, t, listener } of m.eventCbs) {
+            // alpha.25: deregistration now covers both registration APIs —
+            // the static helper's counterpart and instance listener.
+            try {
+                m.atspi?.EventListener?.remove_callback?.(cb, t);
+            } catch (e) {}
             try {
                 m.atspi?.EventListener?.deregister_callback?.(cb, t);
+            } catch (e) {}
+            try {
+                listener?.deregister?.(t);
             } catch (e) {}
         }
         m.eventCbs = [];
@@ -1047,11 +1088,32 @@ export default class InvertonatorExtension extends Extension {
             // Nothing focused: element holes cannot belong anywhere — a
             // COMPLETE empty publish drops them and lets the fullscreen
             // fallback re-arm on fullscreen windows.
+            m.queue = [];
+            m.seen = null;
+            m.targetMw = null;
+            m.reRoot = false;
             this._mediaPublish(null, true);
             return;
         }
         m.walkActive = true;
         m.callBudget = MEDIA_WALK_BUDGET;
+        m.cacheHits = 0;
+        // alpha.25 CONVERGENCE: same target window → keep walking the
+        // carried-over queue instead of restarting from the roots. A
+        // budget-starved walk therefore makes REAL progress every tick
+        // (480 fresh nodes per tick) and eventually drains. alpha.24
+        // restarted from the top every walk: with a wrapper-keyed cache
+        // that never hits, the same first 480 nodes were re-explored
+        // forever and media deep in a big tree was NEVER reached.
+        const carrying = !m.reRoot && mw === m.targetMw &&
+            m.queue.length > 0;
+        m.reRoot = false;
+        if (carrying) {
+            m.carried = m.queue.length;
+            this._mediaWalkChunk();
+            return;
+        }
+        m.carried = 0;
         m.found = [];
         m.targetMw = mw;
         this._mediaResolveFrames(mw, (roots) => {
@@ -1198,12 +1260,30 @@ export default class InvertonatorExtension extends Extension {
             }
             roots.push({ acc: frame, cal: { k, ex, ey }, frameAcc: frame });
         }
+        // alpha.25: probe the cache-key identity ONCE on a real node. A
+        // stable object path beats wrapper identity (wrappers are not
+        // guaranteed to survive D-Bus re-fetches); when unavailable, the
+        // queue carry-over still guarantees the walk converges.
+        if (m.cacheKeyMode === null && roots.length > 0) {
+            let p = null;
+            try {
+                p = roots[0].acc.get_path?.();
+            } catch (e) {}
+            m.cacheKeyMode = (typeof p === 'string' && p.length > 0)
+                ? 'path' : 'wrap';
+            console.log(`Invertonator: a11y cache keying: ${m.cacheKeyMode}` +
+                (m.cacheKeyMode === 'path'
+                    ? ' (stable object paths — cache hits across walks)'
+                    : ' (wrapper identity — carry-over ensures convergence)'));
+        }
         done(roots);
     }
 
     // Budgeted, chunked BFS. Cached nodes cost ZERO D-Bus calls (role +
     // children reused from the previous walk — the Windows "cached walk"
-    // analog); only new nodes and live media extents pay.
+    // analog); only new nodes and live media extents pay. alpha.25: the
+    // queue carries over between ticks (see _mediaWalk), so a starved walk
+    // converges over consecutive ticks instead of restarting.
     _mediaWalkChunk() {
         const m = this._media;
         if (!m?.running || !m.walkActive) {
@@ -1216,9 +1296,10 @@ export default class InvertonatorExtension extends Extension {
                Date.now() - t0 < MEDIA_WALK_CHUNK_MS) {
             const { acc, cal, frameAcc } = m.queue.shift();
             m.seen.add(acc);
-            const cached = m.cache.get(acc);
+            const cached = m.cache.get(this._mediaCacheKey(acc));
             let role;
             if (cached) {
+                m.cacheHits++;
                 role = cached.role;
             } else {
                 try {
@@ -1265,7 +1346,8 @@ export default class InvertonatorExtension extends Extension {
                     if (m.cache.size > MEDIA_CACHE_CAP) {
                         m.cache.clear();
                     }
-                    m.cache.set(acc, { role, kids, ts: Date.now() });
+                    m.cache.set(this._mediaCacheKey(acc),
+                        { role, kids, ts: Date.now() });
                 }
                 for (const k of kids) {
                     if (!m.seen.has(k)) {
@@ -1280,6 +1362,8 @@ export default class InvertonatorExtension extends Extension {
             const pid = m.targetMw?.get_pid?.() ?? -1;
             m.slowApps.set(pid, Date.now());
             m.queue = [];
+            m.seen = null;
+            m.targetMw = null;
             m.walkActive = false;
             this._mediaPublish(null, false);   // keep holes; event captures only
             return;
@@ -1293,6 +1377,14 @@ export default class InvertonatorExtension extends Extension {
         } else {
             m.walkActive = false;
             m.walkComplete = m.queue.length === 0;
+            // alpha.25: a tree-shape event arrived mid-walk — the carried
+            // queue is stale; re-root on the next walk.
+            if (m.reRoot) {
+                m.queue = [];
+                m.seen = null;
+                m.targetMw = null;
+                m.reRoot = false;
+            }
             if (m.walkComplete) {
                 const entries = this._mediaEntriesFromFound();
                 this._mediaWalkDiag(entries.length);
@@ -1300,10 +1392,39 @@ export default class InvertonatorExtension extends Extension {
             } else {
                 // Budget starved mid-tree: publish event captures only and
                 // keep every existing hole — a wipe here would thrash the
-                // fullscreen fallback on huge trees.
+                // fullscreen fallback on huge trees. The queue CARRIES OVER
+                // (alpha.25) so the next tick continues deeper into the tree.
+                // Journal the convergence so silent starvation is visible.
+                const now = Date.now();
+                if (now - m.diagWalkTs > 8000) {
+                    m.diagWalkTs = now;
+                    console.log(`Invertonator: a11y walk converging — ` +
+                        `queue=${m.queue.length} carried=${m.carried} ` +
+                        `media=${m.found.length} ` +
+                        `calls=${MEDIA_WALK_BUDGET - m.callBudget} ` +
+                        `key=${m.cacheKeyMode ?? '?'}`);
+                }
                 this._mediaPublish(null, false);
             }
         }
+    }
+
+    // alpha.25: cache identity. GI wrappers are NOT guaranteed to be stable
+    // across D-Bus re-fetches; the object path is. The mode is probed once
+    // on a real node and journaled — when only wrapper keying is possible
+    // the queue carry-over still guarantees convergence.
+    _mediaCacheKey(acc) {
+        const m = this._media;
+        if (m.cacheKeyMode !== 'path') {
+            return acc;
+        }
+        try {
+            const p = acc.get_path?.();
+            if (typeof p === 'string' && p.length > 0) {
+                return p;
+            }
+        } catch (e) {}
+        return acc;
     }
 
     _mediaWalkDiag(found) {
@@ -1318,7 +1439,9 @@ export default class InvertonatorExtension extends Extension {
             a => a.pid === (m.targetMw?.get_pid?.() ?? -1));
         console.log(`Invertonator: a11y walk "${app?.name ?? '?'}" ` +
             `calls=${MEDIA_WALK_BUDGET - m.callBudget} media=${found} ` +
-            `cache=${m.cache.size}`);
+            `cache=${m.cache.size} hits=${m.cacheHits} ` +
+            `carried=${m.carried ?? 0} key=${m.cacheKeyMode ?? '?'} ` +
+            `complete=${m.walkComplete}`);
     }
 
     _mediaEntriesFromFound() {
@@ -1716,6 +1839,16 @@ export default class InvertonatorExtension extends Extension {
                 continue;
             }
             baked.push([nx0, ny0, nx1, ny1]);
+        }
+        if (rects.length > 0 && baked.length === 0) {
+            // alpha.25: every rect fell outside the paint box — that is the
+            // paint-volume-mismatch signature (worklog risk R1), not a
+            // discovery failure. Journal it once per window class.
+            this._mediaDiagOnce(`bake-clip:${mw.get_wm_class?.() ?? '?'}`,
+                `Invertonator: ALL ${rects.length} element rect(s) clipped ` +
+                `during bake (box=${box.x},${box.y},${box.w},${box.h} ` +
+                `actor@${ax},${ay}) — paint-volume mismatch suspected; ` +
+                'report this journal line');
         }
         return baked;
     }
