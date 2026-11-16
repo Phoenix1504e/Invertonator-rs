@@ -185,3 +185,62 @@ field report: Super+I invert / text crisp / flicker / State: ACTIVE.
   direction flipped → take sorted[0].
 - F7 swallowed (laptop media row) → rebind via gsettings; panel item covers.
 - JS ERROR on F7 → paste decides; vfuncs untouched (alpha.19-proven).
+
+### FIELD REPORT (alpha.20) #3 — v2 pierce CONFIRMED
+User: "**pierce made the whole window a hole tho it snaps on very accurately
+to that exact window**". Fedora 45 / GNOME 51 / Wayland: the double-invert
+hole on the picked Meta.WindowActor renders that EXACT window true color —
+pick accuracy + actor-level effect both proven (risk branches #1 and #2
+cleared without journal round-trip). Whole-window semantics = expected
+v2.0 scope; element-level video-only holes (Windows UIA analog) = AT-SPI2
+discovery = v2.1.
+- F7-vs-stale-module finding: first F7 test hit Firefox caret browsing —
+  live module was still alpha.19 (Version: 19 + old description in
+  `gnome-extensions info`; "No such schema" from plain gsettings CLI is
+  expected — extension schemas aren't in the CLI's scan path; the && chain
+  died there). Disk check + relogin resolved. LESSON: `gnome-extensions
+  info` reads the LIVE module — version there can lag disk after reinstall.
+Open protocol items: F7 direct post-relogin, drag-follow, overlap-above,
+clear-all, invert-off auto-clear. NEXT: alpha.21 = v2.1 AT-SPI2 auto-media
+holes (pending user go).
+
+## Task 20 — alpha.21: pierce hotkey → Super+F7 (browser-safe) + registration logging
+
+### Field report chain (alpha.20)
+- User: "**pierce made the whole window a hole tho it snaps on very accurately**"
+  (menu pierce = mechanism PROVEN) then "**the f7 honestly just goes directly
+  to the browser but the manual click button works**".
+- First F7 test during alpha.20 hit Firefox caret browsing — live module was
+  still alpha.19 (Version: 19 + old description in `gnome-extensions info`;
+  plain-gsettings "No such schema" is EXPECTED — extension schemas are not in
+  the CLI scan path). Disk check + relogin flipped the module to alpha.20.
+- With alpha.20 LIVE (menu pierce works), F7 STILL reaches Firefox ⇒
+  decisive deduction: Super+I is consumed by mutter, so the grab pipeline
+  works; a registered `toggle-pierce` would consume F7 before delivery.
+  It didn't ⇒ the unmodified-F7 registration/grab is the failure — and plain
+  F7 is browser-claimed (caret browsing) regardless, so a working grab would
+  still be a foot-gun. Journal paste never arrived; shipped full-branch
+  coverage instead (each branch either fixed or now self-logging).
+- Also field-observed: re-running an OLD scrollback apply block (alpha.6
+  commit message) → chain stops harmlessly at "nothing to commit, working
+  tree clean" → confirms && -chain guards stale blocks AND that user tree ==
+  zip tree (575514a user sha = 8b6bc44 sandbox tree).
+
+### alpha.21 changes (sandbox; awaiting push)
+- schema: toggle-pierce default `['<F7>']` → `['<Super>F7']` + description
+  documents WHY (browsers claim F7; unmodified-F7 grab doesn't consume).
+  gschemas.compiled recompiled; key presence verified in sandbox.
+- extension.js `_addBinding`: journals `keybinding '<name>' registered
+  (action=…, accel=…)` on success — silent misses are now impossible; a
+  failed get_strv (stale schema) throws INTO the same catch with the reason.
+- install.sh: post-compile verification loop — grep every hotkey key in the
+  installed gschemas.compiled, WARN loudly on absence.
+- metadata v21; Cargo trio → 0.3.0-alpha.21; README (status headline,
+  matrix hotkeys, alpha.21 hardening paragraph); install.sh echo lines →
+  Super+F7; APPLY.md rewritten (alpha.21 protocol includes the two
+  "registered" journal lines as the acceptance gate).
+- Delivered: zip `Invertonator-rs <sha> 0.3.0-alpha.21` + mirror byte-verified.
+- Risk table for round 7: registered-line absent → schema/source problem
+  (paste decides); registered with accel=["<Super>F7"] but Super+F7 no-op →
+  mutter grab failure on Super+F-keys (unprecedented; would demand journal);
+  everything green → v2.1 AT-SPI2 auto-media is next (user go pending).

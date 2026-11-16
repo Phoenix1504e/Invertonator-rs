@@ -201,13 +201,17 @@ export default class InvertonatorExtension extends Extension {
 
     _addBinding(name, handler) {
         try {
-            Main.wm.addKeybinding(
+            const action = Main.wm.addKeybinding(
                 name,
                 this._settings,
                 Meta.KeyBindingFlags.NONE,
                 Shell.ActionMode.ALL,
                 handler
             );
+            // alpha.21: registration now journals itself — a silent miss
+            // (alpha.20's F7) cost a whole field round to find.
+            console.log(`Invertonator: keybinding '${name}' registered ` +
+                `(action=${action}, accel=${JSON.stringify(this._settings.get_strv(name))})`);
         } catch (e) {
             console.error(`Invertonator: keybinding '${name}' failed (${e}) — ` +
                 'the panel menu still works');

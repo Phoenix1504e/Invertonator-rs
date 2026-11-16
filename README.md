@@ -4,11 +4,13 @@
 
 ![Invertonator](icon.svg)
 
-> **Status: v0.3.0-alpha.20 — Linux v2 holes SHIPPED (GNOME/Wayland)**:
-> F7 pierces a true-color hole into the window under the pointer while
-> everything around it stays inverted — the Windows F7-pierce analog,
-> built as a second inversion pass on the picked window actor (double
-> inversion = true color; drag/resize/fullscreen follow automatically).
+> **Status: v0.3.0-alpha.21 — Linux v2 holes SHIPPED (GNOME/Wayland)**:
+> **Super+F7** pierces a true-color hole into the window under the
+> pointer while everything around it stays inverted — the Windows
+> F7-pierce analog (plain F7 is browser-claimed — caret browsing — so
+> the default is browser-safe Super+F7), built as a second inversion
+> pass on the picked window actor (double inversion = true color;
+> drag/resize/fullscreen follow automatically).
 > alpha.19 baseline: GNOME extension inversion that finally
 > matches GNOME 51's shader API. Field-proven chain: alpha.16's ESM
 > default-import crash → fixed in 17 (canonical `import * as Main`);
@@ -22,9 +24,13 @@
 > `Main.layoutManager.uiGroup` (windows + wallpaper + panel), texture via
 > auto-provided `cogl_sampler0`. alpha.20 builds v2 on that machinery:
 > the hole is the same effect attached twice (involution), toggled by
-> F7 (`toggle-pierce`, rebindable via gsettings), with panel-menu pierce
-> /clear items and hole-count in the indicator; holes clear when
-> inversion goes off; AT-SPI2 auto-media discovery is v2.1.
+> Super+F7 (`toggle-pierce`, rebindable via gsettings — alpha.21 default
+> after field tests showed plain F7 falls through to browsers), with
+> panel-menu pierce/clear items and hole-count in the indicator; holes
+> clear when inversion goes off; AT-SPI2 auto-media discovery is v2.1.
+> alpha.21 hardening: keybinding registration journals itself (accel +
+> action id at enable) and install.sh verifies every hotkey key is in
+> the installed compiled schema.
 > alpha.18 kept: install.sh honesty lines + APPLY zip-freshness gate.
 > alpha.16 kept: GNOME/Wayland backend shipped (compositor-level
 > fragment-shader stage inversion, Super+I, panel indicator, reboot
@@ -72,7 +78,7 @@
 |---|---|---|---|
 | Windows 10+ | Magnifier API (compositor) | ✅ UIA tracker | `Ctrl+Alt+F5` invert · `F6` mode · `F7` pierce · `F2` quit |
 | Linux (X11) | XRandR CRTC gamma | 🚧 v2 (XComposite overlay) — media inverts too for now | `Ctrl+Alt+I` toggle · `Ctrl+Alt+Q` quit |
-| Linux (GNOME/Wayland) | Shell extension — compositor shader | ✅ **v2 shipped** — F7 pierce (window under pointer); AT-SPI2 auto-media = v2.1 | `Super+I` invert · `F7` pierce · panel menu |
+| Linux (GNOME/Wayland) | Shell extension — compositor shader | ✅ **v2 shipped** — Super+F7 pierce (window under pointer); AT-SPI2 auto-media = v2.1 | `Super+I` invert · `Super+F7` pierce · panel menu |
 | Linux (KDE/Wayland) | KWin's built-in Invert effect | ❌ | user-bound |
 | macOS | ❌ unsupported | ❌ | — |
 

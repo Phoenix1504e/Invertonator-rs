@@ -12,16 +12,18 @@
             "['&lt;Alt&gt;i']"</description>
         </key>
         <key name="toggle-pierce" type="as">
-            <default><![CDATA[['<F7>']]]></default>
+            <default><![CDATA[['<Super>F7']]]></default>
             <summary>Toggle a true-color hole on the window under the pointer</summary>
-            <description>F7 pierce analog of the Windows backend: the topmost
-            window under the pointer stops being inverted (it is inverted a
-            second time = double inversion = true color) while the rest of the
-            screen stays inverted. Press again over the same window to close
-            the hole; toggling inversion off clears every hole. Change with
-            gsettings:
+            <description>Pierce analog of the Windows backend: the topmost window
+            under the pointer stops being inverted (it is inverted a second time =
+            double inversion = true color) while the rest of the screen stays
+            inverted. Press again over the same window to close the hole; toggling
+            inversion off clears every hole. NOTE: plain F7 is deliberately NOT the
+            default — browsers claim F7 for caret browsing (Firefox/Chromium), and
+            field testing on GNOME 51 showed an unmodified F7 grab does not consume
+            the key. Super+F7 is browser-safe. Change with gsettings:
             gsettings set org.gnome.shell.extensions.invertonator toggle-pierce
-            "['&lt;Super&gt;h']"</description>
+            "['&lt;Super&gt;F7']"</description>
         </key>
         <key name="start-enabled" type="b">
             <default>false</default>

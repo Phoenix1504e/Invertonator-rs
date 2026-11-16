@@ -32,6 +32,17 @@ else
     echo "note: glib-compile-schemas not found — using the shipped precompiled schema"
 fi
 
+# alpha.21: a compiled schema missing a key silently kills that keybinding's
+# registration (addKeybinding throws; the menu keeps working, hotkeys die).
+# Verify every hotkey key really made it into the installed schema.
+for KEY in toggle-invert toggle-pierce start-enabled; do
+    if grep -aq "$KEY" "$DEST/schemas/gschemas.compiled"; then
+        echo "schema check: '$KEY' present"
+    else
+        echo "WARNING: '$KEY' MISSING from installed schema — its hotkey will not register" >&2
+    fi
+done
+
 if gnome-extensions enable "$UUID" 2>/dev/null; then
     echo "enabled LIVE — the running shell already knew the extension"
     # alpha.18 honesty rule: a live enable re-imports from disk when the
@@ -40,7 +51,7 @@ if gnome-extensions enable "$UUID" 2>/dev/null; then
     # restart. Say both; never overpromise.
     echo "  first install this session -> press Super+I now"
     echo "  reinstall over a loaded copy -> log out and back in once"
-    echo "  holes: invert first (Super+I), then F7 over a window"
+    echo "  holes: invert first (Super+I), then Super+F7 over a window"
     NEEDS_RELOGIN="no"
 else
     # The running shell has never scanned this directory (first install,
@@ -93,12 +104,12 @@ fi
 echo
 if [ "$NEEDS_RELOGIN" = "yes" ]; then
     echo "LAST STEP: log out and log back in ONCE (Wayland only loads new"
-    echo "extensions at login). Afterwards Super+I toggles inversion, F7 punches"
-    echo "a true-color hole into the window under the pointer, and a brightness"
-    echo "icon appears in the top-right panel."
+    echo "extensions at login). Afterwards Super+I toggles inversion, Super+F7"
+    echo "punches a true-color hole into the window under the pointer, and a"
+    echo "brightness icon appears in the top-right panel."
 else
     echo "Press Super+I (or use the panel indicator) to invert."
-    echo "Holes: F7 over a window while inverted."
+    echo "Holes: Super+F7 over a window while inverted."
 fi
 echo
 echo "uninstall: gnome-extensions disable $UUID && rm -rf '$DEST'"
