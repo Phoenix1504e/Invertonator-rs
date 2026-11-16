@@ -53,6 +53,7 @@
 //       — tabs are web content inside it. A hole covers whichever tab
 //       is showing and follows tab switches for free; the shell cannot
 //       tell tabs apart (that is web content inside one buffer).
+//       (alpha.24: element media rects BEAT this hole — see below.)
 //     * Hole survival: if Mutter recreates a window actor (remap paths),
 //       the hole reattaches to the new actor via an idle re-check;
 //       window close drops its hole cleanly (unmanaged safety net).
@@ -61,6 +62,22 @@
 //       never bypass the compositor shaders.
 //     * Pick includes override-redirect windows (context menus,
 //       tooltips) — pierce those too.
+//
+//   v2.2/2.3 media lock-on (alpha.23/24): element-level auto-holes.
+//   While inversion is on, the focused window's AT-SPI2 tree is searched
+//   for image/video/animation elements and EACH gets its own true-color
+//   rect — the rest of the screen stays inverted (the Windows UIA
+//   auto-media analog). alpha.24 rework: the hole is ONE shader per
+//   window whose GLSL bakes the rects as literal normalized coordinates
+//   and inverts only inside them. alpha.23's Clutter.Clone overlay was
+//   anchored at stage (0,0) — aligned only for windows already at the
+//   origin, shifted copies everywhere else (that is what "auto hole
+//   doesn't work" was); clones are gone. Discovery = budgeted cached
+//   tree walk + free AT-SPI event capture; element rects BEAT the
+//   fullscreen auto-hole (fullscreen browser: video true, chrome
+//   inverted) and the whole-window hole stays as the fallback for native
+//   players and games. Toolkit accessibility is switched on
+//   automatically (GTK3 apps need a restart to pick it up).
 //
 // Tested against the GNOME 45-51 extension API surface (ESM imports,
 // Extension.getSettings, Main.wm.addKeybinding, PanelMenu.Button).
@@ -91,20 +108,28 @@ import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 
 const SCHEMA = 'org.gnome.shell.extensions.invertonator';
 
-// v2.2 element media lock-on budgets (mirrors the Windows tracker's
+// v2.3 element media lock-on budgets (mirrors the Windows tracker's
 // cadence/evidence design — D-Bus calls cost main-loop time, so every
 // number here is a jank guard).
-const MEDIA_MAX_HOLES = 6;          // hole pool cap (Windows analog: pool)
-const MEDIA_MIN_EDGE = 48;          // icons/thumbnails stay inverted
-const MEDIA_WALK_INTERVAL_S = 3;    // cached-walk cadence
-const MEDIA_WALK_BUDGET = 240;      // max D-Bus calls per walk
-const MEDIA_WALK_CHUNK_MS = 8;      // max block per idle chunk
-const MEDIA_CACHE_CAP = 1200;       // cached subtree nodes
-const MEDIA_REFRESH_MIN_MS = 150;   // extents refresh throttle (scroll)
-const MEDIA_WALK_MIN_MS = 1200;     // min gap between full walks
-const MEDIA_APP_BLACKLIST_MS = 60000;// hung-app protection
-const MEDIA_SLOW_APP_MS = 1200;     // probe slower than this → blacklist
-const MEDIA_MATCH_DIST = 96;        // px — rect churn matching window
+const MEDIA_MAX_HOLES = 6;            // rect cap per window (Windows analog: pool)
+const MEDIA_MIN_EDGE = 48;            // icons/thumbnails stay inverted
+const MEDIA_WALK_INTERVAL_S = 3;      // cached-walk cadence
+const MEDIA_WALK_BUDGET = 480;        // max D-Bus calls per walk (alpha.24:
+                                      // 240 starved on real web trees — a
+                                      // YouTube page's a11y tree is thousands
+                                      // of nodes deep)
+const MEDIA_WALK_CHUNK_MS = 8;        // max block per idle chunk
+const MEDIA_CACHE_CAP = 1200;         // cached subtree nodes
+const MEDIA_REFRESH_MIN_MS = 150;     // extents refresh throttle (scroll)
+const MEDIA_WALK_MIN_MS = 1200;       // min gap between full walks
+const MEDIA_APP_BLACKLIST_MS = 60000; // hung-app protection
+const MEDIA_SLOW_APP_MS = 1200;       // probe slower than this → blacklist
+const MEDIA_REBAKE_DELTA_PX = 6;      // re-shader only when a rect moved this far
+const MEDIA_EVENT_PROBES_PER_SEC = 16;// event-source role probes per second cap
+const MEDIA_EVENT_HIT_CAP = 24;       // remembered event-captured elements
+const MEDIA_EVENT_HIT_TTL_MS = 60000; // stale event captures expire
+const MEDIA_FULLSCREEN_SYNC_MS = 1600;// let the first walk claim rects before
+                                       // the whole-window fallback fires
 
 // The inversion GLSL — a bare fragment BODY (no main()). Cogl's template
 // wraps it; `cogl_sampler0` is AUTO-PROVIDED by Cogl and must never be
@@ -149,6 +174,49 @@ const InvertonatorEffect = GObject.registerClass(InvertonatorEffectImpl);
 
 function makeInvertEffect() {
     return new InvertonatorEffect();
+}
+
+// v2.3 element-hole fragment: invert ONLY inside the baked rect literals
+// (normalized to the actor's paint-volume box). No uniforms — Cogl's GI
+// uniform surface is unreliable across GNOME versions; literals are not.
+// `cogl_sampler0` / `cogl_tex_coord_in` are Cogl-provided (see above).
+function buildRectFragment(rects) {
+    let body = 'vec4 c = texture2D(cogl_sampler0, cogl_tex_coord_in[0].xy);\n' +
+        'vec2 p = cogl_tex_coord_in[0].xy;\n' +
+        'float inside = 0.0;\n';
+    for (const r of rects) {
+        body += `if (p.x >= ${r[0].toFixed(6)} && p.y >= ${r[1].toFixed(6)} && ` +
+            `p.x <= ${r[2].toFixed(6)} && p.y <= ${r[3].toFixed(6)}) inside = 1.0;\n`;
+    }
+    body += 'cogl_color_out = vec4(mix(c.rgb, vec3(1.0) - c.rgb, inside), c.a);\n';
+    return body;
+}
+
+class MediaRectEffectImpl extends EffectBase {
+}
+
+if (Shell.GLSLEffect) {
+    Object.defineProperty(MediaRectEffectImpl.prototype, 'vfunc_build_pipeline', {
+        value() {
+            this.add_glsl_snippet(Cogl.SnippetHook.FRAGMENT, '', this._frag, true);
+        },
+    });
+} else {
+    Object.defineProperty(MediaRectEffectImpl.prototype, 'vfunc_get_static_snippet', {
+        value() {
+            const snippet = Cogl.Snippet.new(Cogl.SnippetHook.FRAGMENT, '', null);
+            snippet.set_replace(this._frag);
+            return snippet;
+        },
+    });
+}
+
+const MediaRectEffect = GObject.registerClass(MediaRectEffectImpl);
+
+function makeRectEffect(fragment) {
+    const effect = new MediaRectEffect();
+    effect._frag = fragment;
+    return effect;
 }
 
 const Indicator = GObject.registerClass(
@@ -226,15 +294,21 @@ export default class InvertonatorExtension extends Extension {
         this._fullscreenWatch = new Map();
         this._unredirectDisabled = false;
         this._windowCreatedId = 0;
-        // v2.2 element media lock-on — walker + rect-hole state
+        // v2.3 element media lock-on — walker + per-window rect-hole state.
+        // holes: Map Meta.Window -> {mw, actor, effect, rects[], nRects[],
+        //   destroyId, unmanagedId, sizeId} — ONE shader per window holding
+        //   up to MEDIA_MAX_HOLES baked rects.
         this._media = {
             atspi: null, roleMap: null, atspiFailed: false, initStarted: false,
             running: false, timerId: 0, walkTimerId: 0, walkScheduled: false,
-            chunkId: 0, focusTimerId: 0, walkActive: false, callBudget: 0,
+            chunkId: 0, eventPubId: 0, focusTimerId: 0, walkActive: false,
+            walkComplete: false, callBudget: 0,
             queue: [], seen: null, found: [], targetMw: null,
             apps: null, appsTs: 0, slowApps: new Map(), cache: new Map(),
-            holes: [], lastWalk: 0, lastRefresh: 0, publishedCount: -1,
-            hinted: false, eventCbs: [],
+            eventHits: new Map(), probeTs: 0, resizeTs: 0,
+            holes: new Map(), lastWalk: 0, lastRefresh: 0,
+            publishedCount: -1, hinted: false, eventCbs: [],
+            diagWalkTs: 0, diagLastFound: -1, diag: new Set(),
         };
         this._focusId = 0;
 
@@ -519,9 +593,14 @@ export default class InvertonatorExtension extends Extension {
     _refreshHoleUI() {
         this._indicator?.setState(
             this._inverted, this._holes ? this._holes.size : 0);
+        let mediaRects = 0;
+        if (this._media) {
+            for (const hole of this._media.holes.values()) {
+                mediaRects += hole.rects.length;
+            }
+        }
         this._indicator?.rebuildHoles(
-            this._holes ? this.listHoles() : [],
-            this._media ? this._media.holes.length : 0);
+            this._holes ? this.listHoles() : [], mediaRects);
     }
 
     // --- v2.1: fullscreen auto-hole (the video feature) -----------------
@@ -582,7 +661,11 @@ export default class InvertonatorExtension extends Extension {
         }
         const setting = !this._settings ||
             this._settings.get_boolean('auto-hole-fullscreen');
-        if (isFs && setting && !this._holes.has(mw)) {
+        // v2.3: element rects beat the whole-window hole — a fullscreen
+        // window whose media rects are already locked on keeps its chrome
+        // inverted; the whole-window hole is only the fallback.
+        if (isFs && setting && !this._holes.has(mw) &&
+            !(this._media?.holes?.has(mw))) {
             const title = mw.get_title?.() ?? 'window';
             this._addHole(actor, mw, true);
             console.log(`Invertonator: auto-hole ON (fullscreen) "${title}"`);
@@ -655,26 +738,44 @@ export default class InvertonatorExtension extends Extension {
         }
     }
 
-    // --- v2.2: element media lock-on (AT-SPI2 rect holes) ----------------
+    // --- v2.3: element media lock-on (AT-SPI2 rect holes) ----------------
     //
     // The Windows backend walks the foreground UIA tree and punches holes
-    // at media elements. The Wayland analog: walk the FOCUSED window's
-    // AT-SPI2 tree (image/video/animation roles), calibrate element
-    // extents against the window frame, and punch RECT holes — a clipped
-    // Clutter.Clone of the window actor carrying the invert effect. The
-    // clone is an IDENTITY overlay of the source (translation cancels the
-    // container position), so the math is invariant to the actor's scale
-    // factor; the container's clip alone selects the media rect, and the
-    // double-invert involution makes exactly that rect true color while
-    // everything else stays inverted. Inserted directly above the source
-    // window actor in window_group, so overlapping windows cover the hole
-    // (correct stacking semantics).
+    // at media elements. The Wayland analog, alpha.24 edition:
     //
-    // Evidence rules (alpha.11/14 analogs): holes belong to the focused
-    // window's tree (focus change = context gone → holes cleared), events
-    // (bounds-changed = scroll) refresh extents cheaply, full walks are
-    // budgeted/chunked so D-Bus never janks the shell, and a slow app is
-    // blacklisted for a minute.
+    //   RENDERING — ONE Clutter.ShaderEffect per target window whose GLSL
+    //   bakes the media rects as literal normalized coordinates: inside a
+    //   rect the window's pixels are inverted a second time, uiGroup's
+    //   pass re-inverts them (involution) → true color; everything else
+    //   stays once-inverted. The effect RIDES the window actor, so moving
+    //   the window moves its holes for free — no overlays, no clones, no
+    //   position tracking. Rects are normalized against the actor's
+    //   paint-volume box: exactly the bounds Cogl's offscreen texture
+    //   spans for this effect, so shadows/CSD margins cancel by
+    //   construction. (alpha.23's Clutter.Clone overlay translated the
+    //   cloned content to stage (0,0) — aligned only for windows AT the
+    //   origin, shifted window copies everywhere else. That is what "auto
+    //   hole doesn't work" was.)
+    //
+    //   DISCOVERY — budgeted, chunked BFS over the FOCUSED window's
+    //   AT-SPI2 tree (image/video/animation roles), PLUS free event-side
+    //   capture: AT-SPI events carry their source element, so media that
+    //   announces itself (bounds/showing storms when a player starts, on
+    //   page loads) is captured with ZERO walk budget and matched to a
+    //   window by rect containment — even when pid/name resolution fails.
+    //   A slow app is blacklisted for a minute; a budget-starved walk
+    //   never wipes holes (it only adds the event captures).
+    //
+    //   PRIORITY — element rects BEAT the fullscreen auto-hole: a
+    //   fullscreen browser with a detected video gets the video true and
+    //   chrome still inverted (the v2.2 request); windows whose tree
+    //   proves NO media on a complete walk keep the whole-window
+    //   fullscreen hole as the fallback (native players, games). Manual
+    //   Super+F7 holes beat everything.
+    //
+    //   EVIDENCE (Windows alpha.11/14 analogs): extents are always live
+    //   queries; walks are budgeted/chunked so D-Bus never janks the
+    //   shell; every swap, fallback and API miss journals itself.
 
     async _mediaInitAtspi() {
         const m = this._media;
@@ -719,7 +820,12 @@ export default class InvertonatorExtension extends Extension {
             'object:children-changed'];
         for (const t of types) {
             try {
-                const cb = () => this._mediaOnEvent(t);
+                // Callback shape is binding-dependent ((listener,event) vs
+                // (event)) — pick the argument that carries a source.
+                const cb = (...args) => {
+                    const ev = args.find(a => a && a.source !== undefined) ?? null;
+                    this._mediaOnEvent(t, ev);
+                };
                 m.atspi.EventListener.add_callback(cb, t);
                 m.eventCbs.push({ cb, t });
             } catch (e) {
@@ -728,12 +834,38 @@ export default class InvertonatorExtension extends Extension {
         }
     }
 
-    _mediaOnEvent(type) {
+    _mediaOnEvent(type, ev) {
         const m = this._media;
         if (!m?.running || !this._inverted) {
             return;
         }
         const now = Date.now();
+        // Free discovery: event sources are probed (rate-limited) for media
+        // roles — a player announcing itself costs no walk budget.
+        if (ev?.source &&
+            now - m.probeTs >= Math.floor(1000 / MEDIA_EVENT_PROBES_PER_SEC)) {
+            m.probeTs = now;
+            try {
+                const kind = m.roleMap.get(ev.source.get_role());
+                if (kind) {
+                    m.eventHits.set(ev.source, { kind, ts: now });
+                    if (m.eventHits.size > MEDIA_EVENT_HIT_CAP) {
+                        let oldest = null;
+                        let oldestTs = Infinity;
+                        for (const [acc, hit] of m.eventHits) {
+                            if (hit.ts < oldestTs) {
+                                oldestTs = hit.ts;
+                                oldest = acc;
+                            }
+                        }
+                        if (oldest) {
+                            m.eventHits.delete(oldest);
+                        }
+                    }
+                    this._mediaScheduleEventPublish();
+                }
+            } catch (e) {}
+        }
         // Tree-shape events → full (budgeted, cached) walk; move events →
         // cheap extents-only refresh (the scroll-follow path).
         if (type.startsWith('document:') || type === 'object:children-changed') {
@@ -782,15 +914,18 @@ export default class InvertonatorExtension extends Extension {
             return;
         }
         m.running = false;
-        for (const id of [m.timerId, m.walkTimerId, m.focusTimerId, m.chunkId]) {
+        for (const id of [m.timerId, m.walkTimerId, m.focusTimerId, m.chunkId,
+            m.eventPubId]) {
             if (id) {
                 try { GLib.source_remove(id); } catch (e) {}
             }
         }
-        m.timerId = m.walkTimerId = m.focusTimerId = m.chunkId = 0;
+        m.timerId = m.walkTimerId = m.focusTimerId = m.chunkId = m.eventPubId = 0;
         m.walkScheduled = false;
         m.walkActive = false;
+        m.walkComplete = false;
         m.queue = [];
+        m.eventHits.clear();
         this._mediaClearHoles();
     }
 
@@ -807,6 +942,8 @@ export default class InvertonatorExtension extends Extension {
         }
         m.eventCbs = [];
         m.cache.clear();
+        m.eventHits.clear();
+        m.diag.clear();
         m.apps = null;
     }
 
@@ -831,15 +968,21 @@ export default class InvertonatorExtension extends Extension {
         if (m.hinted) {
             return;
         }
+        m.hinted = true;
         try {
             const iface = Gio.Settings.new('org.gnome.desktop.interface');
             if (!iface.get_boolean('toolkit-accessibility')) {
-                m.hinted = true;
-                console.log('Invertonator: toolkit-accessibility is OFF — ' +
-                    'app trees may come up empty; enable with: gsettings set ' +
-                    'org.gnome.desktop.interface toolkit-accessibility true');
+                // Set, not hint: GTK3 apps only expose their a11y tree when
+                // this is on. Already-running GTK3 apps need a restart to
+                // pick it up; GTK4/Firefox/Chromium usually react to the
+                // a11y bus alone.
+                iface.set_boolean('toolkit-accessibility', true);
+                console.log('Invertonator: toolkit-accessibility was OFF — set ON ' +
+                    '(already-running GTK3 apps need a restart to expose their trees)');
             }
-        } catch (e) {}
+        } catch (e) {
+            console.warn(`Invertonator: toolkit-accessibility check failed (${e})`);
+        }
     }
 
     _mediaScheduleWalk(delayMs) {
@@ -856,6 +999,20 @@ export default class InvertonatorExtension extends Extension {
         });
     }
 
+    _mediaScheduleEventPublish() {
+        const m = this._media;
+        if (!m?.running || m.eventPubId) {
+            return;
+        }
+        m.eventPubId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 700, () => {
+            m.eventPubId = 0;
+            if (m.running && this._inverted && !m.walkActive) {
+                this._mediaRefreshExtents();
+            }
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
     _mediaApiMiss(name, e) {
         const m = this._media;
         if (!m.apiMissed) {
@@ -863,6 +1020,15 @@ export default class InvertonatorExtension extends Extension {
             console.warn(`Invertonator: AT-SPI API miss '${name}' (${e}) — ` +
                 'element lock-on degraded; report the journal line');
         }
+    }
+
+    _mediaDiagOnce(key, line) {
+        const m = this._media;
+        if (!m || m.diag.has(key)) {
+            return;
+        }
+        m.diag.add(key);
+        console.log(line);
     }
 
     _mediaWalk() {
@@ -875,9 +1041,13 @@ export default class InvertonatorExtension extends Extension {
             return;
         }
         m.lastWalk = now;
+        m.walkComplete = false;
         const mw = global.display.get_focus_window?.();
         if (!mw || (mw.get_pid?.() ?? 0) <= 0 || mw.minimized) {
-            this._mediaPublish([]);
+            // Nothing focused: element holes cannot belong anywhere — a
+            // COMPLETE empty publish drops them and lets the fullscreen
+            // fallback re-arm on fullscreen windows.
+            this._mediaPublish(null, true);
             return;
         }
         m.walkActive = true;
@@ -890,7 +1060,9 @@ export default class InvertonatorExtension extends Extension {
             }
             if (!roots || roots.length === 0) {
                 m.walkActive = false;
-                this._mediaPublish([]);
+                // Resolution failed — event captures still count as proof;
+                // a clean "nothing" lets the fullscreen fallback re-arm.
+                this._mediaPublish(null, true);
                 return;
             }
             m.queue = roots;
@@ -901,7 +1073,7 @@ export default class InvertonatorExtension extends Extension {
 
     // Map the focused Meta.Window to its AT-SPI2 application (by PID, with
     // wm_class name as fallback), return its top-level frames pre-calibrated:
-    // cal = {k, ex, ey} — logical(p) = frameRect.xy + (p - frameExt.xy) * k.
+    // cal = {k, ex, ey} — screen(p) = frameRect.xy + (p - frameExt.xy) * k.
     // The k-calibration self-corrects ANY coordinate-space discrepancy
     // (HiDPI scaling, toolkit quirks) because it is measured, not assumed.
     _mediaResolveFrames(mw, done) {
@@ -914,6 +1086,7 @@ export default class InvertonatorExtension extends Extension {
         if (!m.apps || now - m.appsTs > 10000) {
             m.apps = [];
             m.appsTs = now;
+            m.cache.clear();   // stale wrappers from the previous snapshot
             let desktop = null;
             try {
                 desktop = Atspi.get_desktop(0);
@@ -965,6 +1138,10 @@ export default class InvertonatorExtension extends Extension {
                 a.name.includes(wmClass) || wmClass.includes(a.name));
         }
         if (!app) {
+            this._mediaDiagOnce(`noapp:${pid}:${wmClass}`,
+                `Invertonator: no AT-SPI app for pid=${pid} class="${wmClass}" — ` +
+                'event capture still applies; if holes never appear, check the ' +
+                'toolkit-accessibility journal line');
             done(null);
             return;
         }
@@ -981,6 +1158,7 @@ export default class InvertonatorExtension extends Extension {
         const t1 = Date.now();
         try {
             cnt = app.acc.get_child_count();
+            m.callBudget--;
         } catch (e) {
             this._mediaApiMiss('app child_count', e);
             done(null);
@@ -1071,7 +1249,9 @@ export default class InvertonatorExtension extends Extension {
                     try {
                         cnt = acc.get_child_count();
                         m.callBudget--;
-                    } catch (e) {}
+                    } catch (e) {
+                        continue;   // dead or hung node — nothing to cache
+                    }
                     const cap = Math.min(cnt, 80);
                     for (let i = 0; i < cap && m.callBudget > 0; i++) {
                         try {
@@ -1101,7 +1281,7 @@ export default class InvertonatorExtension extends Extension {
             m.slowApps.set(pid, Date.now());
             m.queue = [];
             m.walkActive = false;
-            this._mediaPublish([]);
+            this._mediaPublish(null, false);   // keep holes; event captures only
             return;
         }
         if (m.queue.length > 0 && m.callBudget > 0) {
@@ -1112,16 +1292,40 @@ export default class InvertonatorExtension extends Extension {
             });
         } else {
             m.walkActive = false;
-            this._mediaPublishFromFound();
+            m.walkComplete = m.queue.length === 0;
+            if (m.walkComplete) {
+                const entries = this._mediaEntriesFromFound();
+                this._mediaWalkDiag(entries.length);
+                this._mediaPublish(entries, true);
+            } else {
+                // Budget starved mid-tree: publish event captures only and
+                // keep every existing hole — a wipe here would thrash the
+                // fullscreen fallback on huge trees.
+                this._mediaPublish(null, false);
+            }
         }
     }
 
-    _mediaPublishFromFound() {
+    _mediaWalkDiag(found) {
+        const m = this._media;
+        const now = Date.now();
+        if (found === m.diagLastFound && now - m.diagWalkTs < 30000) {
+            return;
+        }
+        m.diagLastFound = found;
+        m.diagWalkTs = now;
+        const app = m.apps?.find(
+            a => a.pid === (m.targetMw?.get_pid?.() ?? -1));
+        console.log(`Invertonator: a11y walk "${app?.name ?? '?'}" ` +
+            `calls=${MEDIA_WALK_BUDGET - m.callBudget} media=${found} ` +
+            `cache=${m.cache.size}`);
+    }
+
+    _mediaEntriesFromFound() {
         const m = this._media;
         const mw = m.targetMw;
         if (!mw || m.found.length === 0) {
-            this._mediaPublish([]);
-            return;
+            return [];
         }
         // Sort by area, cap the pool.
         const sorted = [...m.found].sort((a, b) =>
@@ -1136,156 +1340,319 @@ export default class InvertonatorExtension extends Extension {
             const y = fr.y + (f.ext.y - f.cal.ey) * f.cal.k;
             const w = f.ext.width * f.cal.k;
             const h = f.ext.height * f.cal.k;
-            // Clip to the window frame; drop anything mostly outside it.
-            const cx = Math.max(x, fr.x);
-            const cy = Math.max(y, fr.y);
-            const cw = Math.min(x + w, fr.x + fr.width) - cx;
-            const ch = Math.min(y + h, fr.y + fr.height) - cy;
-            if (cw < MEDIA_MIN_EDGE || ch < MEDIA_MIN_EDGE) {
-                continue;
+            const e = this._mediaClipEntry(mw, x, y, w, h, f.kind);
+            if (e) {
+                e.acc = f.acc;
+                e.frameAcc = f.frameAcc;
+                e.cal = f.cal;
+                entries.push(e);
             }
-            entries.push({
-                mw, acc: f.acc, frameAcc: f.frameAcc, cal: f.cal, kind: f.kind,
-                x: cx, y: cy, w: cw, h: ch,
-            });
         }
-        this._mediaPublish(entries);
+        return entries;
     }
 
-    // Diff-and-rebuild the rect hole pool. Matching by element identity
-    // first (acc object), then by kind+window+proximity — scrolling keeps
-    // the same hole object alive and just moves it (no churn).
-    _mediaPublish(entries) {
-        const m = this._media;
-        if (!m) {
-            return;
+    // Clip a screen-space rect to the window frame; keep it only when the
+    // window really covers it (>=50% intersection) — rects leaking from
+    // another window of the same app must not punch holes.
+    _mediaClipEntry(mw, x, y, w, h, kind) {
+        let fr = null;
+        try {
+            fr = mw.get_frame_rect();
+        } catch (e) {
+            return null;
         }
-        entries = entries.filter(e => e.mw && !this._holes?.has(e.mw));
-        const used = new Set();
-        const next = [];
-        for (const e of entries) {
-            let match = null;
-            for (const h of m.holes) {
-                if (!used.has(h) && h.acc === e.acc) {
-                    match = h;
+        const cx = Math.max(x, fr.x);
+        const cy = Math.max(y, fr.y);
+        const cw = Math.min(x + w, fr.x + fr.width) - cx;
+        const ch = Math.min(y + h, fr.y + fr.height) - cy;
+        if (cw < MEDIA_MIN_EDGE || ch < MEDIA_MIN_EDGE) {
+            return null;
+        }
+        if (cw * ch * 2 < w * h) {
+            return null;
+        }
+        return { mw, kind, x: cx, y: cy, w: cw, h: ch };
+    }
+
+    // Event-captured media: extents live-queried, matched to whichever
+    // VISIBLE window contains the rect center — this path works even when
+    // app↔window resolution (pid/name) fails entirely.
+    _mediaEventEntries() {
+        const m = this._media;
+        if (m.eventHits.size === 0) {
+            return [];
+        }
+        const now = Date.now();
+        const wins = [];
+        for (const actor of global.get_window_actors()) {
+            const mw = actor.get_meta_window?.();
+            if (!mw || mw.minimized) {
+                continue;
+            }
+            const isOr = mw.is_override_redirect?.() ?? false;
+            if (!isOr && !mw.showing_on_its_workspace?.()) {
+                continue;
+            }
+            wins.push(mw);
+        }
+        const coord = m.atspi.CoordType?.SCREEN ?? 0;
+        const entries = [];
+        for (const [acc, hit] of m.eventHits) {
+            if (now - hit.ts > MEDIA_EVENT_HIT_TTL_MS) {
+                m.eventHits.delete(acc);
+                continue;
+            }
+            let ext = null;
+            try {
+                const comp = acc.getComponent?.();
+                ext = comp?.get_extents?.(coord);
+            } catch (e) {
+                m.eventHits.delete(acc);   // element died
+                continue;
+            }
+            if (!ext || ext.width < MEDIA_MIN_EDGE ||
+                ext.height < MEDIA_MIN_EDGE) {
+                continue;
+            }
+            let mw = null;
+            for (const w of wins) {
+                const fr = w.get_frame_rect();
+                const px = ext.x + ext.width / 2;
+                const py = ext.y + ext.height / 2;
+                if (px >= fr.x && px < fr.x + fr.width &&
+                    py >= fr.y && py < fr.y + fr.height) {
+                    mw = w;
                     break;
                 }
             }
-            if (!match) {
-                let best = MEDIA_MATCH_DIST;
-                for (const h of m.holes) {
-                    if (used.has(h) || h.kind !== e.kind || h.mw !== e.mw) {
-                        continue;
-                    }
-                    const d = Math.hypot(h.rect.x - e.x, h.rect.y - e.y);
-                    if (d < best) {
-                        best = d;
-                        match = h;
-                    }
+            if (!mw) {
+                continue;
+            }
+            const e = this._mediaClipEntry(mw, ext.x, ext.y, ext.width,
+                ext.height, hit.kind);
+            if (e) {
+                e.acc = acc;
+                entries.push(e);
+            }
+        }
+        return entries;
+    }
+
+    // Diff-and-rebuild the per-window rect-hole pool. A window's shader is
+    // re-baked only when a rect moved >= MEDIA_REBAKE_DELTA_PX or the rect
+    // count changed — scrolling keeps the same holes and just moves them.
+    //
+    // complete=true  → authoritative: the pool is REPLACED and the
+    //                  fullscreen fallback may re-arm. Only complete walks
+    //                  (and clean empty walks) publish complete=true.
+    // complete=false → supplemental: update/create from fresh entries, but
+    //                  never wipe holes that this publish has no data for
+    //                  (event captures and starved walks are partial views).
+    _mediaPublish(walkEntries, complete) {
+        const m = this._media;
+        if (!m || !m.running) {
+            return;
+        }
+        // Element rects never fight a manual pierce hole.
+        const skip = (mw) => this._holes?.has(mw);
+        const byWin = new Map();
+        const addEntry = (e) => {
+            if (!e || skip(e.mw)) {
+                return;
+            }
+            if (!byWin.has(e.mw)) {
+                byWin.set(e.mw, []);
+            }
+            byWin.get(e.mw).push(e);
+        };
+        for (const e of walkEntries ?? []) {
+            addEntry(e);
+        }
+        for (const e of this._mediaEventEntries()) {
+            addEntry(e);
+        }
+        const rectSets = new Map();
+        for (const [mw, list] of byWin) {
+            rectSets.set(mw, list.sort((a, b) => (b.w * b.h) - (a.w * a.h))
+                .slice(0, MEDIA_MAX_HOLES));
+        }
+
+        // PRIORITY: element rects beat the fullscreen auto-hole — the
+        // whole-window hole is dropped the moment rects are proven by a
+        // COMPLETE walk (starved walks never flip-flop).
+        if (complete && this._inverted) {
+            for (const [mw, rects] of rectSets) {
+                const hole = this._holes?.get(mw);
+                if (hole && hole.auto) {
+                    console.log(`Invertonator: media rects (${rects.length}) beat ` +
+                        `fullscreen hole — chrome re-inverts on ` +
+                        `"${mw.get_title?.() ?? '?'}"`);
+                    this.removeHole(mw);
                 }
             }
-            if (match) {
-                used.add(match);
-                this._elementHoleUpdate(match, e);
-                next.push(match);
+        }
+
+        let totalRects = 0;
+        for (const [mw, rects] of rectSets) {
+            totalRects += rects.length;
+            const cur = m.holes.get(mw);
+            if (cur && this._rectSetSame(cur.rects, rects)) {
+                continue;
+            }
+            if (cur) {
+                this._rectHoleRebuild(mw, rects);
             } else {
-                const h = this._elementHoleCreate(e);
-                if (h) {
-                    next.push(h);
+                this._rectHoleCreate(mw, rects);
+            }
+        }
+        if (complete) {
+            for (const mw of [...m.holes.keys()]) {
+                if (!rectSets.has(mw)) {
+                    this._rectHoleDestroy(mw);
                 }
             }
         }
-        for (const h of m.holes) {
-            if (!used.has(h)) {
-                this._elementHoleDestroy(h);
+
+        // FALLBACK: a fullscreen window whose tree proves NO media on a
+        // complete walk (native player, game) gets the whole-window hole.
+        if (complete && this._inverted && m.running &&
+            (this._settings?.get_boolean('auto-hole-fullscreen') ?? true)) {
+            for (const mw of [...(this._fullscreenWatch?.keys() ?? [])]) {
+                if (rectSets.has(mw) || this._holes?.has(mw)) {
+                    continue;
+                }
+                let isFs = false;
+                try {
+                    isFs = mw.fullscreen ?? mw.is_fullscreen?.() ?? false;
+                } catch (e) {}
+                if (!isFs) {
+                    continue;
+                }
+                const actor = mw.get_compositor_private?.();
+                if (actor && !this._holes?.has(mw)) {
+                    this._addHole(actor, mw, true);
+                    console.log(`Invertonator: auto-hole ON (fullscreen, no media ` +
+                        `nodes) "${mw.get_title?.() ?? '?'}"`);
+                }
             }
         }
-        const countChanged = next.length !== m.publishedCount;
-        m.holes = next;
-        m.publishedCount = entries.length;
+
+        const countChanged = totalRects !== m.publishedCount;
+        m.publishedCount = totalRects;
         if (countChanged) {
-            const kinds = [...new Set(next.map(h => h.kind))].join(',');
-            console.log(`Invertonator: media lock-on ${next.length} rect(s)` +
-                (next.length ? ` (${kinds})` : ''));
+            const kinds = [...new Set(
+                [...rectSets.values()].flat().map(r => r.kind))].join(',');
+            console.log(`Invertonator: media lock-on ${totalRects} rect(s) on ` +
+                `${rectSets.size} window(s)` + (totalRects ? ` (${kinds})` : ''));
             this._refreshHoleUI();
         }
     }
 
-    // THE rect hole: container (clip = the media rect) + identity clone of
-    // the window actor (translation = -container pos cancels the container's
-    // transform — content overlays the real window pixel-for-pixel at ANY
-    // scale) + the invert effect. Global pass re-inverts it → true color.
-    _elementHoleCreate(e) {
+    _rectSetSame(oldRects, newRects) {
+        if (oldRects.length !== newRects.length) {
+            return false;
+        }
+        for (let i = 0; i < oldRects.length; i++) {
+            const a = oldRects[i];
+            const b = newRects[i];
+            if (a.kind !== b.kind ||
+                Math.abs(a.x - b.x) >= MEDIA_REBAKE_DELTA_PX ||
+                Math.abs(a.y - b.y) >= MEDIA_REBAKE_DELTA_PX ||
+                Math.abs(a.w - b.w) >= MEDIA_REBAKE_DELTA_PX ||
+                Math.abs(a.h - b.h) >= MEDIA_REBAKE_DELTA_PX) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // THE element hole: one shader on the window actor whose GLSL bakes
+    // the rects (normalized to the actor's paint-volume box — the same
+    // bounds Cogl's offscreen texture spans) and inverts ONLY inside
+    // them. uiGroup's pass re-inverts those pixels → true color media,
+    // chrome stays inverted. The effect rides the actor: moving the
+    // window moves its holes for free.
+    _rectHoleCreate(mw, rects) {
+        const m = this._media;
+        if (!m) {
+            return;
+        }
         try {
-            const actor = e.mw.get_compositor_private?.();
+            const actor = mw.get_compositor_private?.();
             if (!actor) {
-                return null;
+                return;
             }
-            const container = new Clutter.Actor({ reactive: false });
-            let clone;
-            try {
-                clone = Clutter.Clone.new(actor);
-            } catch (e) {
-                clone = new Clutter.Clone({ source: actor });
+            const baked = this._mediaBakeRects(actor, rects, mw);
+            if (!baked || baked.length === 0) {
+                return;
             }
-            clone.reactive = false;
-            container.set_position(e.x, e.y);
-            container.set_size(e.w, e.h);
-            container.set_clip(0, 0, e.w, e.h);
-            clone.translation_x = -e.x;
-            clone.translation_y = -e.y;
-            container.add_child(clone);
-            container.add_effect(makeInvertEffect());
-            global.window_group.insert_child_above(container, actor);
-            const fr = e.mw.get_frame_rect();
             const hole = {
-                mw: e.mw, acc: e.acc, frameAcc: e.frameAcc, cal: e.cal,
-                kind: e.kind, rect: { x: e.x, y: e.y, w: e.w, h: e.h },
-                rel: { x: e.x - fr.x, y: e.y - fr.y },
-                container, clone,
-                posId: e.mw.connect('position-changed', () =>
-                    this._elementHoleReposition(hole)),
-                sizeId: e.mw.connect('size-changed', () =>
-                    this._elementHoleReposition(hole)),
+                mw, actor,
+                effect: makeRectEffect(buildRectFragment(baked)),
+                rects: rects.map(r => ({ ...r })),
+                nRects: baked,
+                destroyId: 0, unmanagedId: 0, sizeId: 0,
             };
-            return hole;
+            hole.destroyId = actor.connect('destroy', () => {
+                if (m.holes.get(mw) === hole) {
+                    m.holes.delete(mw);
+                    this._refreshHoleUI();
+                }
+            });
+            hole.unmanagedId = mw.connect('unmanaged', () => {
+                if (m.holes.get(mw) === hole) {
+                    m.holes.delete(mw);
+                    this._refreshHoleUI();
+                }
+            });
+            hole.sizeId = mw.connect('size-changed', () =>
+                this._mediaOnWindowResized(mw));
+            actor.add_effect(hole.effect);
+            actor.queue_repaint?.();
+            m.holes.set(mw, hole);
         } catch (err) {
             console.warn(`Invertonator: element hole create failed (${err})`);
-            return null;
         }
     }
 
-    _elementHoleUpdate(h, e) {
+    _rectHoleRebuild(mw, rects) {
+        const m = this._media;
+        const cur = m?.holes.get(mw);
+        if (!cur) {
+            return;
+        }
         try {
-            const fr = e.mw.get_frame_rect();
-            h.acc = e.acc;
-            h.cal = e.cal;
-            h.kind = e.kind;
-            h.rect = { x: e.x, y: e.y, w: e.w, h: e.h };
-            h.rel = { x: e.x - fr.x, y: e.y - fr.y };
-            h.container.set_position(e.x, e.y);
-            h.container.set_size(e.w, e.h);
-            h.container.set_clip(0, 0, e.w, e.h);
-            h.clone.translation_x = -e.x;
-            h.clone.translation_y = -e.y;
-        } catch (err) {}
+            const baked = this._mediaBakeRects(cur.actor, rects, mw);
+            if (!baked || baked.length === 0) {
+                this._rectHoleDestroy(mw);
+                return;
+            }
+            try {
+                cur.actor.remove_effect(cur.effect);
+            } catch (e) {}
+            cur.effect = makeRectEffect(buildRectFragment(baked));
+            cur.rects = rects.map(r => ({ ...r }));
+            cur.nRects = baked;
+            cur.actor.add_effect(cur.effect);
+            cur.actor.queue_repaint?.();
+        } catch (err) {
+            console.warn(`Invertonator: element hole rebuild failed (${err})`);
+        }
     }
 
-    _elementHoleReposition(hole) {
-        try {
-            const fr = hole.mw.get_frame_rect();
-            const mx = fr.x + hole.rel.x;
-            const my = fr.y + hole.rel.y;
-            hole.container.set_position(mx, my);
-            hole.clone.translation_x = -mx;
-            hole.clone.translation_y = -my;
-        } catch (e) {}
-    }
-
-    _elementHoleDestroy(hole) {
-        try { hole.mw.disconnect(hole.posId); } catch (e) {}
-        try { hole.mw.disconnect(hole.sizeId); } catch (e) {}
-        try { hole.container.destroy(); } catch (e) {}
+    _rectHoleDestroy(mw) {
+        const m = this._media;
+        const cur = m?.holes.get(mw);
+        if (!cur) {
+            return;
+        }
+        m.holes.delete(mw);
+        try { cur.actor.disconnect(cur.destroyId); } catch (e) {}
+        try { cur.mw.disconnect(cur.unmanagedId); } catch (e) {}
+        try { cur.mw.disconnect(cur.sizeId); } catch (e) {}
+        try { cur.actor.remove_effect(cur.effect); } catch (e) {}
+        try { cur.actor.queue_repaint?.(); } catch (e) {}
+        this._refreshHoleUI();
     }
 
     _mediaClearHoles() {
@@ -1293,73 +1660,162 @@ export default class InvertonatorExtension extends Extension {
         if (!m) {
             return;
         }
-        for (const h of m.holes) {
-            this._elementHoleDestroy(h);
+        for (const mw of [...m.holes.keys()]) {
+            this._rectHoleDestroy(mw);
         }
-        m.holes = [];
         m.publishedCount = 0;
     }
 
     _mediaDropForWindow(mw) {
         const m = this._media;
-        if (!m || m.holes.length === 0) {
+        if (!m || !m.holes.has(mw)) {
             return;
         }
-        const keep = [];
-        let dropped = 0;
-        for (const h of m.holes) {
-            if (h.mw === mw) {
-                this._elementHoleDestroy(h);
-                dropped++;
-            } else {
-                keep.push(h);
-            }
-        }
-        if (dropped > 0) {
-            m.holes = keep;
-            this._refreshHoleUI();
-        }
+        this._rectHoleDestroy(mw);
     }
 
-    // Scroll-follow: cheap extents re-query of the LIVE holes only (≤6
-    // elements × 2 calls), no tree walk. Self-correcting calibration as in
-    // publish (Δ between element and frame cancels window movement).
+    _mediaOnWindowResized(mw) {
+        const m = this._media;
+        if (!m?.running || !this._inverted) {
+            return;
+        }
+        const now = Date.now();
+        if (now - m.resizeTs < MEDIA_REFRESH_MIN_MS) {
+            return;
+        }
+        m.resizeTs = now;
+        this._mediaRefreshExtents();
+    }
+
+    // Screen-space rects → normalized [x0, y0, x1, y1] against the actor's
+    // paint-volume box — the bounds Cogl's offscreen texture spans for this
+    // actor's effect. Both sides live in the actor's local space, so CSD
+    // shadows/margins cancel by construction.
+    _mediaBakeRects(actor, rects, mw) {
+        let ax = 0, ay = 0;
+        try {
+            [ax, ay] = actor.get_transformed_position();
+        } catch (e) {}
+        const box = this._mediaLocalBox(actor);
+        if (box.w <= 0 || box.h <= 0) {
+            this._mediaDiagOnce('degenerate-box',
+                'Invertonator: degenerate paint box — element rects skipped');
+            return null;
+        }
+        const cls = mw.get_wm_class?.() ?? '?';
+        this._mediaDiagOnce(`bake:${cls}`,
+            `Invertonator: rect bake "${cls}" actor@(${ax},${ay}) ` +
+            `box=(${box.x},${box.y},${box.w},${box.h})`);
+        const baked = [];
+        for (const r of rects) {
+            const nx0 = Math.min(Math.max((r.x - ax - box.x) / box.w, 0), 1);
+            const ny0 = Math.min(Math.max((r.y - ay - box.y) / box.h, 0), 1);
+            const nx1 = Math.min(Math.max((r.x + r.w - ax - box.x) / box.w, 0), 1);
+            const ny1 = Math.min(Math.max((r.y + r.h - ay - box.y) / box.h, 0), 1);
+            if (nx1 - nx0 < 0.004 || ny1 - ny0 < 0.004) {
+                continue;
+            }
+            baked.push([nx0, ny0, nx1, ny1]);
+        }
+        return baked;
+    }
+
+    // Bounds of the region the effect's offscreen texture covers, in the
+    // actor's local space: paint volume first (authoritative — the
+    // offscreen pass measures the same volume), paint box as fallback,
+    // allocation last.
+    _mediaLocalBox(actor) {
+        try {
+            const pv = actor.get_paint_volume?.();
+            if (pv) {
+                const o = pv.get_origin?.();
+                const w = pv.get_width?.();
+                const h = pv.get_height?.();
+                if (o && w > 1 && h > 1) {
+                    return { x: o.x, y: o.y, w, h };
+                }
+            }
+        } catch (e) {}
+        try {
+            const [ok, pb] = actor.get_paint_box?.() ?? [false, null];
+            if (ok && pb && pb.width > 1 && pb.height > 1) {
+                return { x: pb.x, y: pb.y, w: pb.width, h: pb.height };
+            }
+        } catch (e) {}
+        return { x: 0, y: 0, w: actor.width ?? 0, h: actor.height ?? 0 };
+    }
+
+    // Scroll-follow: live extents re-query for EXISTING holes only
+    // (≤ 6 elements × 2 calls per window, no tree walk), merged with the
+    // event captures. Publishes with complete=false — existing holes move
+    // or are updated, nothing is wiped or invented here.
     _mediaRefreshExtents() {
         const m = this._media;
-        if (!m?.running || m.walkActive || m.holes.length === 0) {
+        if (!m?.running || m.walkActive) {
             return;
         }
         const coord = m.atspi.CoordType?.SCREEN ?? 0;
         const entries = [];
-        for (const h of m.holes) {
+        for (const [mw, hole] of m.holes) {
+            let fr = null;
             try {
-                const fr = h.mw.get_frame_rect();
-                const comp = h.acc.getComponent?.();
-                const ext = comp?.get_extents?.(coord);
-                const fcomp = h.frameAcc?.getComponent?.();
-                const fext = fcomp?.get_extents?.(coord);
-                if (!ext || ext.width <= 0) {
+                fr = mw.get_frame_rect();
+            } catch (e) {
+                continue;
+            }
+            for (const r of hole.rects) {
+                if (!r.acc) {
                     continue;
                 }
-                let ex = h.cal.ex, ey = h.cal.ey, k = h.cal.k;
-                if (fext && fext.width > 0) {
-                    const kNow = fr.width / fext.width;
-                    if (kNow > 0.2 && kNow < 5) {
-                        k = kNow;
+                try {
+                    const comp = r.acc.getComponent?.();
+                    const ext = comp?.get_extents?.(coord);
+                    if (!ext || ext.width <= 0) {
+                        continue;
                     }
-                    ex = fext.x;
-                    ey = fext.y;
-                }
-                const x = fr.x + (ext.x - ex) * k;
-                const y = fr.y + (ext.y - ey) * k;
-                entries.push({
-                    mw: h.mw, acc: h.acc, frameAcc: h.frameAcc,
-                    cal: { k, ex, ey }, kind: h.kind,
-                    x, y, w: ext.width * k, h: ext.height * k,
-                });
-            } catch (e) {}
+                    let x, y, w, h;
+                    if (r.cal) {
+                        // Walk-sourced rect: re-anchor through the frame's
+                        // live extents (Δ between element and frame cancels
+                        // any window movement in between).
+                        let k = r.cal.k;
+                        let ex = r.cal.ex;
+                        let ey = r.cal.ey;
+                        const fcomp = r.frameAcc?.getComponent?.();
+                        const fext = fcomp?.get_extents?.(coord);
+                        if (fext && fext.width > 0) {
+                            const kNow = fr.width / fext.width;
+                            if (kNow > 0.2 && kNow < 5) {
+                                k = kNow;
+                            }
+                            ex = fext.x;
+                            ey = fext.y;
+                        }
+                        x = fr.x + (ext.x - ex) * k;
+                        y = fr.y + (ext.y - ey) * k;
+                        w = ext.width * k;
+                        h = ext.height * k;
+                    } else {
+                        // Event-sourced rect: the extent IS screen space.
+                        x = ext.x;
+                        y = ext.y;
+                        w = ext.width;
+                        h = ext.height;
+                    }
+                    const e = this._mediaClipEntry(mw, x, y, w, h, r.kind);
+                    if (e) {
+                        e.acc = r.acc;
+                        e.frameAcc = r.frameAcc ?? null;
+                        e.cal = r.cal ?? null;
+                        entries.push(e);
+                    }
+                } catch (e) {}
+            }
         }
-        this._mediaPublish(entries);
+        for (const e of this._mediaEventEntries()) {
+            entries.push(e);
+        }
+        this._mediaPublish(entries, false);
     }
 
     accelFor(key, fallback) {
@@ -1406,9 +1862,21 @@ export default class InvertonatorExtension extends Extension {
             this.clearHoles();
             this._mediaStop();
         } else {
-            // Windows already fullscreen when inversion comes on (user
-            // was watching video, then inverted) — hole them now.
-            this._syncFullscreenHoles();
+            // Windows already fullscreen when inversion comes on (user was
+            // watching video, then inverted): give the first media walk a
+            // beat to claim element rects before the whole-window fallback
+            // fires — no full-window flash that would re-invert chrome.
+            if (this._media?.running) {
+                GLib.timeout_add(GLib.PRIORITY_DEFAULT, MEDIA_FULLSCREEN_SYNC_MS,
+                    () => {
+                        if (this._inverted && this._fullscreenWatch) {
+                            this._syncFullscreenHoles();
+                        }
+                        return GLib.SOURCE_REMOVE;
+                    });
+            } else {
+                this._syncFullscreenHoles();
+            }
             this._mediaStart();
         }
         try {

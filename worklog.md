@@ -389,3 +389,33 @@ Delivered: zip `Invertonator-rs <sha> 0.3.0-alpha.22` + changed-files mirror byt
 | Everything green | rects lock, follow scroll/tabs, clear on focus loss | next = v2.3 quality pass, user go pending |
 
 Delivered: zip `Invertonator-rs <sha> 0.3.0-alpha.23` + changed-files mirror byte-verified.
+
+## Task 23 — alpha.24: v2.3 auto-hole fix (rect-shader element holes, event capture, priority repair)
+
+### Field report chain (alpha.23)
+- USER: "auto hole doesnt woks" — alpha.23 (zip ddd5aa2) on Fedora 45 / GNOME 51. No install-side issue (schema keys present, installer intact). Sandbox-side code audit found three concrete bugs:
+  1. KILLER: element rect holes were Clutter.Clone overlays whose translation anchored cloned window content at stage (0,0) — aligned ONLY for windows already at the origin (fullscreen on the primary monitor), shifted window copies for every windowed app. Risk-table R4 was real but the magnitude was "completely wrong anchor", not deco-offset drift.
+  2. Walker starvation: budget 240 D-Bus calls (~120 nodes) per 3s walk vs multi-thousand-node web trees; cache/seen keyed by Atspi.Accessible object identity (libatspi wrapper reuse unguaranteed) → frontier could stall forever (risk R2/R3 adjacent).
+  3. Priority inversion: fullscreen whole-window auto-hole suppressed element rects (entries filtered for holed windows) → chrome true color in fullscreen, contradicting the v2.2 ask.
+
+### alpha.24 changes (sandbox; awaiting push)
+- RENDERING REWORK: element hole = ONE rect-invert Clutter.ShaderEffect per window; GLSL bakes rects as literal normalized comparisons (no uniforms — Cogl GI uniform surface unreliable), inverts ONLY inside; global pass re-inverts → media true, chrome stays inverted. Rects normalized against the actor's paint-volume box (get_paint_volume → get_paint_box → allocation fallback) = exactly the bounds Cogl's offscreen texture spans → shadows/CSD margins cancel; effect rides the actor → move/resize follow free. Clone overlay, container, position-changed/size-changed repositioning all DELETED.
+- DISCOVERY: budget 480; free event capture (Atspi event sources probed 16/s for media roles → eventHits cap 24 TTL 60s; windows matched by rect-center containment — works when pid/name matching fails); event publishes debounce 700ms through the refresh path.
+- PUBLISH MODEL: complete=true (walk finished or clean-empty) = authoritative replace + fallback re-arm; complete=false (event/refresh/starved) = supplemental update/create, never wipes; starved walks publish event-only (no [] wipe → no flip-flop). Rebake only when a rect moved ≥6px or count changed.
+- PRIORITY: complete walk proving rects removes an auto fullscreen hole (swap journaled); complete walk proving no rects re-arms the whole-window hole (native players/games); _onFullscreenChange skips the whole-window hole when rect holes exist; setInverted(true) delays _syncFullscreenHoles 1.6s when the walker runs.
+- A11Y: toolkit-accessibility SET (not hinted); GTK3-restart caveat journaled. DIAGNOSTICS: walk summaries (30s throttle), rect bake anchor one-shot per app class, no-app-match one-shot, swap/fallback lines; LINUX-TESTING.md documents the paste-back grep + got the missing v2 holes test protocol.
+- DOCS/CONFIG: metadata v24, Cargo VERSION alpha.24, gschema description documents priority/fallback, install.sh note updated, README (status block alpha.24 / matrix v2.3 / roadmap), APPLY.md rewritten (freshness gate alpha.24; 7-step protocol incl. move-window glue test + fullscreen-chrome-stays-inverted test).
+- VALIDATION: node --check green; glib-compile-schemas --strict green; all 5 keys in compiled schema; bash -n green; JSON/XML green. Cargo NOT run (no rustup in this sandbox session; only Rust change = VERSION string, zero functional risk; CI compiles).
+- PROCESS LESSON: MultiEdit here applies edits non-atomically on anchor failure (earlier edits stuck) — a grep caught the duplicated rect-effect block; dedup + one-edit-per-call after that. Always grep for duplicate definitions after a failed multi-edit.
+
+### Risk table for round 10 (pre-registered)
+| Branch | Evidence in field | Verdict path |
+|---|---|---|
+| R1: paint-volume ≠ offscreen bounds (rect misalignment) | `rect bake "class" actor@… box=…` journal + shifted-hole screenshot | switch normalization anchor to paint box/allocation; compare box vs actor size |
+| R2: Atspi wrapper identity differs per fetch (cache useless) | `a11y walk … media=0` on media-heavy pages, cache=… stays tiny | cache keyed by role+name+index path strings; rely on event capture meanwhile |
+| R3: trees dormant (toolkit-accessibility just set, apps not restarted) | walk media=0 + `toolkit-accessibility was OFF — set ON` line | restart the app once; re-test |
+| R4: gi://Atspi import fails in shell process | `unavailable (Atspi import: …)` | out-of-process helper via bus (fullscreen auto-hole unaffected meanwhile) |
+| R5: rebake churn jank (scroll storms recompile shaders) | stutter while scrolling with holes visible | raise MEDIA_REBAKE_DELTA_PX; bake→uniform path only if Cogl GI allows |
+| Everything green | windowed rects glue to media; fullscreen = video true + chrome inverted; native player = whole window | v2.3 quality pass done; next = pooling beyond 6, telemetry |
+
+Delivered: zip `Invertonator-rs <sha> 0.3.0-alpha.24` + changed-files mirror byte-verified.

@@ -54,9 +54,11 @@ if gnome-extensions enable "$UUID" 2>/dev/null; then
     echo "  holes: invert first (Super+I), then Super+F7 over a window"
     echo "  fullscreen video auto-holes while inverted (opt out: gsettings"
     echo "    set org.gnome.shell.extensions.invertonator auto-hole-fullscreen false)"
-    echo "  media lock-on: images/videos get element-level true-color rects"
-    echo "    (AT-SPI2; opt out: ... auto-hole-media false; if trees come up"
-    echo "    empty, run: gsettings set org.gnome.desktop.interface toolkit-accessibility true)"
+    echo "  media lock-on: images/videos get element-level true-color rects,"
+    echo "    everything else stays inverted (AT-SPI2; element rects beat the"
+    echo "    fullscreen hole; opt out: ... auto-hole-media false). The extension"
+    echo "    enables org.gnome.desktop.interface toolkit-accessibility itself —"
+    echo "    already-running GTK3 apps need a restart to expose their trees."
     NEEDS_RELOGIN="no"
 else
     # The running shell has never scanned this directory (first install,

@@ -65,6 +65,46 @@ gsettings set org.gnome.shell.extensions.invertonator toggle-invert "['<Alt>i']"
 The extension remembers its state across reboots (toggling writes
 `start-enabled`, which is re-applied at login).
 
+### Holes and auto-holes (v2)
+
+1. Invert with **Super+I**, hover a window and press **Super+F7** — that
+   window snaps to true color while the rest of the screen stays inverted.
+   Press Super+F7 over it again to close the hole. The panel menu's
+   "Holes" submenu lists every hole (click a row to close it).
+2. Windowed YouTube (or any page with a photo): the video/image element
+   should come up true color ON ITS OWN within a few seconds while the
+   page around it stays inverted — that is media lock-on
+   (`auto-hole-media`, on by default). The journal shows the decisions.
+3. Fullscreen YouTube: the video stays true color AND the chrome goes
+   back to inverted — element rects beat the whole-window hole. A native
+   player or a game (no a11y media nodes) gets the whole-window hole
+   instead — true color everywhere, also automatic.
+4. Turning inversion off (Super+I) clears every hole and rect.
+
+### Media lock-on journal lines (paste these when reporting)
+
+```bash
+journalctl --user -b /usr/bin/gnome-shell | grep Invertonator | tail -40
+```
+
+The lines that decide auto holes:
+
+- `AT-SPI2 ready — media lock-on roles: image,video,animation` — the
+  a11y import worked. Its absence means no element holes ever.
+- `toolkit-accessibility was OFF — set ON` — the extension enabled it;
+  apps already running needed a restart to expose their trees.
+- `no AT-SPI app for pid=… class="…"` — the focused window's app could
+  not be matched (event capture still applies).
+- `a11y walk "app" calls=N media=K cache=…` — one per interesting walk;
+  `media=0` on a page you KNOW has images/videos is the number to report.
+- `media lock-on N rect(s) on M window(s) (kinds)` — rects published.
+- `rect bake "class" actor@(x,y) box=(…)` — the coordinate anchor of the
+  first bake per app; if holes appear SHIFTED, this + a screenshot
+  pinpoints the mapping bug.
+- `media rects (N) beat fullscreen hole — chrome re-inverts on "…"` and
+  `auto-hole ON (fullscreen, no media nodes) "…"` — the priority swap
+  and the native-player fallback doing their jobs.
+
 ### Verify + report back
 
 Send me one line per item:

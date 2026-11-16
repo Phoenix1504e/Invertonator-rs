@@ -31,9 +31,12 @@
             <description>While inversion is on, the focused window's AT-SPI2 tree
             is walked (budgeted, cached) and every image/video/animation element
             above 48px gets its own true-color rect hole — the rest of the screen
-            stays inverted. Rects follow scrolling and tab switches. Requires
-            AT-SPI2; if app trees come up empty, enable
-            org.gnome.desktop.interface toolkit-accessibility. Opt out:
+            stays inverted. Element rects beat the fullscreen auto-hole
+            (fullscreen browser: video true, chrome inverted); windows whose tree
+            proves no media keep the whole-window fullscreen hole as the fallback.
+            Rects follow scrolling and tab switches. Requires AT-SPI2
+            (toolkit-accessibility is switched on automatically; GTK3 apps need a
+            restart to pick it up). Opt out:
             gsettings set org.gnome.shell.extensions.invertonator
             auto-hole-media false</description>
         </key>

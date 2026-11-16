@@ -4,7 +4,7 @@
 
 ![Invertonator](icon.svg)
 
-> **Status: v0.3.0-alpha.23 — Linux v2.2 media lock-on (GNOME/Wayland)**:
+> **Status: v0.3.0-alpha.24 — Linux v2.3 media lock-on rework (GNOME/Wayland)**:
 > **Super+F7** pierces a true-color hole into the window under the
 > pointer while everything around it stays inverted — the Windows
 > F7-pierce analog (plain F7 is browser-claimed — caret browsing — so
@@ -59,6 +59,31 @@
 > (alpha.11 evidence-rule analog); hung apps blacklisted 60s; pool cap
 > 6; `auto-hole-media` gsettings opt-out; toolkit-accessibility hint
 > journaled when app trees may be dormant.
+> alpha.24 MEDIA LOCK-ON REWORK (v2.3 — fixes "auto hole doesn't work"):
+> alpha.23's rect holes were Clutter.Clone overlays whose translation
+> anchored the cloned window content at stage (0,0) — aligned only for
+> windows already at the origin (fullscreen on the primary monitor) and
+> visibly shifted copies for every windowed app, plus the 240-call walk
+> budget starved on real web trees (a YouTube page's a11y tree is
+> thousands of nodes). alpha.24: rect holes are now ONE shader per
+> window whose GLSL bakes the rects as literal normalized coordinates
+> (no uniforms — Cogl's GI uniform surface is unreliable) and inverts
+> ONLY inside them, normalized against the actor's paint-volume box —
+> the exact bounds Cogl's offscreen texture spans — so shadows/CSD
+> margins cancel by construction and the hole rides the window actor
+> (move/resize follow for free). Discovery adds FREE event capture
+> (AT-SPI events carry their source element; media that announces
+> itself costs zero walk budget) with window matching by rect
+> containment, so it works even when pid/name resolution fails; the
+> walk budget doubles to 480 and a budget-starved walk never wipes
+> holes. PRIORITY FIX: element rects now BEAT the fullscreen auto-hole
+> (fullscreen browser: video true, chrome still inverted — the v2.2
+> request), the whole-window hole remains the fallback for native
+> players/games, and it re-arms only on complete walks (no flip-flop).
+> toolkit-accessibility is switched ON automatically (GTK3 apps need a
+> restart to pick it up); every swap, fallback and resolution failure
+> journals itself (a11y walk summaries, rect bake anchor, no-app-match
+> one-shots).
 > alpha.18 kept: install.sh honesty lines + APPLY zip-freshness gate.
 > alpha.16 kept: GNOME/Wayland backend shipped (compositor-level
 > fragment-shader stage inversion, Super+I, panel indicator, reboot
@@ -106,7 +131,7 @@
 |---|---|---|---|
 | Windows 10+ | Magnifier API (compositor) | ✅ UIA tracker | `Ctrl+Alt+F5` invert · `F6` mode · `F7` pierce · `F2` quit |
 | Linux (X11) | XRandR CRTC gamma | 🚧 v2 (XComposite overlay) — media inverts too for now | `Ctrl+Alt+I` toggle · `Ctrl+Alt+Q` quit |
-| Linux (GNOME/Wayland) | Shell extension — compositor shader | ✅ **v2.2 shipped** — Super+F7 pierce + hole manager + fullscreen video auto-hole + AT-SPI2 media lock-on (element rects) | `Super+I` invert · `Super+F7` pierce · panel menu |
+| Linux (GNOME/Wayland) | Shell extension — compositor shader | ✅ **v2.3 shipped** — Super+F7 pierce + hole manager + fullscreen video auto-hole + AT-SPI2 media lock-on (element rects beat the fullscreen hole) | `Super+I` invert · `Super+F7` pierce · panel menu |
 | Linux (KDE/Wayland) | KWin's built-in Invert effect | ❌ | user-bound |
 | macOS | ❌ unsupported | ❌ | — |
 
@@ -118,8 +143,12 @@ re-pierce with Super+F7. Fullscreen windows auto-hole while inversion
 is on (video: YouTube fullscreen, mpv, VLC); opt out with
 `gsettings set org.gnome.shell.extensions.invertonator auto-hole-fullscreen false`.
 Media lock-on (element-level image/video rects via AT-SPI2, default
-on): opt out with `... auto-hole-media false`; if app trees come up
-empty, run `gsettings set org.gnome.desktop.interface toolkit-accessibility true`.
+on): opt out with `... auto-hole-media false`. Element rects beat the
+fullscreen hole when found (fullscreen browser: video true, chrome
+inverted); the extension enables
+`org.gnome.desktop.interface toolkit-accessibility` itself — already-
+running GTK3 apps need a restart to expose their trees (GTK4, Firefox
+and Chromium usually react to the a11y bus alone).
 
 No Linux box of your own? Run `invertonator --self-test` on any Linux
 machine — it prints a paste-back diagnostic report (session type, gamma
@@ -273,8 +302,12 @@ Tor Browser) cannot detect it — there is nothing in the web layer to detect.
 - **v2.2** — **GNOME element-level media lock-on shipped as alpha.23**:
   AT-SPI2 image/video rects (clone rect-holes), scroll/tab follow,
   measured calibration, hung-app blacklist
-- **v2.3** — GNOME hole quality: element-only video holes without
-  window chrome bleed, per-element pooling beyond 6, tracker telemetry
+- **v2.3** — **media lock-on rework shipped as alpha.24** (fixes "auto
+  hole doesn't work"): rect-shader holes replacing the misaligned clone
+  overlay, event-capture discovery, element rects beat the fullscreen
+  auto-hole (whole-window hole = native player/game fallback),
+  toolkit-accessibility auto-enable, self-journaling swaps/fallbacks;
+  still queued: per-element pooling beyond 6, tracker telemetry
 - **research** — compositor-level video handling, other Wayland compositors
 
 ## Credits & thanks
