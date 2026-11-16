@@ -40,6 +40,40 @@
             gsettings set org.gnome.shell.extensions.invertonator
             auto-hole-media false</description>
         </key>
+        <key name="pin-hole" type="as">
+            <default><![CDATA[['<Super>F8']]]></default>
+            <summary>Store a true-color area (select once, re-applied forever)</summary>
+            <description>Opens a drag-select overlay: drag a rectangle over the
+            area that should stay true color (e.g. the YouTube player), Esc
+            cancels. The area is stored NORMALIZED to the focused window's
+            frame, so it re-applies automatically whenever a matching window
+            shows up — no tree walk needed, the hole is there the moment the
+            window appears. Matching is title-first: the window title's
+            stable segments are stored as tokens (a YouTube page always
+            carries a "- YouTube" segment, video titles change and are
+            matched loosely), falling back to the window class when the
+            title carries nothing stable. Because the rect is stored
+            relative to the window frame it follows moves and resizes; a
+            matching window that goes FULLSCREEN drops the pin and lets the
+            fullscreen auto-hole take over (the windowed player position is
+            meaningless in fullscreen). Stored areas live in the
+            pinned-holes key; manage them in the panel menu ("Stored
+            areas"). Change with gsettings:
+            gsettings set org.gnome.shell.extensions.invertonator pin-hole
+            "['&lt;Super&gt;F8']"</description>
+        </key>
+        <key name="pinned-holes" type="s">
+            <default>'[]'</default>
+            <summary>Stored area pins (JSON, written by the pin feature)</summary>
+            <description>JSON array of stored area pins, each:
+            {"rel":[nx0,ny0,nx1,ny1], "cls":"wmclass", "tokens":["t1","t2"],
+            "ts":epoch-ms}. rel is the rectangle normalized to the anchor
+            window's frame rect (0..1); tokens are lowercase title segments
+            a window must contain to match (title-first matching); cls is
+            the fallback match on wm_class when no tokens could be derived.
+            Edited via the panel menu (Super+F8 stores, the menu forgets);
+            hand-editing works too but keep the JSON valid.</description>
+        </key>
         <key name="auto-hole-fullscreen" type="b">
             <default>true</default>
             <summary>Auto-hole fullscreen windows (fullscreen video)</summary>

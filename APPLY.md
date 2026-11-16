@@ -1,11 +1,54 @@
-# Invertonator-rs — Full Source Package (v0.3.0-alpha.26, field-round-11 walk fix)
+# Invertonator-rs — Full Source Package (v0.3.0-alpha.27, stored area pins)
 
 Complete repo at a fixed state — extract over your clone, commit, push.
 No `.git` inside, your history is untouched.
 
 ---
 
-## What alpha.26 fixes (field round 11 — journal proved the thrash)
+## What alpha.27 adds (your request: "select an area once and it gets stored for YouTube")
+
+The auto-hole walker stays exactly as alpha.26 left it (your call: "this is
+probably fine"). On TOP of it there is now a manual path that needs NO
+discovery at all — which is the only thing that can work where the
+accessibility tree is closed (LibreWolf hardened builds):
+
+1. **Super+F8 — the selection prompt.** The screen dims, you drag a
+   rectangle over the area that should stay true color (the YouTube
+   player), Esc cancels. On release the area is STORED.
+2. **Stored, not absolute.** The rectangle is saved normalized to the
+   focused window's frame (rel 0..1, four decimals) — so it follows window
+   moves and resizes and matches other windows of the same size class, on
+   any monitor. Stored in gsettings (`pinned-holes`) — it survives
+   reboots and re-logins.
+3. **Matched by title tokens.** The anchor window's title is split on its
+   separators and stable segments are kept as match tokens:
+   `Song X - YouTube — Mozilla Firefox` stores `["song x", "youtube"]`.
+   ANY window whose title contains ANY token gets the pin — your NEXT
+   video still matches via `- youtube`, video titles change, the site
+   name does not. If the title carries nothing stable, the window class
+   is stored instead.
+4. **Applied automatically.** A cheap 2-second scan (plus focus-change
+   and window-created hooks — pure string matching, zero D-Bus) re-bakes
+   the stored rect as a true-color hole on every matching visible window
+   the moment it appears. Instant, and immune to browsers that hide
+   their a11y tree.
+5. **Fullscreen-safe.** A matching window that goes FULLSCREEN drops its
+   pin (a windowed player's position is meaningless fullscreen) and the
+   existing fullscreen auto-hole / media rects take over; leaving
+   fullscreen restores the pin.
+6. **Priority: manual Super+F7 pierce > stored pins > media rects >
+   fullscreen auto-hole.** Media rects never fight your stored area.
+7. **Management.** Panel menu: "Pin a stored area", a "Stored areas: N"
+   submenu (each row shows its tokens + coordinates; click to forget
+   that one) and "Forget all stored areas". Re-storing the exact same
+   area replaces it instead of duplicating. Cap: 16 pins (oldest
+   evicted).
+
+Quick how-to: Super+I → open YouTube → Super+F8 → drag a box around the
+player → done. From then on every YouTube-titled window gets that hole
+instantly.
+
+## What alpha.26 fixed (field round 11 — journal proved the thrash)
 
 Your journal finally landed the diagnosis. It showed alpha.25 running,
 event capture alive (via the `EventListener.register` fallback — your
@@ -124,8 +167,8 @@ The filename is the SAME across versions. An older download in
 unzip -z ~/Downloads/Invertonator-rs-full-source.zip
 ```
 
-It must print **`Invertonator-rs <sha> 0.3.0-alpha.26`**. If it
-prints alpha.25 or older, re-download the zip from the chat first.
+It must print **`Invertonator-rs <sha> 0.3.0-alpha.27`**. If it
+prints alpha.26 or older, re-download the zip from the chat first.
 
 > **NOTE (round 10):** last round the WINDOWS PowerShell block below
 > was pasted into Fedora bash (`cd C:\Users\admin\invertonator-push`
@@ -144,7 +187,7 @@ git reset --hard origin/main && \
 unzip -o ~/Downloads/Invertonator-rs-full-source.zip -d . && \
 git status --short && \
 git add -A && \
-git commit -m "alpha.26: Linux v2.3.2 — re-root thrash fix (journal round 11), document-priority dive, diag script" && \
+git commit -m "alpha.27: Linux v2.3.3 — stored area pins (Super+F8 select-once, title-token matching)" && \
 git push origin HEAD && \
 bash shell-extension/install.sh
 ```
@@ -164,15 +207,16 @@ Then **log out and log back in**. Reinstalling over a copy the running
 shell already executes cannot hot-reload — the logout guarantees the
 new module actually runs.
 
-After login: install.sh output should include FIVE
+After login: install.sh output should include SIX
 `schema check: '...' present` lines (toggle-invert, toggle-pierce,
-auto-hole-media, auto-hole-fullscreen, start-enabled).
+pin-hole, auto-hole-media, auto-hole-fullscreen, start-enabled).
 
 ## Test protocol (6 minutes)
 
-1. `gnome-extensions info invertonator@phoenix1504e` → **Version: 26**, State: ACTIVE.
+1. `gnome-extensions info invertonator@phoenix1504e` → **Version: 27**, State: ACTIVE.
 2. `journalctl --user -b --no-pager | grep -i Invertonator | tail -15` →
-   expect: both `registered` keybinding lines, `AT-SPI2 ready — media
+   expect: THREE `registered` keybinding lines (toggle-invert,
+   toggle-pierce, **pin-hole**), `AT-SPI2 ready — media
    lock-on roles: image,video,animation`, and `event capture on via …
    (5/5 listeners)` (or the Atspi-import warning — paste either).
    First run may also log the
@@ -197,6 +241,21 @@ auto-hole-media, auto-hole-fullscreen, start-enabled).
    fullscreen → rects keep following.
 7. mpv / VLC / a game fullscreen → whole window true color (fallback
    hole, journal: `auto-hole ON (fullscreen, no media nodes)`).
+8. **NEW — the alpha.27 test (the YouTube pin):** inverted, on a YouTube
+   watch page (windowed), press **Super+F8** → screen dims with a hint
+   label. Drag a box around the video player, release. Journal:
+   `area stored — match title tokens [song x, youtube] rel=[…]`.
+   Close the tab, open ANOTHER video on YouTube → within ≤2s a true-color
+   rect appears at the SAME relative position (journal:
+   `stored area applied (title […])`) — no walker needed. Resize the
+   window → the rect follows. Fullscreen the video → the pin drops
+   (`stored area dropped (window went fullscreen)`) and normal fullscreen
+   behavior returns; leave fullscreen → pin comes back. Esc mid-drag →
+   nothing stored. Panel menu → "Stored areas" lists the pin; click the
+   row to forget it.
+9. If AT-SPI discovery ALSO still works on your setup, both can coexist:
+   the stored pin wins on its window (chrome of a pinned YouTube window
+   stays inverted even if the walker is dead — the whole point).
 
 Report back ONE line: version + whether windowed video/images got true-
 color rects at the right place + whether fullscreen showed video true
@@ -214,12 +273,12 @@ journalctl --user -b --no-pager | grep -iE 'invertonator|JS ERROR' | tail -40
 cd C:\Users\admin\invertonator-push
 Expand-Archive -Path "$env:USERPROFILE\Downloads\Invertonator-rs-full-source.zip" -DestinationPath . -Force
 git add -A
-git commit -m "alpha.26: Linux v2.3.2 — re-root thrash fix (journal round 11), document-priority dive, diag script"
+git commit -m "alpha.27: Linux v2.3.3 — stored area pins (Super+F8 select-once, title-token matching)"
 git push origin HEAD
 ```
 
 Verify: first line of `%LOCALAPPDATA%\Invertonator\log.txt` must read
-`=== Invertonator-rs v0.3.0-alpha.26 ===`. Windows behavior is
+`=== Invertonator-rs v0.3.0-alpha.27 ===`. Windows behavior is
 alpha.15-identical; its test protocol and Desktop diagnostics still apply.
 
 ---
@@ -231,7 +290,7 @@ alpha.15-identical; its test protocol and Desktop diagnostics still apply.
 .gitignore                   /target, *.exe — keep, protects your clone
 APPLY.md                     this file
 invertonator-diag.sh         one-shot Linux auto-hole diagnostics (run on Fedora, paste output)
-Cargo.toml                   0.3.0-alpha.26 (windows+linux deps)
+Cargo.toml                   0.3.0-alpha.27 (windows+linux deps)
 Cargo.lock                   pinned
 Invertonator-rs-v0.2.0-alpha.2.exe  legacy artifact (safe to git rm)
 LICENSE                      MIT
@@ -240,7 +299,7 @@ docs/LINUX-TESTING.md        Fedora-first runbook (Wayland ext / X11 / KDE) +
                              holes test protocol + journal-line diagnosis
 icon.ico / icon.svg          logo (tray + README)
 src/main.rs                  cross-platform entry (cfg dispatcher)
-src/common.rs                settings.json + logging + VERSION (alpha.26)
+src/common.rs                settings.json + logging + VERSION (alpha.27)
 src/win_main.rs              Windows backend (tray, hotkeys, probe, DPI,
                              auto-diagnostics, hysteresis telemetry)
 src/holes.rs                 hole pool + main-thread pump (≈64Hz, context-
@@ -252,7 +311,7 @@ src/scrollhook.rs            low-level wheel hook (scroll-hold, page-dirty)
 src/linux.rs                 X11 XRandR gamma inversion + --self-test +
                              Wayland session awareness
 shell-extension/install.sh                       installer + schema verification + gsettings fallback
-shell-extension/invertonator@phoenix1504e/metadata.json    uuid, v26, shells 45–51
+shell-extension/invertonator@phoenix1504e/metadata.json    uuid, v27, shells 45–51
 shell-extension/invertonator@phoenix1504e/extension.js     compositor shader inversion
                                                            (Cogl.Snippet / dual-API effect,
                                                            uiGroup attach), Super+I,
@@ -261,7 +320,10 @@ shell-extension/invertonator@phoenix1504e/extension.js     compositor shader inv
                                                            auto-hole fallback, AT-SPI2
                                                            media lock-on v2.3 (per-window
                                                            rect-shader holes, event
-                                                           capture), scanout guard
+                                                           capture), scanout guard,
+                                                           v2.3.3 Super+F8 stored area
+                                                           pins (select-once, title-token
+                                                           matching, reboot-proof)
 shell-extension/invertonator@phoenix1504e/schemas/org.gnome.shell.extensions.invertonator.gschema.xml
 shell-extension/invertonator@phoenix1504e/schemas/gschemas.compiled
 worklog.md                   project memory: tasks, field findings, SHA chain

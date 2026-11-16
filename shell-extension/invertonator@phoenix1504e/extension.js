@@ -79,6 +79,24 @@
 //   players and games. Toolkit accessibility is switched on
 //   automatically (GTK3 apps need a restart to pick it up).
 //
+//   v2.3.3 stored area pins (alpha.27): "select an area once, it gets
+//   stored" — Super+F8 opens a drag-select overlay; the rectangle is
+//   stored NORMALIZED to the focused window's frame together with
+//   match tokens derived from the window title (a YouTube page always
+//   carries a "- youtube" segment; video titles change per video, so
+//   tokens match loosely), class match as fallback. Stored areas live
+//   in gsettings (pinned-holes) and survive reboots: whenever a window
+//   whose title contains a stored token shows up (ANY browser, ANY
+//   session), its pin is re-baked as a rect-shader hole at the stored
+//   relative position — zero AT-SPI budget, instant, and immune to
+//   browsers that hide their a11y tree (LibreWolf hardened builds).
+//   The pin rides the window actor like every other rect hole, so moves
+//   and resizes follow; a matching window that goes FULLSCREEN drops
+//   the pin (a windowed player's position is meaningless fullscreen)
+//   and the fullscreen auto-hole / media rects take over. PRIORITY:
+//   manual Super+F7 pierce > stored pins > media rects > fullscreen
+//   auto-hole.
+//
 // Tested against the GNOME 45-51 extension API surface (ESM imports,
 // Extension.getSettings, Main.wm.addKeybinding, PanelMenu.Button).
 //
@@ -132,6 +150,25 @@ const MEDIA_EVENT_HIT_CAP = 24;       // remembered event-captured elements
 const MEDIA_EVENT_HIT_TTL_MS = 60000; // stale event captures expire
 const MEDIA_FULLSCREEN_SYNC_MS = 1600;// let the first walk claim rects before
                                        // the whole-window fallback fires
+
+// v2.3.3 stored area pins (alpha.27) budgets — pure bookkeeping, no
+// D-Bus anywhere: the refresh tick is string matching over window titles.
+const PIN_MAX_ENTRIES = 16;           // stored area cap (oldest evicted)
+const PIN_MIN_EDGE = 24;              // px — a smaller drag is a misclick
+const PIN_MIN_REL = 0.02;             // a smaller stored rect is degenerate
+const PIN_TICK_S = 2;                 // re-scan cadence (tab switches)
+const PIN_TOKEN_MIN = 4;              // title-token length bounds
+const PIN_TOKEN_MAX = 48;
+const PIN_TOKEN_CAP = 4;              // tokens stored per pin
+const PIN_MAX_STORE = 4;              // per-pin rel precision = 4 decimals
+// Title segments that name the APP, not the site — never stored as match
+// tokens (they would match every window of that app).
+const PIN_APP_TOKENS = new Set([
+    'mozilla firefox', 'firefox', 'librewolf', 'waterfox', 'tor browser',
+    'chromium', 'google chrome', 'chrome', 'brave', 'epiphany', 'web',
+    'vivaldi', 'opera', 'microsoft edge', 'edge', 'safari', 'zen browser',
+    'mpv', 'vlc', 'celluloid', 'totem', 'gnome mpv', 'haruna', 'dragon player',
+]);
 
 // The inversion GLSL — a bare fragment BODY (no main()). Cogl's template
 // wraps it; `cogl_sampler0` is AUTO-PROVIDED by Cogl and must never be
@@ -245,6 +282,13 @@ const Indicator = GObject.registerClass(
             pierceItem.connect('activate', () => this._ext.pierce());
             this.menu.addMenuItem(pierceItem);
 
+            // v2.3.3: stored area pins — select once, re-applied forever.
+            const pinItem = new PopupMenu.PopupMenuItem(
+                `Pin a stored area (${this._ext.accelFor('pin-hole', 'Super+F8')})`
+            );
+            pinItem.connect('activate', () => this._ext.pinSelectStart());
+            this.menu.addMenuItem(pinItem);
+
             // v2.1: per-hole manager — one row per hole, click to close it.
             this._holeSub = new PopupMenu.PopupSubMenuMenuItem('Holes: 0');
             this.menu.addMenuItem(this._holeSub);
@@ -253,6 +297,17 @@ const Indicator = GObject.registerClass(
             const clearItem = new PopupMenu.PopupMenuItem('Clear all holes');
             clearItem.connect('activate', () => this._ext.clearHoles());
             this.menu.addMenuItem(clearItem);
+
+            // v2.3.3: stored-areas manager — one row per pin, click forgets
+            // it; the footer forgets everything.
+            this._pinSub = new PopupMenu.PopupSubMenuMenuItem('Stored areas: 0');
+            this.menu.addMenuItem(this._pinSub);
+            this._pinSig = '';
+            this.rebuildPins([]);
+
+            this._forgetItem = new PopupMenu.PopupMenuItem('Forget all stored areas');
+            this._forgetItem.connect('activate', () => this._ext.pinsForget());
+            this.menu.addMenuItem(this._forgetItem);
         }
 
         setState(inverted, holes = 0) {
@@ -281,6 +336,39 @@ const Indicator = GObject.registerClass(
                 this._holeSub.menu.addMenuItem(new PopupMenu.PopupMenuItem(
                     `media lock-on: ${mediaCount} rect${mediaCount > 1 ? 's' : ''} (auto)`,
                     { reactive: false }));
+            }
+        }
+
+        // v2.3.3: one row per stored area — "#1 — youtube — 0.03,0.25…",
+        // click forgets that pin. Signature-guarded: the refresh tick runs
+        // every 2s and must not churn the open menu.
+        rebuildPins(entries) {
+            const sig = JSON.stringify(entries);
+            if (sig === this._pinSig) {
+                return;
+            }
+            this._pinSig = sig;
+            this._pinSub.menu.removeAll();
+            this._pinSub.label.text = `Stored areas: ${entries.length}`;
+            if (entries.length === 0) {
+                this._pinSub.menu.addMenuItem(new PopupMenu.PopupMenuItem(
+                    'none — Super+F8 stores one', { reactive: false }));
+            }
+            entries.forEach((e, i) => {
+                const match = (e.tokens?.length)
+                    ? `title: ${e.tokens.join(', ')}`
+                    : `class: ${e.cls || 'any'}`;
+                const rel = e.rel.map(v => Math.round(v * 100) / 100).join(', ');
+                const row = new PopupMenu.PopupMenuItem(
+                    `#${i + 1} — ${match} — [${rel}]`);
+                row.connect('activate', () => this._ext.pinDelete(i));
+                this._pinSub.menu.addMenuItem(row);
+            });
+            if (this._forgetItem) {
+                this._forgetItem.reactive = entries.length > 0;
+                this._forgetItem.label.text = entries.length > 0
+                    ? `Forget all stored areas (${entries.length})`
+                    : 'Forget all stored areas';
             }
         }
     }
@@ -321,6 +409,14 @@ export default class InvertonatorExtension extends Extension {
             lastRootTs: 0, docRoles: null,
         };
         this._focusId = 0;
+        // v2.3.3 stored area pins — entries persist in gsettings, effects
+        // are per-window rect shaders (same machinery as the media rects).
+        this._pins = new Map();      // Meta.Window -> pin hole object
+        this._pinEntries = [];       // stored pins (loaded from settings)
+        this._pinTimerId = 0;
+        this._pinSelect = null;      // selection-mode state
+        this._pinGrab = null;
+        this._pinLoadEntries();
 
         try {
             this._effect = makeInvertEffect();
@@ -339,16 +435,23 @@ export default class InvertonatorExtension extends Extension {
 
         this._addBinding('toggle-invert', () => this.toggle());
         this._addBinding('toggle-pierce', () => this.pierce());
+        this._addBinding('pin-hole', () => this.pinSelectStart());
 
         // v2.1: fullscreen auto-hole — watch every window's fullscreen
         // state (existing windows now, future windows via window-created).
         this._windowCreatedId = global.display.connect('window-created',
-            (display, mw) => this._watchWindow(mw));
+            (display, mw) => {
+                this._watchWindow(mw);
+                this._pinsRefresh();
+            });
         this._watchAllWindows();
 
-        // v2.2: element media lock-on — focus changes retarget the walker
-        this._focusId = global.display.connect('notify::focus-window', () =>
-            this._mediaFocusChanged());
+        // v2.2: element media lock-on — focus changes retarget the walker;
+        // v2.3.3: pins re-scan immediately on focus (cheap: string ops).
+        this._focusId = global.display.connect('notify::focus-window', () => {
+            this._mediaFocusChanged();
+            this._pinsRefresh();
+        });
         this._media.initStarted = true;
         this._mediaInitAtspi();
 
@@ -356,7 +459,8 @@ export default class InvertonatorExtension extends Extension {
             this.setInverted(true);
         }
         console.log(`Invertonator ${this.metadata.version} enabled — ` +
-            'Super+I invert · Super+F7 pierce · fullscreen auto-hole · media lock-on');
+            'Super+I invert · Super+F7 pierce · Super+F8 pin area · ' +
+            'fullscreen auto-hole · media lock-on');
     }
 
     disable() {
@@ -371,6 +475,11 @@ export default class InvertonatorExtension extends Extension {
         this._clearFullscreenWatch();
         this._setUnredirectDisabled(false);
         this._mediaShutdown();
+        // v2.3.3: selection mode must never survive the extension (a
+        // leaked grab would freeze input), then effects, then the timer.
+        this.pinSelectCancel(true);
+        this._pinStopTimer();
+        this._pinsDestroyAll();
         if (this._focusId) {
             try { global.display.disconnect(this._focusId); } catch (e) {}
             this._focusId = 0;
@@ -381,6 +490,9 @@ export default class InvertonatorExtension extends Extension {
         try {
             Main.wm.removeKeybinding('toggle-pierce');
         } catch (e) {}
+        try {
+            Main.wm.removeKeybinding('pin-hole');
+        } catch (e) {}
         this._indicator.destroy();
         this._indicator = null;
         this._effect = null;
@@ -388,6 +500,8 @@ export default class InvertonatorExtension extends Extension {
         this._fullscreenWatch = null;
         this._unredirectDisabled = false;
         this._media = null;
+        this._pins = null;
+        this._pinEntries = [];
         this._settings = null;
     }
 
@@ -525,6 +639,9 @@ export default class InvertonatorExtension extends Extension {
         // A window-hole already renders this window true color — element
         // rects on top would re-invert its content. Drop them.
         this._mediaDropForWindow(mw);
+        // v2.3.3: same for stored pins — the whole-window hole wins while
+        // it lives; removing the hole restores the pin (_pinsRefresh).
+        this._pinDestroyFor(mw);
         this._refreshHoleUI();
         return hole;
     }
@@ -544,6 +661,8 @@ export default class InvertonatorExtension extends Extension {
             }
         } catch (e) {}
         this._holes.delete(mw);
+        // v2.3.3: a stored pin for this window may now come back.
+        this._pinsRefresh();
         this._refreshHoleUI();
     }
 
@@ -611,6 +730,8 @@ export default class InvertonatorExtension extends Extension {
         }
         this._indicator?.rebuildHoles(
             this._holes ? this.listHoles() : [], mediaRects);
+        // v2.3.3: stored-areas submenu (signature-guarded inside).
+        this._indicator?.rebuildPins(this._pinEntries ?? []);
     }
 
     // --- v2.1: fullscreen auto-hole (the video feature) -----------------
@@ -671,6 +792,15 @@ export default class InvertonatorExtension extends Extension {
         }
         const setting = !this._settings ||
             this._settings.get_boolean('auto-hole-fullscreen');
+        // v2.3.3: a stored pin describes the WINDOWED layout — fullscreen
+        // has a different geometry entirely. Drop the pin and let the
+        // fullscreen auto-hole / media rects take over; un-fullscreening
+        // restores it via _pinsRefresh below.
+        if (isFs && this._pins?.has(mw)) {
+            this._pinDestroyFor(mw);
+            console.log('Invertonator: stored area dropped (window went ' +
+                'fullscreen) "' + (mw.get_title?.() ?? '?') + '"');
+        }
         // v2.3: element rects beat the whole-window hole — a fullscreen
         // window whose media rects are already locked on keeps its chrome
         // inverted; the whole-window hole is only the fallback.
@@ -687,6 +817,8 @@ export default class InvertonatorExtension extends Extension {
                     (mw.get_title?.() ?? '?') + '"');
                 this.removeHole(mw);
             }
+            // Un-fullscreened: the stored pin may return.
+            this._pinsRefresh();
         }
     }
 
@@ -1639,8 +1771,9 @@ export default class InvertonatorExtension extends Extension {
         if (!m || !m.running) {
             return;
         }
-        // Element rects never fight a manual pierce hole.
-        const skip = (mw) => this._holes?.has(mw);
+        // Element rects never fight a manual pierce hole; v2.3.3: a stored
+        // pin is user intent too — media rects never fight it either.
+        const skip = (mw) => this._holes?.has(mw) || this._pins?.has(mw);
         const byWin = new Map();
         const addEntry = (e) => {
             if (!e || skip(e.mw)) {
@@ -1704,7 +1837,8 @@ export default class InvertonatorExtension extends Extension {
         if (complete && this._inverted && m.running &&
             (this._settings?.get_boolean('auto-hole-fullscreen') ?? true)) {
             for (const mw of [...(this._fullscreenWatch?.keys() ?? [])]) {
-                if (rectSets.has(mw) || this._holes?.has(mw)) {
+                if (rectSets.has(mw) || this._holes?.has(mw) ||
+                    this._pins?.has(mw)) {
                     continue;
                 }
                 let isFs = false;
@@ -2014,6 +2148,525 @@ export default class InvertonatorExtension extends Extension {
         this._mediaPublish(entries, false);
     }
 
+    // --- v2.3.3: stored area pins (select once, re-applied forever) ------
+    //
+    // The user's insight: some layouts NEVER change (YouTube's player is
+    // always in the same place relative to the window), so a manually
+    // selected area can be STORED and re-applied forever — no tree walk,
+    // no a11y bus, works on browsers that hide their accessibility tree.
+    //
+    //   STORAGE — the rect is stored normalized to the anchor window's
+    //   frame (rel 0..1), plus match tokens derived from the title: the
+    //   title is split on its dash/pipe separators and stable segments are
+    //   kept ("Song X - YouTube — Mozilla Firefox" → tokens ["song x",
+    //   "youtube"], the browser suffix is dropped). Video titles change;
+    //   a token list matches ANY window whose title contains ANY token —
+    //   the next video still matches via "- youtube". No stable segments
+    //   → fall back to matching the window class. Pins live in gsettings
+    //   (pinned-holes) and survive reboots.
+    //
+    //   APPLY — a cheap 2s scan (string ops only) + focus/created hooks
+    //   re-bake one rect-shader hole per matching window at the stored
+    //   relative position. The hole rides the window actor: moves are
+    //   free, resizes re-bake via size-changed. Matching windows that go
+    //   fullscreen drop their pin (windowed layout is meaningless there).
+    //
+    //   PRIORITY — pins beat media rects (user intent > discovery) and
+    //   lose to manual Super+F7 whole-window holes while those live.
+
+    _pinLoadEntries() {
+        this._pinEntries = [];
+        try {
+            const raw = this._settings.get_string('pinned-holes');
+            const parsed = JSON.parse(raw || '[]');
+            if (Array.isArray(parsed)) {
+                this._pinEntries = parsed.filter(e => e &&
+                    Array.isArray(e.rel) && e.rel.length === 4 &&
+                    e.rel.every(v => typeof v === 'number' && isFinite(v)) &&
+                    typeof e.cls === 'string' &&
+                    Array.isArray(e.tokens) &&
+                    e.tokens.every(t => typeof t === 'string'));
+            }
+        } catch (e) {
+            console.warn(`Invertonator: stored areas unreadable (${e}) — reset`);
+            this._pinSaveEntries();
+        }
+    }
+
+    _pinSaveEntries() {
+        try {
+            this._settings.set_string('pinned-holes',
+                JSON.stringify(this._pinEntries));
+        } catch (e) {
+            console.warn(`Invertonator: storing areas failed (${e})`);
+        }
+        this._refreshHoleUI();
+    }
+
+    // Title → match tokens: split on dash/pipe separators, drop app-name
+    // segments, keep short stable-looking ones.
+    _pinTokensFromTitle(title) {
+        const raw = (title ?? '').toLowerCase();
+        if (!raw) {
+            return [];
+        }
+        const tokens = [];
+        for (let seg of raw.split(/\s*(?:—|–|\|| - )\s*/)) {
+            seg = (seg ?? '').trim();
+            if (seg.length < PIN_TOKEN_MIN || seg.length > PIN_TOKEN_MAX) {
+                continue;
+            }
+            if (PIN_APP_TOKENS.has(seg)) {
+                continue;
+            }
+            if (tokens.includes(seg)) {
+                continue;
+            }
+            tokens.push(seg);
+            if (tokens.length >= PIN_TOKEN_CAP) {
+                break;
+            }
+        }
+        return tokens;
+    }
+
+    _pinMatches(mw, entry) {
+        if (!entry) {
+            return false;
+        }
+        const tokens = entry.tokens ?? [];
+        if (tokens.length > 0) {
+            // Title-first: ANY stored token in the window title matches.
+            let title = '';
+            try {
+                title = (mw.get_title() ?? '').toLowerCase();
+            } catch (e) {}
+            return tokens.some(t => title.includes(t));
+        }
+        const cls = (mw.get_wm_class?.() ?? '').toLowerCase();
+        const stored = (entry.cls ?? '').toLowerCase();
+        if (stored) {
+            return cls.includes(stored) || stored.includes(cls);
+        }
+        return false;
+    }
+
+    _pinEntryFor(mw) {
+        if (!this._pinEntries?.length) {
+            return null;
+        }
+        for (let i = this._pinEntries.length - 1; i >= 0; i--) {
+            if (this._pinMatches(mw, this._pinEntries[i])) {
+                return this._pinEntries[i];
+            }
+        }
+        return null;
+    }
+
+    // The scan: ensure every matching VISIBLE window carries its pin
+    // effect and no non-matching window does. Cheap on purpose — called
+    // every 2s, on focus changes and window creation.
+    _pinsRefresh() {
+        if (!this._pins || !this._inverted) {
+            return;
+        }
+        let changed = 0;
+        const seen = new Set();
+        for (const actor of global.get_window_actors()) {
+            const mw = actor.get_meta_window?.();
+            if (!mw || mw.minimized) {
+                continue;
+            }
+            if (mw.is_override_redirect?.() ?? false) {
+                continue;
+            }
+            if (!mw.showing_on_its_workspace?.()) {
+                continue;
+            }
+            let isFs = false;
+            try {
+                isFs = mw.fullscreen ?? mw.is_fullscreen?.() ?? false;
+            } catch (e) {}
+            if (isFs) {
+                continue;   // fullscreen layout ≠ windowed layout
+            }
+            seen.add(mw);
+            if (this._holes.has(mw)) {
+                continue;   // whole-window hole wins; skip silently
+            }
+            const entry = this._pinEntryFor(mw);
+            const cur = this._pins.get(mw);
+            if (cur && cur.entry === entry) {
+                continue;
+            }
+            if (cur) {
+                this._pinDestroyFor(mw);
+                changed++;
+            }
+            if (entry && this._pinCreate(mw, entry)) {
+                changed++;
+            }
+        }
+        for (const mw of [...this._pins.keys()]) {
+            if (!seen.has(mw)) {
+                this._pinDestroyFor(mw);
+                changed++;
+            }
+        }
+        if (changed > 0) {
+            this._refreshHoleUI();
+        }
+    }
+
+    // Bake the stored rel rect onto the window actor. Returns true when
+    // the pin effect actually landed.
+    _pinCreate(mw, entry) {
+        try {
+            const actor = mw.get_compositor_private?.();
+            if (!actor) {
+                return false;
+            }
+            const fr = mw.get_frame_rect();
+            if (!fr || fr.width <= 0 || fr.height <= 0) {
+                return false;
+            }
+            const rel = entry.rel;
+            const x = fr.x + rel[0] * fr.width;
+            const y = fr.y + rel[1] * fr.height;
+            const w = Math.max((rel[2] - rel[0]) * fr.width, 1);
+            const h = Math.max((rel[3] - rel[1]) * fr.height, 1);
+            const e = this._mediaClipEntry(mw, x, y, w, h, 'pin');
+            if (!e) {
+                return false;
+            }
+            const baked = this._mediaBakeRects(actor, [e], mw);
+            if (!baked || baked.length === 0) {
+                return false;
+            }
+            const pin = {
+                mw, actor, entry,
+                effect: makeRectEffect(buildRectFragment(baked)),
+                nRects: baked,
+                destroyId: 0, unmanagedId: 0, sizeId: 0,
+            };
+            pin.destroyId = actor.connect('destroy', () => {
+                if (this._pins?.get(mw) === pin) {
+                    this._pins.delete(mw);
+                }
+            });
+            pin.unmanagedId = mw.connect('unmanaged', () =>
+                this._pinDestroyFor(mw));
+            // Resizes change the normalization — re-bake. Moves ride the
+            // actor (normalized coords are actor-local).
+            pin.sizeId = mw.connect('size-changed', () => this._pinRebake(mw));
+            actor.add_effect(pin.effect);
+            actor.queue_repaint?.();
+            this._pins.set(mw, pin);
+            const match = entry.tokens?.length
+                ? `title [${entry.tokens.join(', ')}]`
+                : `class "${entry.cls}"`;
+            console.log(`Invertonator: stored area applied (${match}) ` +
+                `rel=${JSON.stringify(entry.rel)} — "${mw.get_title?.() ?? '?'}"`);
+            return true;
+        } catch (err) {
+            console.warn(`Invertonator: stored area apply failed (${err})`);
+            return false;
+        }
+    }
+
+    _pinDestroyFor(mw) {
+        const cur = this._pins?.get(mw);
+        if (!cur) {
+            return;
+        }
+        this._pins.delete(mw);
+        try { cur.actor.disconnect(cur.destroyId); } catch (e) {}
+        try { cur.mw.disconnect(cur.unmanagedId); } catch (e) {}
+        try { cur.mw.disconnect(cur.sizeId); } catch (e) {}
+        try { cur.actor.remove_effect(cur.effect); } catch (e) {}
+        try { cur.actor.queue_repaint?.(); } catch (e) {}
+    }
+
+    _pinRebake(mw) {
+        const cur = this._pins?.get(mw);
+        if (!cur) {
+            return;
+        }
+        const entry = cur.entry;
+        this._pinDestroyFor(mw);
+        this._pinCreate(mw, entry);
+    }
+
+    _pinsDestroyAll() {
+        for (const mw of [...(this._pins?.keys() ?? [])]) {
+            this._pinDestroyFor(mw);
+        }
+    }
+
+    _pinStartTimer() {
+        this._pinStopTimer();
+        this._pinTimerId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT,
+            PIN_TICK_S, () => {
+                this._pinsRefresh();
+                return GLib.SOURCE_CONTINUE;
+            });
+    }
+
+    _pinStopTimer() {
+        if (this._pinTimerId) {
+            try { GLib.source_remove(this._pinTimerId); } catch (e) {}
+            this._pinTimerId = 0;
+        }
+    }
+
+    pinDelete(i) {
+        if (!this._pinEntries || i < 0 || i >= this._pinEntries.length) {
+            return;
+        }
+        const [gone] = this._pinEntries.splice(i, 1);
+        this._pinSaveEntries();
+        this._pinsRefresh();
+        console.log(`Invertonator: stored area forgotten ` +
+            `(rel=${JSON.stringify(gone?.rel)})`);
+    }
+
+    pinsForget() {
+        if (!this._pinEntries?.length) {
+            return;
+        }
+        const n = this._pinEntries.length;
+        this._pinEntries = [];
+        this._pinSaveEntries();
+        this._pinsRefresh();
+        console.log(`Invertonator: forgot ${n} stored area(s)`);
+    }
+
+    // --- v2.3.3: the drag-select overlay ---------------------------------
+    //
+    // A fullscreen St.Widget above the stage (outside uiGroup, so the
+    // overlay itself is NOT inverted), a modal grab, pointer events draw
+    // the rectangle, Esc cancels, release commits against the anchor
+    // window's frame rect.
+
+    pinSelectStart() {
+        if (!this._pins) {
+            return;
+        }
+        if (this._pinSelect) {
+            return;   // already selecting
+        }
+        if (!this._inverted) {
+            console.log('Invertonator: pin ignored — inversion is off');
+            Main.notify('Invertonator',
+                'Turn inversion on first (Super+I), then Super+F8.');
+            return;
+        }
+        const mw = global.display.get_focus_window?.();
+        if (!mw || mw.minimized || (mw.is_override_redirect?.() ?? false)) {
+            console.log('Invertonator: pin ignored — no anchor window');
+            Main.notify('Invertonator',
+                'No focused window to anchor the area to.');
+            return;
+        }
+
+        const overlay = new St.Widget({
+            reactive: true,
+            layout_manager: new Clutter.FixedLayout(),
+            style: 'background: rgba(0, 0, 0, 0.35);',
+        });
+        overlay.add_constraint(new Clutter.BindConstraint({
+            source: global.stage,
+            coordinate: Clutter.BindCoordinate.ALL,
+        }));
+        const hint = new St.Label({
+            text: 'Drag a rectangle to store a true-color area · Esc cancels',
+            style: 'padding: 8px 14px; background: rgba(20, 20, 20, 0.85); ' +
+                'color: #eeeeee; border-radius: 6px; font-size: 13px;',
+        });
+        hint.set_position(24, 24);
+        overlay.add_child(hint);
+        const box = new St.Widget({
+            visible: false,
+            style: 'border: 2px dashed #4fc3f7; ' +
+                'background: rgba(79, 195, 247, 0.18);',
+        });
+        overlay.add_child(box);
+
+        global.stage.add_child(overlay);
+        global.stage.set_child_above_sibling(overlay, null);
+
+        this._pinSelect = {
+            overlay, box, mw,
+            mwTitle: mw.get_title?.() ?? '',
+            startX: 0, startY: 0, dragging: false, ids: [],
+        };
+        const s = this._pinSelect;
+        s.ids.push(overlay.connect('button-press-event',
+            (a, ev) => this._pinSelectPress(ev)));
+        s.ids.push(overlay.connect('motion-event',
+            (a, ev) => this._pinSelectMotion(ev)));
+        s.ids.push(overlay.connect('button-release-event',
+            (a, ev) => this._pinSelectRelease(ev)));
+        s.ids.push(overlay.connect('key-press-event',
+            (a, ev) => this._pinSelectKey(ev)));
+        try {
+            this._pinGrab = Main.pushModal(overlay,
+                { actionMode: Shell.ActionMode.ALL });
+        } catch (e) {
+            this.pinSelectCancel();
+            console.warn(`Invertonator: selection grab failed (${e})`);
+            Main.notify('Invertonator', 'Selection grab failed — see journal.');
+            return;
+        }
+        console.log('Invertonator: area selection started — drag a ' +
+            `rectangle (anchor "${s.mwTitle}"), Esc cancels`);
+    }
+
+    _pinSelectPress(ev) {
+        const s = this._pinSelect;
+        if (!s) {
+            return Clutter.EVENT_PROPAGATE;
+        }
+        if (ev.get_button() !== 1) {
+            this.pinSelectCancel();
+            return Clutter.EVENT_STOP;
+        }
+        const [x, y] = ev.get_coords();
+        s.startX = x;
+        s.startY = y;
+        s.dragging = true;
+        s.box.visible = true;
+        s.box.set_position(x, y);
+        s.box.set_size(1, 1);
+        return Clutter.EVENT_STOP;
+    }
+
+    _pinSelectMotion(ev) {
+        const s = this._pinSelect;
+        if (!s || !s.dragging) {
+            return Clutter.EVENT_PROPAGATE;
+        }
+        const [x, y] = ev.get_coords();
+        s.box.set_position(Math.min(s.startX, x), Math.min(s.startY, y));
+        s.box.set_size(Math.max(Math.abs(x - s.startX), 1),
+            Math.max(Math.abs(y - s.startY), 1));
+        return Clutter.EVENT_STOP;
+    }
+
+    _pinSelectRelease(ev) {
+        const s = this._pinSelect;
+        if (!s || !s.dragging) {
+            return Clutter.EVENT_PROPAGATE;
+        }
+        const [x, y] = ev.get_coords();
+        const bx = Math.min(s.startX, x);
+        const by = Math.min(s.startY, y);
+        const bw = Math.abs(x - s.startX);
+        const bh = Math.abs(y - s.startY);
+        if (bw < PIN_MIN_EDGE || bh < PIN_MIN_EDGE) {
+            this.pinSelectCancel();
+            Main.notify('Invertonator', 'Selection too small — nothing stored.');
+            return Clutter.EVENT_STOP;
+        }
+        this._pinSelectCommit(bx, by, bw, bh);
+        return Clutter.EVENT_STOP;
+    }
+
+    _pinSelectKey(ev) {
+        if (ev.get_key_symbol() === Clutter.KEY_Escape) {
+            this.pinSelectCancel();
+            return Clutter.EVENT_STOP;
+        }
+        return Clutter.EVENT_PROPAGATE;
+    }
+
+    _pinSelectCommit(x, y, w, h) {
+        const s = this._pinSelect;
+        // Input first — never leave the user grabbed while we compute.
+        this._pinSelectTeardown();
+        try {
+            let fr = null;
+            try {
+                fr = s.mw?.get_frame_rect?.() ?? null;
+            } catch (e) {}
+            if (!fr || fr.width <= 0) {
+                fr = global.display.get_focus_window?.()
+                    ?.get_frame_rect?.() ?? null;
+            }
+            if (!fr || fr.width <= 0) {
+                Main.notify('Invertonator', 'Anchor window gone — nothing stored.');
+                return;
+            }
+            const rel = [
+                Math.min(Math.max((x - fr.x) / fr.width, 0), 1),
+                Math.min(Math.max((y - fr.y) / fr.height, 0), 1),
+                Math.min(Math.max((x + w - fr.x) / fr.width, 0), 1),
+                Math.min(Math.max((y + h - fr.y) / fr.height, 0), 1),
+            ].map(v => Math.round(v * 10000) / 10000);
+            if (rel[2] - rel[0] < PIN_MIN_REL || rel[3] - rel[1] < PIN_MIN_REL) {
+                Main.notify('Invertonator', 'Selection too small — nothing stored.');
+                return;
+            }
+            const tokens = this._pinTokensFromTitle(s.mwTitle);
+            const entry = {
+                rel,
+                cls: (s.mw?.get_wm_class?.() ?? '').toLowerCase(),
+                tokens,
+                ts: Date.now(),
+            };
+            // Re-storing the exact same area replaces the old pin instead
+            // of piling up duplicates.
+            const sig = JSON.stringify([entry.rel, entry.tokens, entry.cls]);
+            this._pinEntries = this._pinEntries.filter(e2 =>
+                JSON.stringify([e2.rel, e2.tokens ?? [], e2.cls ?? '']) !== sig);
+            this._pinEntries.push(entry);
+            while (this._pinEntries.length > PIN_MAX_ENTRIES) {
+                this._pinEntries.shift();
+            }
+            this._pinSaveEntries();
+            this._pinsRefresh();
+            const match = tokens.length
+                ? `title tokens [${tokens.join(', ')}]`
+                : `class "${entry.cls}"`;
+            console.log(`Invertonator: area stored — match ${match}, ` +
+                `rel=${JSON.stringify(entry.rel)}`);
+            Main.notify('Invertonator',
+                'Area stored — it re-applies whenever a matching window shows up.');
+        } catch (err) {
+            console.warn(`Invertonator: storing area failed (${err})`);
+        }
+    }
+
+    pinSelectCancel(silent = false) {
+        if (!this._pinSelect) {
+            return;
+        }
+        this._pinSelectTeardown();
+        if (!silent) {
+            console.log('Invertonator: area selection cancelled');
+        }
+    }
+
+    _pinSelectTeardown() {
+        const s = this._pinSelect;
+        if (!s) {
+            return;
+        }
+        this._pinSelect = null;
+        for (const id of s.ids) {
+            try { s.overlay.disconnect(id); } catch (e) {}
+        }
+        // GNOME 45+: popModal wants the grab handle returned by pushModal;
+        // destroying the grabbed actor releases any surviving grab anyway.
+        try {
+            Main.popModal(this._pinGrab ?? s.overlay);
+        } catch (e) {
+            try { this._pinGrab?.dismiss?.(); } catch (e2) {}
+        }
+        this._pinGrab = null;
+        try { s.overlay.destroy(); } catch (e) {}
+    }
+
     accelFor(key, fallback) {
         try {
             const accels = this._settings?.get_strv(key);
@@ -2057,6 +2710,10 @@ export default class InvertonatorExtension extends Extension {
             // would make that window the ONLY inverted thing on screen.
             this.clearHoles();
             this._mediaStop();
+            // v2.3.3: pin effects go with the shaders; the STORED entries
+            // stay in gsettings for the next enable.
+            this._pinStopTimer();
+            this._pinsDestroyAll();
         } else {
             // Windows already fullscreen when inversion comes on (user was
             // watching video, then inverted): give the first media walk a
@@ -2074,6 +2731,12 @@ export default class InvertonatorExtension extends Extension {
                 this._syncFullscreenHoles();
             }
             this._mediaStart();
+            // v2.3.3: stored pins come back with the inversion — reload
+            // (settings may have changed since), scan, and start the cheap
+            // title-matching tick.
+            this._pinLoadEntries();
+            this._pinsRefresh();
+            this._pinStartTimer();
         }
         try {
             this._settings.set_boolean('start-enabled', on);

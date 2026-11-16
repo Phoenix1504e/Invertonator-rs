@@ -2,7 +2,7 @@
 # Invertonator-rs — Linux auto-hole diagnostics (one shot, no root, no net).
 #
 # Collects everything needed to debug "media lock-on finds nothing":
-#   1. running vs installed extension version
+#   1. running vs installed extension version + stored area pins
 #   2. session / shell info
 #   3. toolkit-accessibility gsetting
 #   4. browser accessibility prefs (LibreWolf / Firefox, native + flatpak)
@@ -28,6 +28,8 @@ if [ -f "$MD" ]; then
 else
     echo "  NOT INSTALLED at ~/.local/share/gnome-shell/extensions/"
 fi
+echo "  stored area pins (Super+F8 feature):"
+gsettings get org.gnome.shell.extensions.invertonator pinned-holes 2>&1 | sed 's/^/    /'
 
 sec "2. Session"
 echo "  XDG_SESSION_TYPE=$XDG_SESSION_TYPE  XDG_CURRENT_DESKTOP=$XDG_CURRENT_DESKTOP"

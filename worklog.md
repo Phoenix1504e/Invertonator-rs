@@ -467,3 +467,30 @@ Delivered: zip `Invertonator-rs <sha> 0.3.0-alpha.24` + changed-files mirror byt
 | D3: probe sees media, extension walk still media=0 | diag YES + journal media=0 with carried progressing | matching/walk bug — probe pid/name table vs extension app match; next code round targets _mediaResolveFrames |
 | D4: cache hits=0 forever (wrap mode unstable) | converging lines hits=0 across ticks | walk still converges via carry-over; consider cache by (parent-path,index) composite keys |
 | D5: bake-clip line | rects found but nothing punches | paint-volume anchor rework (R1 path, unchanged) |
+
+## Task 26 — alpha.27: stored area pins ("select an area once, it gets stored")
+
+### Field context
+- USER accepted the current auto-hole state ("this is probably fine tbh") and asked for a SELECTION PROMPT that stores an area ONCE — "and it gets stored for youtube as it doesnt change". Directly addresses the discovery problem from rounds 10-12 WITHOUT touching the walker: where the AT-SPI tree is closed (LibreWolf hardened builds, round-11 finding) a user-selected stored rect is the only discovery that can work.
+- Design constraint taken from the user's own words: YouTube's layout does not change relative to the window → store the rect NORMALIZED to the focused window's frame (rel 0..1), not absolute pixels — window moves and resizes follow, other videos on the same site match too.
+
+### alpha.27 changes (v2.3.3)
+- SCHEMA: new keys `pin-hole` (as, default `['<Super>F8']`) and `pinned-holes` (s, JSON array, default '[]'); compiled schema shipped updated; install.sh now verifies SIX keys.
+- SELECTION (`pinSelectStart`, Super+F8 / panel menu "Pin a stored area"): fullscreen St.Widget ABOVE the stage (outside uiGroup — the overlay itself is NOT inverted), BindConstraint to the stage, modal grab via Main.pushModal (handle kept; legacy popModal fallback), pointer draw (dashed blue rect), Esc/right-click cancel, commit on release. Selection smaller than 24px or 2% rel → nothing stored. Requires inversion ON and a focused non-OR anchor window.
+- STORAGE: the rect is stored rel to the anchor window's frame (4 decimals) + match tokens from the title: split on — – | " - " separators, drop app-name segments (PIN_APP_TOKENS: browsers + players), keep up to 4 tokens 4-48 chars. "Song X - YouTube — Mozilla Firefox" → ["song x","youtube"]. Tokens empty → class match fallback. Dedupe identical stores; cap 16 (oldest evicted); persisted in gsettings — survives reboots.
+- MATCHING: title-first (ANY token contained in the window title — a different video still matches via "- youtube"), class fallback otherwise. Scan = 2s timer + focus-change + window-created hooks, pure string ops, no D-Bus.
+- APPLY: one rect-shader hole per matching VISIBLE window at the stored relative position (same buildRectFragment machinery as media rects; rides the actor — moves free, resizes re-bake via size-changed). Fullscreen matching windows are skipped; a pinned window that GOES fullscreen drops its pin (windowed layout is meaningless there) and the fullscreen auto-hole/media rects take over; un-fullscreening restores the pin.
+- PRIORITY: manual Super+F7 pierce > stored pins > media rects > fullscreen auto-hole. `_mediaPublish` skip() now includes `_pins`; the fullscreen fallback refuses pinned windows; `_addHole` (manual/auto whole-window) drops the pin and removeHole restores it.
+- UI: panel menu gains "Pin a stored area", a "Stored areas: N" submenu (one row per pin: title tokens/class + rel coords, click forgets that entry) and "Forget all stored areas"; rebuildPins is signature-guarded (the 2s tick must not churn the open menu).
+- DIAG: invertonator-diag.sh section 1 now prints the stored pins.
+- Versions: metadata 27, Cargo/common.rs 0.3.0-alpha.27. Walker/walker-priority code otherwise untouched — alpha.26's re-root fix stands.
+
+### Risk table for round 13 (pre-registered)
+| Branch | Evidence in field | Verdict path |
+|---|---|---|
+| P1: pin works end-to-end | Super+F8 drag → `area stored — match title tokens [song x, youtube]` journal → close window → reopen YouTube → `stored area applied` within ≤2s, rect true color at the same relative spot | DONE — v2.3.3 quality pass |
+| P2: grab API mismatch (popModal/pushModal shape on 51) | journal `selection grab failed` or a stuck overlay/input after Esc | overlay.destroy() already releases grabs (Clutter auto-dismiss); adjust teardown if a stuck grab is reported |
+| P3: rel drift on browser UI scaling (fractional HiDPI) | stored rect lands slightly off the player after window resize | bake diag line (`rect bake`) vs screenshot; consider storing rel against the CONTENT rect (window minus shadow) instead of frame rect |
+| P4: false-positive matches (token too generic) | pin appears on non-YouTube windows (e.g. token = short common word) | submenu row shows tokens; user forgets the entry; consider requiring ≥2 tokens matched when title has >2 segments |
+| P5: fullscreen pin conflict | fullscreen shows a mis-shapen true rect | should be impossible (pins dropped on fullscreen) — if seen, the fullscreen check missed a path; check `stored area dropped (window went fullscreen)` line |
+| Everything green | pinned YouTube window: instant true rect, zero walk needed; media walk irrelevant on that window | v2.3.3 converged; next = per-monitor pin variants, Windows-side analog (F8 UIA rect store) |
