@@ -25,17 +25,42 @@
 //   Hotkey: Super+I (NOT F5 — a shell-level grab of a plain F-key
 //   would shadow the browser's refresh shortcut system-wide).
 //
-//   v2 holes (alpha.20): F7 "pierce" — the Windows Magnifier analog.
+//   v2 holes (alpha.20): Super+F7 "pierce" — the Windows Magnifier analog.
 //   A hole is the SAME inversion shader attached a SECOND time, to the
 //   picked window actor itself. Inversion is an involution (1-x), so a
 //   window its own effect paints inverted and uiGroup's global pass
 //   paints again comes out TRUE COLOR — a hole punched through the
 //   global inversion covering exactly that window (moves, resizes and
 //   fullscreening follow automatically; no rectangle tracking, no
-//   overlay windows). F7 picks the topmost window under the pointer;
+//   overlay windows). Super+F7 picks the topmost window under the pointer;
 //   press again over the same window to close the hole; turning
 //   inversion off clears every hole. (Windows additionally auto-holes
 //   media via UIA — the AT-SPI2 auto-media analog is v2.1.)
+//
+//   v2.1 holes (alpha.22) — "holes everywhere":
+//     * Hole manager: the panel menu lists every hole by window title;
+//       click a row to close that one hole (per-window bookkeeping made
+//       visible). Indicator count + submenu live-update together.
+//     * Fullscreen auto-hole (the video feature): while inversion is on,
+//       any window that goes fullscreen is pierced AUTOMATICALLY —
+//       YouTube fullscreen, mpv, VLC, games come up true color without
+//       touching the hotkey (the UIA auto-media analog, heuristic
+//       edition; element-level AT-SPI2 rects are v2.2). Manual holes are
+//       never auto-removed by un-fullscreening; auto holes are. Opt out:
+//       gsettings set org.gnome.shell.extensions.invertonator
+//       auto-hole-fullscreen false
+//     * Per-tab truth: a browser window is ONE buffer to the compositor
+//       — tabs are web content inside it. A hole covers whichever tab
+//       is showing and follows tab switches for free; the shell cannot
+//       tell tabs apart (that is web content inside one buffer).
+//     * Hole survival: if Mutter recreates a window actor (remap paths),
+//       the hole reattaches to the new actor via an idle re-check;
+//       window close drops its hole cleanly (unmanaged safety net).
+//     * Direct-scanout guard: inversion disables unredirect/direct
+//       scanout where the Mutter API exists, so a fullscreen video can
+//       never bypass the compositor shaders.
+//     * Pick includes override-redirect windows (context menus,
+//       tooltips) — pierce those too.
 //
 // Tested against the GNOME 45-51 extension API surface (ESM imports,
 // Extension.getSettings, Main.wm.addKeybinding, PanelMenu.Button).
@@ -53,6 +78,7 @@
 
 import Clutter from 'gi://Clutter';
 import Cogl from 'gi://Cogl';
+import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
 import St from 'gi://St';
 import Meta from 'gi://Meta';
@@ -128,10 +154,15 @@ const Indicator = GObject.registerClass(
             this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
             const pierceItem = new PopupMenu.PopupMenuItem(
-                'Pierce window under pointer (F7)'
+                `Pierce window under pointer (${this._ext.accelFor('toggle-pierce', 'Super+F7')})`
             );
             pierceItem.connect('activate', () => this._ext.pierce());
             this.menu.addMenuItem(pierceItem);
+
+            // v2.1: per-hole manager — one row per hole, click to close it.
+            this._holeSub = new PopupMenu.PopupSubMenuMenuItem('Holes: 0');
+            this.menu.addMenuItem(this._holeSub);
+            this.rebuildHoles([]);
 
             const clearItem = new PopupMenu.PopupMenuItem('Clear all holes');
             clearItem.connect('activate', () => this._ext.clearHoles());
@@ -144,6 +175,23 @@ const Indicator = GObject.registerClass(
                   (holes > 0 ? ` · ${holes} hole${holes > 1 ? 's' : ''}` : ''))
                 : 'Inversion: OFF';
         }
+
+        // v2.1: one row per hole — "title — class (auto)", click closes it.
+        rebuildHoles(infos) {
+            this._holeSub.menu.removeAll();
+            this._holeSub.label.text = `Holes: ${infos.length}`;
+            if (infos.length === 0) {
+                this._holeSub.menu.addMenuItem(new PopupMenu.PopupMenuItem(
+                    'none — pierce a window first', { reactive: false }));
+                return;
+            }
+            for (const info of infos) {
+                const row = new PopupMenu.PopupMenuItem(
+                    `${info.title} — ${info.cls}${info.auto ? ' (auto)' : ''}`);
+                row.connect('activate', () => this._ext.removeHole(info.mw));
+                this._holeSub.menu.addMenuItem(row);
+            }
+        }
     }
 );
 
@@ -151,7 +199,12 @@ export default class InvertonatorExtension extends Extension {
     enable() {
         this._settings = this.getSettings(SCHEMA);
         this._inverted = false;
-        this._holes = new Map(); // Meta.Window -> {actor, mw, effect, destroyId}
+        // Meta.Window -> {mw, actor, effect, destroyId, unmanagedId, auto}
+        this._holes = new Map();
+        // Meta.Window -> {notifyId, unmanagedId} — fullscreen auto-hole
+        this._fullscreenWatch = new Map();
+        this._unredirectDisabled = false;
+        this._windowCreatedId = 0;
 
         try {
             this._effect = makeInvertEffect();
@@ -171,10 +224,17 @@ export default class InvertonatorExtension extends Extension {
         this._addBinding('toggle-invert', () => this.toggle());
         this._addBinding('toggle-pierce', () => this.pierce());
 
+        // v2.1: fullscreen auto-hole — watch every window's fullscreen
+        // state (existing windows now, future windows via window-created).
+        this._windowCreatedId = global.display.connect('window-created',
+            (display, mw) => this._watchWindow(mw));
+        this._watchAllWindows();
+
         if (this._settings.get_boolean('start-enabled')) {
             this.setInverted(true);
         }
-        console.log(`Invertonator ${this.metadata.version} enabled — Super+I invert, F7 pierce hole`);
+        console.log(`Invertonator ${this.metadata.version} enabled — ` +
+            'Super+I invert · Super+F7 pierce · fullscreen auto-hole');
     }
 
     disable() {
@@ -182,6 +242,12 @@ export default class InvertonatorExtension extends Extension {
         // staring at an inverted screen with the toggle gone. Also clears
         // every hole (they are meaningless without the global pass).
         this.setInverted(false);
+        if (this._windowCreatedId) {
+            try { global.display.disconnect(this._windowCreatedId); } catch (e) {}
+            this._windowCreatedId = 0;
+        }
+        this._clearFullscreenWatch();
+        this._setUnredirectDisabled(false);
         try {
             Main.wm.removeKeybinding('toggle-invert');
         } catch (e) {}
@@ -192,6 +258,8 @@ export default class InvertonatorExtension extends Extension {
         this._indicator = null;
         this._effect = null;
         this._holes = null;
+        this._fullscreenWatch = null;
+        this._unredirectDisabled = false;
         this._settings = null;
     }
 
@@ -243,7 +311,13 @@ export default class InvertonatorExtension extends Extension {
         const candidates = [];
         for (const actor of global.get_window_actors()) {
             const mw = actor.get_meta_window?.();
-            if (!mw || mw.minimized || !mw.showing_on_its_workspace()) {
+            if (!mw || mw.minimized) {
+                continue;
+            }
+            // v2.1: override-redirect windows (menus, tooltips) skip the
+            // workspace check — they belong to no workspace at all.
+            const isOr = mw.is_override_redirect?.() ?? false;
+            if (!isOr && !mw.showing_on_its_workspace()) {
                 continue;
             }
             const r = mw.get_frame_rect();
@@ -277,7 +351,7 @@ export default class InvertonatorExtension extends Extension {
         const cls = top.mw.get_wm_class() ?? 'unknown';
         const title = top.mw.get_title() ?? 'window';
         if (this._holes.has(top.mw)) {
-            this._removeHole(top.mw);
+            this.removeHole(top.mw);
             console.log(`Invertonator: hole OFF (${cls}) "${title}"`);
             Main.notify('Invertonator', `Hole OFF: ${title}`);
         } else {
@@ -286,7 +360,7 @@ export default class InvertonatorExtension extends Extension {
                 'window re-inverts the global pass = true color');
             Main.notify('Invertonator', `Hole ON: ${title}`);
         }
-        this._indicator?.setState(this._inverted, this._holes.size);
+        this._refreshHoleUI();
     }
 
     clearHoles() {
@@ -295,28 +369,37 @@ export default class InvertonatorExtension extends Extension {
         }
         const n = this._holes.size;
         for (const mw of [...this._holes.keys()]) {
-            this._removeHole(mw);
+            this.removeHole(mw);
         }
         console.log(`Invertonator: cleared ${n} hole(s)`);
-        this._indicator?.setState(this._inverted, this._holes.size);
+        this._refreshHoleUI();
     }
 
-    _addHole(actor, mw) {
-        const hole = { actor, mw, effect: makeInvertEffect(), destroyId: 0 };
-        hole.destroyId = actor.connect('destroy', () => {
-            // Window closed with its hole still on — the actor (and its
-            // effects) die with it; just drop the bookkeeping.
-            if (this._holes.get(mw) === hole) {
+    _addHole(actor, mw, auto = false) {
+        const hole = {
+            mw, actor, effect: makeInvertEffect(),
+            destroyId: 0, unmanagedId: 0, auto,
+        };
+        hole.destroyId = actor.connect('destroy', () =>
+            this._onHoleActorDestroyed(mw, hole));
+        hole.unmanagedId = mw.connect('unmanaged', () => {
+            // Window closed — the actor destroy usually fires first and
+            // handles the drop; this is the safety net.
+            if (this._holes && this._holes.get(mw) === hole) {
                 this._holes.delete(mw);
-                this._indicator?.setState(this._inverted, this._holes.size);
+                this._refreshHoleUI();
+                console.log('Invertonator: hole dropped (unmanaged): ' +
+                    (mw.get_title?.() ?? '?'));
             }
         });
         actor.add_effect(hole.effect);
         this._holes.set(mw, hole);
+        this._refreshHoleUI();
+        return hole;
     }
 
-    _removeHole(mw) {
-        const hole = this._holes.get(mw);
+    removeHole(mw) {
+        const hole = this._holes?.get(mw);
         if (!hole) {
             return;
         }
@@ -325,8 +408,218 @@ export default class InvertonatorExtension extends Extension {
             if (hole.destroyId) {
                 hole.actor.disconnect(hole.destroyId);
             }
+            if (hole.unmanagedId) {
+                mw.disconnect(hole.unmanagedId);
+            }
         } catch (e) {}
         this._holes.delete(mw);
+        this._refreshHoleUI();
+    }
+
+    _onHoleActorDestroyed(mw, hole) {
+        if (!this._holes || this._holes.get(mw) !== hole) {
+            return;
+        }
+        // Mutter can recreate a window actor on remap paths (monitor
+        // changes, some reconfigurations). Give the new actor a beat to
+        // appear, then reattach; if the window is really gone, drop the
+        // hole. The dying actor takes the old effect with it — nothing to
+        // remove, only new bookkeeping.
+        GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+            if (!this._holes || this._holes.get(mw) !== hole) {
+                return GLib.SOURCE_REMOVE;
+            }
+            let next = null;
+            try {
+                next = mw.get_compositor_private?.() ?? null;
+            } catch (e) {}
+            if (next && next !== hole.actor) {
+                console.log('Invertonator: hole reattached to a recreated actor (' +
+                    (mw.get_title?.() ?? '?') + ')');
+                hole.actor = next;
+                hole.effect = makeInvertEffect();
+                hole.destroyId = next.connect('destroy', () =>
+                    this._onHoleActorDestroyed(mw, hole));
+                next.add_effect(hole.effect);
+            } else {
+                this._holes.delete(mw);
+                try {
+                    if (hole.unmanagedId) {
+                        mw.disconnect(hole.unmanagedId);
+                    }
+                } catch (e) {}
+                console.log('Invertonator: hole dropped (window closed): ' +
+                    (mw.get_title?.() ?? '?'));
+                this._refreshHoleUI();
+            }
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    listHoles() {
+        const infos = [];
+        for (const [mw, hole] of this._holes) {
+            infos.push({
+                mw,
+                title: mw.get_title?.() ?? 'unnamed window',
+                cls: mw.get_wm_class?.() ?? 'unknown',
+                auto: hole.auto,
+            });
+        }
+        return infos;
+    }
+
+    _refreshHoleUI() {
+        this._indicator?.setState(
+            this._inverted, this._holes ? this._holes.size : 0);
+        this._indicator?.rebuildHoles(
+            this._holes ? this.listHoles() : []);
+    }
+
+    // --- v2.1: fullscreen auto-hole (the video feature) -----------------
+    //
+    // The Windows backend auto-holes media via UIA classification. The
+    // Wayland analog starts with the fullscreen heuristic: a window that
+    // goes fullscreen while inversion is on is pierced automatically —
+    // YouTube fullscreen, mpv, VLC, games come up true color without
+    // touching the hotkey. Manual (auto=false) holes are NEVER
+    // auto-removed by un-fullscreening; auto holes are. Element-level
+    // holes (video element only, chrome stays dark) need AT-SPI2 rects —
+    // v2.2.
+
+    _watchAllWindows() {
+        for (const actor of global.get_window_actors()) {
+            const mw = actor.get_meta_window?.();
+            if (mw) {
+                this._watchWindow(mw);
+            }
+        }
+    }
+
+    _watchWindow(mw) {
+        if (!this._fullscreenWatch || this._fullscreenWatch.has(mw)) {
+            return;
+        }
+        try {
+            this._fullscreenWatch.set(mw, {
+                notifyId: mw.connect('notify::fullscreen', () =>
+                    this._onFullscreenChange(mw)),
+                unmanagedId: mw.connect('unmanaged', () => {
+                    this._fullscreenWatch?.delete(mw);
+                }),
+            });
+            // The handler is state-driven — this call covers windows that
+            // are ALREADY fullscreen at watch time (launched fullscreen
+            // while inverted).
+            this._onFullscreenChange(mw);
+        } catch (e) {
+            console.warn(`Invertonator: fullscreen watch failed (${e})`);
+        }
+    }
+
+    _onFullscreenChange(mw) {
+        if (!this._holes || !this._inverted) {
+            return;
+        }
+        let isFs = false;
+        try {
+            isFs = mw.fullscreen ?? mw.is_fullscreen?.() ?? false;
+        } catch (e) {}
+        let actor = null;
+        try {
+            actor = mw.get_compositor_private?.() ?? null;
+        } catch (e) {}
+        if (!actor) {
+            return;
+        }
+        const setting = !this._settings ||
+            this._settings.get_boolean('auto-hole-fullscreen');
+        if (isFs && setting && !this._holes.has(mw)) {
+            const title = mw.get_title?.() ?? 'window';
+            this._addHole(actor, mw, true);
+            console.log(`Invertonator: auto-hole ON (fullscreen) "${title}"`);
+            Main.notify('Invertonator', `Auto-hole ON: ${title}`);
+        } else if (!isFs) {
+            const hole = this._holes.get(mw);
+            if (hole && hole.auto) {
+                console.log('Invertonator: auto-hole OFF (left fullscreen) "' +
+                    (mw.get_title?.() ?? '?') + '"');
+                this.removeHole(mw);
+            }
+        }
+    }
+
+    _syncFullscreenHoles() {
+        // Inversion just turned ON — hole every currently-fullscreen
+        // watched window (subject to the setting).
+        if (!this._fullscreenWatch) {
+            return;
+        }
+        for (const mw of [...this._fullscreenWatch.keys()]) {
+            this._onFullscreenChange(mw);
+        }
+    }
+
+    _clearFullscreenWatch() {
+        if (!this._fullscreenWatch) {
+            return;
+        }
+        for (const [mw, entry] of this._fullscreenWatch) {
+            try { mw.disconnect(entry.notifyId); } catch (e) {}
+            try { mw.disconnect(entry.unmanagedId); } catch (e) {}
+        }
+        this._fullscreenWatch.clear();
+    }
+
+    // --- v2.1: direct-scanout guard --------------------------------------
+    //
+    // A fullscreen video window may be direct-scanned out, skipping the
+    // compositor FBO entirely — our shaders would never see its pixels.
+    // The uiGroup offscreen effect already forces compositing, so this is
+    // belt-and-braces insurance; the API moved across Mutter versions, so
+    // try both names.
+
+    _setUnredirectDisabled(dis) {
+        if (this._unredirectDisabled === dis) {
+            return;
+        }
+        try {
+            if (global.compositor?.disable_unredirect) {
+                if (dis) {
+                    global.compositor.disable_unredirect();
+                } else {
+                    global.compositor.enable_unredirect();
+                }
+                console.log(`Invertonator: unredirect ${dis ? 'disabled' : 'enabled'} (compositor API)`);
+            } else if (Meta.disable_unredirect_for_display) {
+                if (dis) {
+                    Meta.disable_unredirect_for_display(global.display);
+                } else {
+                    Meta.enable_unredirect_for_display(global.display);
+                }
+                console.log(`Invertonator: unredirect ${dis ? 'disabled' : 'enabled'} (Meta API)`);
+            } else {
+                console.log('Invertonator: no unredirect API — uiGroup effect already forces compositing');
+            }
+            this._unredirectDisabled = dis;
+        } catch (e) {
+            console.warn(`Invertonator: unredirect toggle failed (${e})`);
+        }
+    }
+
+    accelFor(key, fallback) {
+        try {
+            const accels = this._settings?.get_strv(key);
+            if (accels && accels.length > 0) {
+                return accels[0]
+                    .replace(/<Super>/g, 'Super+')
+                    .replace(/<Alt>/g, 'Alt+')
+                    .replace(/<Ctrl>/g, 'Ctrl+')
+                    .replace(/<Primary>/g, 'Ctrl+')
+                    .replace(/<Shift>/g, 'Shift+');
+            }
+        } catch (e) {}
+        return fallback;
     }
 
     setInverted(on) {
@@ -349,10 +642,17 @@ export default class InvertonatorExtension extends Extension {
             return;
         }
         this._inverted = on;
+        // v2.1: keep fullscreen video out of direct scanout while the
+        // shaders are active (see _setUnredirectDisabled).
+        this._setUnredirectDisabled(on);
         if (!on) {
             // Holes exist only relative to the global pass; leaving one on
             // would make that window the ONLY inverted thing on screen.
             this.clearHoles();
+        } else {
+            // Windows already fullscreen when inversion comes on (user
+            // was watching video, then inverted) — hole them now.
+            this._syncFullscreenHoles();
         }
         try {
             this._settings.set_boolean('start-enabled', on);

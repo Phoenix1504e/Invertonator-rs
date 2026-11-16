@@ -4,7 +4,7 @@
 
 ![Invertonator](icon.svg)
 
-> **Status: v0.3.0-alpha.21 — Linux v2 holes SHIPPED (GNOME/Wayland)**:
+> **Status: v0.3.0-alpha.22 — Linux v2.1 holes everywhere (GNOME/Wayland)**:
 > **Super+F7** pierces a true-color hole into the window under the
 > pointer while everything around it stays inverted — the Windows
 > F7-pierce analog (plain F7 is browser-claimed — caret browsing — so
@@ -31,6 +31,20 @@
 > alpha.21 hardening: keybinding registration journals itself (accel +
 > action id at enable) and install.sh verifies every hotkey key is in
 > the installed compiled schema.
+> alpha.22 holes-everywhere (v2.1): a panel-menu HOLE MANAGER (one row
+> per hole — title + class, click to close that hole); FULLSCREEN
+> AUTO-HOLE — while inversion is on, a window going fullscreen
+> (YouTube fullscreen, mpv, VLC, games) is pierced automatically
+> true-color, the UIA auto-media analog heuristic edition
+> (`auto-hole-fullscreen` gsettings opt-out; manual holes are never
+> auto-removed by un-fullscreening); hole SURVIVAL — a hole reattaches
+> when Mutter recreates the window actor and drops cleanly on window
+> close; a DIRECT-SCANOUT guard while inverted (fullscreen video can
+> never bypass the compositor shaders); override-redirect windows
+> (menus, tooltips) are pierceable. Per-tab truth: a browser window is
+> ONE buffer to the compositor — a hole covers whichever tab is
+> showing and follows tab switches for free; element-level AT-SPI2
+> rects are v2.2.
 > alpha.18 kept: install.sh honesty lines + APPLY zip-freshness gate.
 > alpha.16 kept: GNOME/Wayland backend shipped (compositor-level
 > fragment-shader stage inversion, Super+I, panel indicator, reboot
@@ -78,7 +92,7 @@
 |---|---|---|---|
 | Windows 10+ | Magnifier API (compositor) | ✅ UIA tracker | `Ctrl+Alt+F5` invert · `F6` mode · `F7` pierce · `F2` quit |
 | Linux (X11) | XRandR CRTC gamma | 🚧 v2 (XComposite overlay) — media inverts too for now | `Ctrl+Alt+I` toggle · `Ctrl+Alt+Q` quit |
-| Linux (GNOME/Wayland) | Shell extension — compositor shader | ✅ **v2 shipped** — Super+F7 pierce (window under pointer); AT-SPI2 auto-media = v2.1 | `Super+I` invert · `Super+F7` pierce · panel menu |
+| Linux (GNOME/Wayland) | Shell extension — compositor shader | ✅ **v2.1 shipped** — Super+F7 pierce + hole manager + fullscreen video auto-hole; AT-SPI2 element rects = v2.2 | `Super+I` invert · `Super+F7` pierce · panel menu |
 | Linux (KDE/Wayland) | KWin's built-in Invert effect | ❌ | user-bound |
 | macOS | ❌ unsupported | ❌ | — |
 
@@ -86,7 +100,9 @@ If a Linux X11 run is killed while inverted, the ramp persists until you
 run `invertonator --restore` (pushes identity ramps and exits). The
 Wayland extension restores colors automatically on disable/quit. GNOME
 holes are session-transient: toggling inversion off clears them —
-re-pierce with F7.
+re-pierce with Super+F7. Fullscreen windows auto-hole while inversion
+is on (video: YouTube fullscreen, mpv, VLC); opt out with
+`gsettings set org.gnome.shell.extensions.invertonator auto-hole-fullscreen false`.
 
 No Linux box of your own? Run `invertonator --self-test` on any Linux
 machine — it prints a paste-back diagnostic report (session type, gamma
@@ -233,7 +249,12 @@ Tor Browser) cannot detect it — there is nothing in the web layer to detect.
   Firefox support
 - **v2.0** — Linux true-color holes (X11 XComposite overlay · GNOME/Wayland
   per-window-actor inversion with a picked un-inverted window — **GNOME
-  side shipped as alpha.20 F7 pierce**), AT-SPI2 discovery
+  side shipped as alpha.20 Super+F7 pierce**), AT-SPI2 discovery
+- **v2.1** — **GNOME holes-everywhere shipped as alpha.22**: hole manager
+  menu, fullscreen video auto-hole, actor-recreate survival, scanout
+  guard, OR-window pierce
+- **v2.2** — GNOME element-level holes via AT-SPI2 rects (video element
+  only, browser chrome stays dark)
 - **research** — compositor-level video handling, other Wayland compositors
 
 ## Credits & thanks

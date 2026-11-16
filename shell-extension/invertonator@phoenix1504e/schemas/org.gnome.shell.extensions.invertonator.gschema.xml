@@ -25,6 +25,16 @@
             gsettings set org.gnome.shell.extensions.invertonator toggle-pierce
             "['&lt;Super&gt;F7']"</description>
         </key>
+        <key name="auto-hole-fullscreen" type="b">
+            <default>true</default>
+            <summary>Auto-hole fullscreen windows (fullscreen video)</summary>
+            <description>While inversion is on, any window that goes fullscreen
+            is pierced automatically true-color — YouTube fullscreen, mpv, VLC,
+            games. Leave it off to keep fullscreen windows inverted (opt out:
+            gsettings set org.gnome.shell.extensions.invertonator
+            auto-hole-fullscreen false). Manual Super+F7 holes are unaffected
+            and are never auto-removed by un-fullscreening.</description>
+        </key>
         <key name="start-enabled" type="b">
             <default>false</default>
             <summary>Inversion state</summary>

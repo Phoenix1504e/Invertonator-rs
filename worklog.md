@@ -244,3 +244,74 @@ holes (pending user go).
   (paste decides); registered with accel=["<Super>F7"] but Super+F7 no-op →
   mutter grab failure on Super+F-keys (unprecedented; would demand journal);
   everything green → v2.1 AT-SPI2 auto-media is next (user go pending).
+
+## Task 21 — alpha.22: v2.1 "holes everywhere" (manager, fullscreen video auto-hole, survival, scanout guard)
+
+### Field report chain (alpha.21)
+- User: "**yea both keys work**" — Super+I AND Super+F7 both confirmed live on
+  Fedora 45 / GNOME 51 / Wayland. Round-7 risk branches all cleared: the
+  registered-line journaling + Super+F7 rebind fixed the last dead branch; no
+  journal paste needed.
+- User: "**lets try to make the holes work per tab, per window and holes on
+  video and things**" — the v2.1 go signal.
+
+### Scope decision
+- "Per tab": a browser window is ONE buffer to the compositor — tabs are web
+  content inside it. A window hole covers whichever tab is showing and follows
+  tab switches for FREE (nothing to implement; documented honestly). Element-level
+  holes (video element only, chrome stays dark) need AT-SPI2 rects — deferred to
+  v2.2/alpha.23, not attempted this round (needs its own field evidence loop).
+- "Per window": holes were already multi + per-actor; what was missing is
+  VISIBILITY and individual control → hole manager submenu.
+- "Video": the fullscreen heuristic ships NOW (UIA auto-media analog, heuristic
+  edition) — fullscreen video is the dominant video experience and the window
+  state is compositor-visible. Native players = manual Super+F7 (proven). PiP =
+  manual pierce (pick includes OR windows now).
+- Windows side untouched (alpha.15 code, version bump only).
+
+### alpha.22 changes (sandbox; awaiting push)
+- extension.js:
+  - Indicator: `Holes: N` PopupSubMenuMenuItem — one row per hole
+    ("title — class (auto)"), click a row closes exactly that hole;
+    rebuildHoles() live-updates on every hole mutation via _refreshHoleUI().
+    Pierce menu item label now renders the LIVE accel from settings
+    (accelFor() pretty-printer) — no more stale "(F7)" text.
+  - Fullscreen auto-hole: every window watched (existing at enable +
+    window-created stream) via notify::fullscreen; while inverted and
+    auto-hole-fullscreen=true, a window entering fullscreen is pierced
+    automatically (auto=true hole, "Auto-hole ON: title" notify); leaving
+    fullscreen removes ONLY auto holes — manual holes never auto-removed.
+    setInverted(true) syncs holes for already-fullscreen windows.
+  - Hole survival: actor destroy → idle re-check (GLib.idle_add) →
+    mw.get_compositor_private() non-null and different → reattach fresh effect
+    to the recreated actor; else drop + disconnect unmanagedId. Every hole
+    also carries an 'unmanaged' safety net on the Meta.Window.
+  - Direct-scanout guard: _setUnredirectDisabled(on) while inverted —
+    global.compositor.disable_unredirect/enable_unredirect first, then
+    Meta.disable/enable_unredirect_for_display fallback, else honest journal
+    line (uiGroup offscreen effect already forces compositing; this is
+    belt-and-braces for fullscreen video direct scanout).
+  - Pick: OR windows (context menus, tooltips) skip the workspace check
+    (is_override_redirect) — pierceable now.
+  - removeHole() made public (manager rows + hotkey paths share it);
+    gschema adds auto-hole-fullscreen (b, default TRUE — user asked for it).
+- install.sh: schema-check loop now verifies 4 keys (incl. auto-hole-fullscreen);
+  auto-hole lines in both echo paths. metadata v22. Cargo trio →
+  0.3.0-alpha.22. README (status headline, matrix row, session-transient note,
+  roadmap v2.1 shipped / v2.2 AT-SPI2). APPLY.md rewritten (alpha.22, 7-step
+  protocol incl. per-tab switch, 2-window manager, YouTube fullscreen
+  auto-hole, manual-hole persistence). Sandbox gates green: node --check OK,
+  glib-compile-schemas --strict OK, all 4 keys present in compiled schema,
+  metadata JSON parses, install.sh bash -n clean.
+
+### Risk table for round 8 (pre-registered)
+| Branch | Evidence in field | Verdict path |
+|---|---|---|
+| R1: notify::fullscreen absent/never fires for some window types | no "Auto-hole ON" line on YouTube fullscreen | journal paste decides; fallback = re-check in size-changed, or poll at 1Hz while inverted |
+| R2: false-positive auto-holes annoy (games/fullscreen editors holed too) | user wants fullscreen terminal NOT true color | gsettings auto-hole-fullscreen false (documented); or v2.2 AT-SPI2 gates auto-hole to real media |
+| R3: disable_unredirect API mismatch on GNOME 51 | "no unredirect API" journal line (honest, harmless) | none needed — insurance only; uiGroup effect already forces compositing |
+| R4: manager rows leak/duplicate | duplicate rows or stale rows after window close | listHoles is rebuilt from the live Map on every mutation; unmanaged drops entries — journal shows "hole dropped" |
+| R5: reattach loop on rapid actor churn | repeated "hole reattached" lines | reattach only fires from a destroy of the CURRENT hole actor; guarded by map identity check |
+| Everything green | all 7 protocol steps pass | next = v2.2 AT-SPI2 element rects (video-element-only holes), user go pending |
+
+Delivered: zip `Invertonator-rs <sha> 0.3.0-alpha.22` + changed-files mirror byte-verified.
