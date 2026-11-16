@@ -1,11 +1,46 @@
-# Invertonator-rs — Full Source Package (v0.3.0-alpha.25, auto-hole convergence fix)
+# Invertonator-rs — Full Source Package (v0.3.0-alpha.26, field-round-11 walk fix)
 
 Complete repo at a fixed state — extract over your clone, commit, push.
 No `.git` inside, your history is untouched.
 
 ---
 
-## What alpha.25 fixes ("still the holes are not automatic")
+## What alpha.26 fixes (field round 11 — journal proved the thrash)
+
+Your journal finally landed the diagnosis. It showed alpha.25 running,
+event capture alive (via the `EventListener.register` fallback — your
+AT-SPI build has no static `add_callback`), the carry-over working —
+and `media=0` across six 480-call walks on a YouTube page, with the
+carried queue reset to 0 after the first tick:
+
+1. **RE-ROOT THRASH (the killer).** YouTube emits AT-SPI
+   `children-changed` events continuously while playing (progress bar,
+   buffering, DOM churn). alpha.25 treated every one as "the tree
+   changed, restart the walk" — so the BFS restarted from the browser
+   chrome every tick and NEVER reached the content document where the
+   video and thumbnails live. alpha.26: only page loads
+   (`document:load-complete/stopped`) re-root; `children-changed` merely
+   accelerates the schedule, and the carried queue converges until it
+   drains.
+2. **STEADY-STATE GUARD.** With the queue drained and no page load, the
+   walker no longer re-roots every 3s — it does a cheap extents refresh
+   to keep holes glued and only revalidates the tree once per 8s.
+3. **DOCUMENT PRIORITY.** The BFS now dives into `DOCUMENT_*` subtrees
+   before everything else (sibling order kept), so the walk enters the
+   content document as soon as it appears instead of drowning in
+   toolbar/bookmark/sidebar nodes.
+4. **BETTER FIELD LINES.** The `a11y walk converging` line now prints
+   the app name and cache `hits=`, so the next report pins the state in
+   one glance.
+5. **NEW TOOL: `invertonator-diag.sh`.** One-shot host-side diagnostic
+   (no root, no net): running-vs-installed version, toolkit-accessibility,
+   LibreWolf/Firefox accessibility prefs (LibreWolf ships
+   `accessibility.force_disabled=1` — hardened forks refuse to expose
+   their tree to ANY client), an independent AT-SPI probe that walks
+   every app and counts IMAGE/VIDEO nodes with sample extents, and the
+   journal tail. Run it while the video page is open; paste the output.
+
+## What alpha.25 fixed ("still the holes are not automatic")
 
 alpha.24 rebuilt the element holes on the rect-shader (alpha.23's shifted
 overlay is gone). alpha.25 fixes the remaining reason holes could still
@@ -89,8 +124,8 @@ The filename is the SAME across versions. An older download in
 unzip -z ~/Downloads/Invertonator-rs-full-source.zip
 ```
 
-It must print **`Invertonator-rs <sha> 0.3.0-alpha.25`**. If it
-prints alpha.24 or older, re-download the zip from the chat first.
+It must print **`Invertonator-rs <sha> 0.3.0-alpha.26`**. If it
+prints alpha.25 or older, re-download the zip from the chat first.
 
 > **NOTE (round 10):** last round the WINDOWS PowerShell block below
 > was pasted into Fedora bash (`cd C:\Users\admin\invertonator-push`
@@ -109,7 +144,7 @@ git reset --hard origin/main && \
 unzip -o ~/Downloads/Invertonator-rs-full-source.zip -d . && \
 git status --short && \
 git add -A && \
-git commit -m "alpha.25: Linux v2.3.1 — walker convergence (queue carry-over, stable cache keys, event-API fallback)" && \
+git commit -m "alpha.26: Linux v2.3.2 — re-root thrash fix (journal round 11), document-priority dive, diag script" && \
 git push origin HEAD && \
 bash shell-extension/install.sh
 ```
@@ -135,7 +170,7 @@ auto-hole-media, auto-hole-fullscreen, start-enabled).
 
 ## Test protocol (6 minutes)
 
-1. `gnome-extensions info invertonator@phoenix1504e` → **Version: 25**, State: ACTIVE.
+1. `gnome-extensions info invertonator@phoenix1504e` → **Version: 26**, State: ACTIVE.
 2. `journalctl --user -b --no-pager | grep -i Invertonator | tail -15` →
    expect: both `registered` keybinding lines, `AT-SPI2 ready — media
    lock-on roles: image,video,animation`, and `event capture on via …
@@ -179,12 +214,12 @@ journalctl --user -b --no-pager | grep -iE 'invertonator|JS ERROR' | tail -40
 cd C:\Users\admin\invertonator-push
 Expand-Archive -Path "$env:USERPROFILE\Downloads\Invertonator-rs-full-source.zip" -DestinationPath . -Force
 git add -A
-git commit -m "alpha.25: Linux v2.3.1 — walker convergence (queue carry-over, stable cache keys, event-API fallback)"
+git commit -m "alpha.26: Linux v2.3.2 — re-root thrash fix (journal round 11), document-priority dive, diag script"
 git push origin HEAD
 ```
 
 Verify: first line of `%LOCALAPPDATA%\Invertonator\log.txt` must read
-`=== Invertonator-rs v0.3.0-alpha.25 ===`. Windows behavior is
+`=== Invertonator-rs v0.3.0-alpha.26 ===`. Windows behavior is
 alpha.15-identical; its test protocol and Desktop diagnostics still apply.
 
 ---
@@ -195,7 +230,8 @@ alpha.15-identical; its test protocol and Desktop diagnostics still apply.
 .github/workflows/build.yml  CI: windows+ubuntu artifacts + GNOME extension bundle
 .gitignore                   /target, *.exe — keep, protects your clone
 APPLY.md                     this file
-Cargo.toml                   0.3.0-alpha.25 (windows+linux deps)
+invertonator-diag.sh         one-shot Linux auto-hole diagnostics (run on Fedora, paste output)
+Cargo.toml                   0.3.0-alpha.26 (windows+linux deps)
 Cargo.lock                   pinned
 Invertonator-rs-v0.2.0-alpha.2.exe  legacy artifact (safe to git rm)
 LICENSE                      MIT
@@ -204,7 +240,7 @@ docs/LINUX-TESTING.md        Fedora-first runbook (Wayland ext / X11 / KDE) +
                              holes test protocol + journal-line diagnosis
 icon.ico / icon.svg          logo (tray + README)
 src/main.rs                  cross-platform entry (cfg dispatcher)
-src/common.rs                settings.json + logging + VERSION (alpha.25)
+src/common.rs                settings.json + logging + VERSION (alpha.26)
 src/win_main.rs              Windows backend (tray, hotkeys, probe, DPI,
                              auto-diagnostics, hysteresis telemetry)
 src/holes.rs                 hole pool + main-thread pump (≈64Hz, context-
@@ -216,7 +252,7 @@ src/scrollhook.rs            low-level wheel hook (scroll-hold, page-dirty)
 src/linux.rs                 X11 XRandR gamma inversion + --self-test +
                              Wayland session awareness
 shell-extension/install.sh                       installer + schema verification + gsettings fallback
-shell-extension/invertonator@phoenix1504e/metadata.json    uuid, v25, shells 45–51
+shell-extension/invertonator@phoenix1504e/metadata.json    uuid, v26, shells 45–51
 shell-extension/invertonator@phoenix1504e/extension.js     compositor shader inversion
                                                            (Cogl.Snippet / dual-API effect,
                                                            uiGroup attach), Super+I,

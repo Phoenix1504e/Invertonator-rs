@@ -443,3 +443,27 @@ Delivered: zip `Invertonator-rs <sha> 0.3.0-alpha.24` + changed-files mirror byt
 | C4: no AT-SPI app match (pid/name) | "no AT-SPI app for pid=… class=…" one-shot | event capture covers; if also dead, out-of-process helper (R4 path) |
 | C5: bake-clip line appears | holes found but nothing punches | paint-volume anchor rework (R1 path) |
 | Everything green | windowed rects glue to media; fullscreen = video true + chrome inverted; native player = whole window | v2.3 converged; next = pooling beyond 6, telemetry |
+
+## Task 25 — alpha.26: re-root thrash fix (journal round 11) + host-side diag tool
+
+### Field data (first useful journal paste of the whole project)
+- USER journal: alpha.25 confirmed RUNNING (`Invertonator 25 enabled`), event capture alive via the `EventListener.register` FALLBACK (`Atspi.EventListener.add_callback` does not exist on Fedora 51's GI surface — the alpha.25 fallback design was load-bearing), cache keying `wrap` (no get_path), carry-over active (`carried=199`).
+- THE SMOKING GUN: `media=0` on every walk, and `carried=199` (19:03:51) followed by ALL-fresh walks (`carried=0`, queues 146/187/17/202). Root cause: alpha.25 set `reRoot` on EVERY `object:children-changed`; YouTube emits them CONTINUOUSLY while playing (progress/buffering/DOM churn) → the walk re-rooted inside the browser chrome every tick and NEVER reached the content document. alpha.25's convergence fix was defeated by its own reRoot policy — i introduced this bug in the same release that added the carry-over.
+- Manual Super+F7 holes work on the same window (librewolf) → shader machinery fine; discovery is the only broken layer.
+- SECOND open question: LibreWolf is a hardened Firefox fork that ships `accessibility.force_disabled=1` (a11y-tree fingerprinting mitigation) — if the content tree is closed to ANY client, NO walk change can help. Needs the host-side probe to decide (extension cannot fix browser prefs).
+
+### alpha.26 changes
+- `_mediaOnEvent`: reRoot ONLY on `document:load-complete/stopped` (page load = genuinely new tree). `children-changed` keeps only the schedule acceleration. (R11 fix)
+- `_mediaWalk` steady-state guard: drained queue + same target + no reRoot + <MEDIA_REROOT_MIN_MS(8s) since last root → cheap extents refresh instead of re-root; fresh revalidation walks bounded to once per 8s. `lastRootTs` state added.
+- `_mediaWalkChunk` DOCUMENT PRIORITY: DOCUMENT/DOCUMENT_WEB/DOCUMENT_FRAME/DOCUMENT_* kids are unshifted (sibling order preserved via reversed iteration) → the walk dives into content docs as soon as they appear instead of drowning in chrome/sidebar siblings. `m.docRoles` built at AT-SPI init.
+- Converging diag line now prints app name + `hits=` (cache effectiveness pre-drain — R2/R3 verdict data).
+- `invertonator-diag.sh` (repo root, also shipped standalone): sections 1-6 — running-vs-installed version, session, toolkit-accessibility, browser pref greps (user + system cfg, native + flatpak paths, conditional force_disabled verdict), independent python/gi AT-SPI probe (per-app node counts, DOCUMENT-node counts, media counts, sample extents, verdict banner), journal tail.
+
+### Risk table for round 12 (pre-registered)
+| Branch | Evidence | Verdict path |
+|---|---|---|
+| D1: thrash fixed, tree open | converging lines show carried>0 persisting → drain → "media lock-on N rect(s)" within ~10-30s | DONE — v2.3.2 quality pass |
+| D2: thrash fixed but probe shows media=NONE for LibreWolf | diag section 5 verdict NO + document-nodes=0 or missing app | user flips accessibility.force_disabled=0 in about:config (LibreWolf default) + browser restart; extension side complete |
+| D3: probe sees media, extension walk still media=0 | diag YES + journal media=0 with carried progressing | matching/walk bug — probe pid/name table vs extension app match; next code round targets _mediaResolveFrames |
+| D4: cache hits=0 forever (wrap mode unstable) | converging lines hits=0 across ticks | walk still converges via carry-over; consider cache by (parent-path,index) composite keys |
+| D5: bake-clip line | rects found but nothing punches | paint-volume anchor rework (R1 path, unchanged) |

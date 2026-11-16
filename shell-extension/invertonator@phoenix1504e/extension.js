@@ -125,6 +125,8 @@ const MEDIA_WALK_MIN_MS = 1200;       // min gap between full walks
 const MEDIA_APP_BLACKLIST_MS = 60000; // hung-app protection
 const MEDIA_SLOW_APP_MS = 1200;       // probe slower than this → blacklist
 const MEDIA_REBAKE_DELTA_PX = 6;      // re-shader only when a rect moved this far
+const MEDIA_REROOT_MIN_MS = 8000;     // alpha.26: min gap between fresh
+                                      // revalidation walks (steady state)
 const MEDIA_EVENT_PROBES_PER_SEC = 16;// event-source role probes per second cap
 const MEDIA_EVENT_HIT_CAP = 24;       // remembered event-captured elements
 const MEDIA_EVENT_HIT_TTL_MS = 60000; // stale event captures expire
@@ -314,6 +316,9 @@ export default class InvertonatorExtension extends Extension {
             // hits), cache keys probe for a stable identity, tree-shape
             // events force a re-root.
             cacheKeyMode: null, cacheHits: 0, carried: 0, reRoot: false,
+            // alpha.26: steady-state revalidation gate + document-subtree
+            // priority set (see _mediaWalk / _mediaWalkChunk).
+            lastRootTs: 0, docRoles: null,
         };
         this._focusId = 0;
 
@@ -807,6 +812,20 @@ export default class InvertonatorExtension extends Extension {
             }
             m.atspi = Atspi;
             m.roleMap = roleMap;
+            // alpha.26: document-subtree roles get BFS priority — once the
+            // walk reaches a document node (content or chrome), its subtree
+            // is explored BEFORE the rest of the queue. Without this the
+            // walk drowned in browser chrome / sidebar siblings and only
+            // reached the content document after thousands of calls.
+            const docRoles = new Set();
+            for (const name of ['DOCUMENT', 'DOCUMENT_WEB', 'DOCUMENT_FRAME',
+                'DOCUMENT_EMAIL', 'DOCUMENT_PRESENTATION',
+                'DOCUMENT_SPREADSHEET', 'DOCUMENT_TEXT']) {
+                if (Atspi.Role?.[name] !== undefined) {
+                    docRoles.add(Atspi.Role[name]);
+                }
+            }
+            m.docRoles = docRoles;
             console.log(`Invertonator: AT-SPI2 ready — media lock-on roles: ` +
                 [...roleMap.values()].join(','));
             this._mediaConnectEvents();
@@ -895,10 +914,22 @@ export default class InvertonatorExtension extends Extension {
         }
         // Tree-shape events → full (budgeted, cached) walk; move events →
         // cheap extents-only refresh (the scroll-follow path).
-        if (type.startsWith('document:') || type === 'object:children-changed') {
-            // alpha.25: the tree changed shape — any carried queue is stale
-            // (old page's nodes) and the new content must be re-rooted.
+        if (type.startsWith('document:')) {
+            // alpha.26: a page LOAD is a genuinely new tree — re-root.
             m.reRoot = true;
+            if (now - m.lastWalk > MEDIA_WALK_MIN_MS) {
+                this._mediaScheduleWalk(60);
+            }
+        } else if (type === 'object:children-changed') {
+            // alpha.26 FIELD FIX (round 11): children-changed NO LONGER
+            // re-roots. YouTube emits it CONTINUOUSLY while playing
+            // (progress bar, buffering, DOM churn) — re-rooting on every
+            // event restarted the walk inside the browser chrome forever,
+            // never reaching the content document (journal: media=0 across
+            // six 480-call walks, carried=0 after the first). The carried
+            // queue keeps converging; this event only accelerates the
+            // schedule, and the steady-state guard in _mediaWalk does the
+            // periodic revalidation.
             if (now - m.lastWalk > MEDIA_WALK_MIN_MS) {
                 this._mediaScheduleWalk(60);
             }
@@ -1098,24 +1129,43 @@ export default class InvertonatorExtension extends Extension {
         m.walkActive = true;
         m.callBudget = MEDIA_WALK_BUDGET;
         m.cacheHits = 0;
+        // alpha.26: a reRoot (page load) discards any carried queue — it is
+        // a genuinely new tree.
+        if (m.reRoot) {
+            m.queue = [];
+            m.seen = null;
+            m.targetMw = null;
+            m.reRoot = false;
+        }
         // alpha.25 CONVERGENCE: same target window → keep walking the
         // carried-over queue instead of restarting from the roots. A
         // budget-starved walk therefore makes REAL progress every tick
-        // (480 fresh nodes per tick) and eventually drains. alpha.24
-        // restarted from the top every walk: with a wrapper-keyed cache
-        // that never hits, the same first 480 nodes were re-explored
-        // forever and media deep in a big tree was NEVER reached.
-        const carrying = !m.reRoot && mw === m.targetMw &&
-            m.queue.length > 0;
-        m.reRoot = false;
+        // (480 fresh nodes per tick) and eventually drains.
+        const carrying = mw === m.targetMw && m.queue.length > 0;
         if (carrying) {
             m.carried = m.queue.length;
             this._mediaWalkChunk();
             return;
         }
+        // alpha.26 STEADY-STATE GUARD (field round 11): queue drained, same
+        // window, no page load → do NOT re-root every tick. A cheap extents
+        // refresh keeps the existing holes glued; a fresh revalidation walk
+        // re-roots at most once per MEDIA_REROOT_MIN_MS (new DOM content is
+        // picked up there — with cache hits it is cheap, without them it is
+        // still bounded instead of thrashing 480 calls per second-cadence).
+        if (mw === m.targetMw &&
+            Date.now() - m.lastRootTs < MEDIA_REROOT_MIN_MS) {
+            m.walkActive = false;
+            if (now - m.lastRefresh >= MEDIA_REFRESH_MIN_MS) {
+                m.lastRefresh = now;
+                this._mediaRefreshExtents();
+            }
+            return;
+        }
         m.carried = 0;
         m.found = [];
         m.targetMw = mw;
+        m.lastRootTs = Date.now();
         this._mediaResolveFrames(mw, (roots) => {
             if (!m.walkActive) {
                 return;
@@ -1349,8 +1399,18 @@ export default class InvertonatorExtension extends Extension {
                     m.cache.set(this._mediaCacheKey(acc),
                         { role, kids, ts: Date.now() });
                 }
-                for (const k of kids) {
-                    if (!m.seen.has(k)) {
+                // alpha.26 DOCUMENT PRIORITY: a document node's subtree is
+                // explored before everything else (sibling order kept on
+                // both paths — reversed iteration + unshift/push).
+                const dive = m.docRoles?.has(role) ?? false;
+                for (let i = kids.length - 1; i >= 0; i--) {
+                    const k = kids[i];
+                    if (m.seen.has(k)) {
+                        continue;
+                    }
+                    if (dive) {
+                        m.queue.unshift({ acc: k, cal, frameAcc });
+                    } else {
                         m.queue.push({ acc: k, cal, frameAcc });
                     }
                 }
@@ -1398,11 +1458,14 @@ export default class InvertonatorExtension extends Extension {
                 const now = Date.now();
                 if (now - m.diagWalkTs > 8000) {
                     m.diagWalkTs = now;
-                    console.log(`Invertonator: a11y walk converging — ` +
+                    const app = m.apps?.find(
+                        a => a.pid === (m.targetMw?.get_pid?.() ?? -1));
+                    console.log(`Invertonator: a11y walk converging ` +
+                        `"${app?.name ?? '?'}" — ` +
                         `queue=${m.queue.length} carried=${m.carried} ` +
                         `media=${m.found.length} ` +
                         `calls=${MEDIA_WALK_BUDGET - m.callBudget} ` +
-                        `key=${m.cacheKeyMode ?? '?'}`);
+                        `hits=${m.cacheHits} key=${m.cacheKeyMode ?? '?'}`);
                 }
                 this._mediaPublish(null, false);
             }

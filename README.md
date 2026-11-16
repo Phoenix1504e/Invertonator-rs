@@ -4,7 +4,7 @@
 
 ![Invertonator](icon.svg)
 
-> **Status: v0.3.0-alpha.25 — Linux v2.3.1 walker convergence (GNOME/Wayland)**:
+> **Status: v0.3.0-alpha.26 — Linux v2.3.2 re-root thrash fix (GNOME/Wayland)**:
 > **Super+F7** pierces a true-color hole into the window under the
 > pointer while everything around it stays inverted — the Windows
 > F7-pierce analog (plain F7 is browser-claimed — caret browsing — so
@@ -59,6 +59,17 @@
 > (alpha.11 evidence-rule analog); hung apps blacklisted 60s; pool cap
 > 6; `auto-hole-media` gsettings opt-out; toolkit-accessibility hint
 > journaled when app trees may be dormant.
+> alpha.26 RE-ROOT THRASH FIX (v2.3.2 — field round 11): the journal
+> proved alpha.25's carry-over was being defeated — YouTube emits
+> children-changed events continuously while playing and the walker
+> re-rooted on each one, restarting inside the browser chrome forever
+> (media=0 across six 480-call walks). alpha.26: only page loads
+> re-root; children-changed just accelerates the schedule; drained+same
+> window+no load = cheap extents refresh with revalidation at most
+> every 8s; the BFS dives into DOCUMENT_* subtrees first (content doc
+> reached in the first ticks); converging lines print app name +
+> cache hits; new invertonator-diag.sh runs the discovery independently
+> on the host and reports LibreWolf/Firefox a11y-hardening prefs.
 > alpha.25 WALKER CONVERGENCE (v2.3.1 — fixes "still the holes are not
 > automatic"): alpha.24's walk restarted from the tree top every 3s; with
 > a cache miss on big pages (GI wrapper identity unguaranteed) the same
@@ -322,8 +333,14 @@ Tor Browser) cannot detect it — there is nothing in the web layer to detect.
   the holes are not automatic"): BFS queue carry-over between ticks (a
   starved walk makes real progress instead of restarting), stable cache
   keying with journaled mode, re-root on tree-shape events, event-API
-  fallback, bake-clip diagnostics; still queued: per-element pooling
-  beyond 6, tracker telemetry
+  fallback, bake-clip diagnostics
+- **v2.3.2** — **re-root thrash fix shipped as alpha.26** (field round
+  11, journal-diagnosed): children-changed events no longer re-root the
+  walk (YouTube emits them continuously while playing), steady-state
+  extents-refresh instead of per-tick re-roots, document-subtree BFS
+  priority, invertonator-diag.sh host-side probe incl. browser
+  a11y-hardening detection; still queued: per-element pooling beyond 6,
+  tracker telemetry
 - **research** — compositor-level video handling, other Wayland compositors
 
 ## Credits & thanks

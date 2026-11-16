@@ -105,9 +105,14 @@ The lines that decide auto holes:
   complete=…` — one per interesting walk; `media=0` on a page you KNOW
   has images/videos is the number to report. `carried>0` shows the
   alpha.25 carry-over at work; `complete=true` means the walk drained.
-- `a11y walk converging — queue=N media=M` — the walk is budget-limited
-  on a huge page and continues next tick (alpha.25); element holes
-  publish when it drains (typically seconds, big pages up to ~30s).
+- `a11y walk converging "app" — queue=N media=M calls=… hits=… key=…` —
+  the walk is budget-limited on a huge page and continues next tick;
+  element holes publish when it drains (typically seconds, big pages up
+  to ~30s). `carried>0` persisting across ticks is the alpha.26
+  carry-over converging (alpha.25's re-root thrash is fixed — if you
+  still see `carried=0` on every line, you are not running alpha.26).
+  `hits=` shows whether the cache works across walks (wrapper mode is
+  best-effort; convergence does not depend on it).
 - `media lock-on N rect(s) on M window(s) (kinds)` — rects published.
 - `rect bake "class" actor@(x,y) box=(…)` — the coordinate anchor of the
   first bake per app; if holes appear SHIFTED, this + a screenshot
