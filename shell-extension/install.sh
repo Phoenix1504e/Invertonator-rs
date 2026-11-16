@@ -35,7 +35,7 @@ fi
 # alpha.21: a compiled schema missing a key silently kills that keybinding's
 # registration (addKeybinding throws; the menu keeps working, hotkeys die).
 # Verify every hotkey key really made it into the installed schema.
-for KEY in toggle-invert toggle-pierce auto-hole-fullscreen start-enabled; do
+for KEY in toggle-invert toggle-pierce auto-hole-media auto-hole-fullscreen start-enabled; do
     if grep -aq "$KEY" "$DEST/schemas/gschemas.compiled"; then
         echo "schema check: '$KEY' present"
     else
@@ -54,6 +54,9 @@ if gnome-extensions enable "$UUID" 2>/dev/null; then
     echo "  holes: invert first (Super+I), then Super+F7 over a window"
     echo "  fullscreen video auto-holes while inverted (opt out: gsettings"
     echo "    set org.gnome.shell.extensions.invertonator auto-hole-fullscreen false)"
+    echo "  media lock-on: images/videos get element-level true-color rects"
+    echo "    (AT-SPI2; opt out: ... auto-hole-media false; if trees come up"
+    echo "    empty, run: gsettings set org.gnome.desktop.interface toolkit-accessibility true)"
     NEEDS_RELOGIN="no"
 else
     # The running shell has never scanned this directory (first install,

@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const VERSION: &str = "0.3.0-alpha.22";
+pub const VERSION: &str = "0.3.0-alpha.23";
 
 // =====================================================================
 // Settings — same settings.json format as the C# edition.

@@ -25,6 +25,18 @@
             gsettings set org.gnome.shell.extensions.invertonator toggle-pierce
             "['&lt;Super&gt;F7']"</description>
         </key>
+        <key name="auto-hole-media" type="b">
+            <default>true</default>
+            <summary>Element media lock-on (AT-SPI2 image/video rects)</summary>
+            <description>While inversion is on, the focused window's AT-SPI2 tree
+            is walked (budgeted, cached) and every image/video/animation element
+            above 48px gets its own true-color rect hole — the rest of the screen
+            stays inverted. Rects follow scrolling and tab switches. Requires
+            AT-SPI2; if app trees come up empty, enable
+            org.gnome.desktop.interface toolkit-accessibility. Opt out:
+            gsettings set org.gnome.shell.extensions.invertonator
+            auto-hole-media false</description>
+        </key>
         <key name="auto-hole-fullscreen" type="b">
             <default>true</default>
             <summary>Auto-hole fullscreen windows (fullscreen video)</summary>

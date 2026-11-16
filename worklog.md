@@ -315,3 +315,77 @@ holes (pending user go).
 | Everything green | all 7 protocol steps pass | next = v2.2 AT-SPI2 element rects (video-element-only holes), user go pending |
 
 Delivered: zip `Invertonator-rs <sha> 0.3.0-alpha.22` + changed-files mirror byte-verified.
+
+## Task 22 — alpha.23: v2.2 element media lock-on (AT-SPI2 image/video rect holes)
+
+### Field report chain (alpha.22)
+- User: "**can we implement auto hole where it only locks on to images and videos
+  and rest everything is just inverted**" — the v2.2 go signal, exactly the
+  AT-SPI2 rect-hole milestone the roadmap reserved after alpha.22's
+  fullscreen heuristic.
+
+### Scope decision
+- Element holes need RECT holes, not window holes. Two candidate machineries
+  were weighed: (a) rect-masked global shader via uniforms — REJECTED: uniform
+  API on GNOME 51 is unverified (alpha.17/18 shader-API archaeology cost two
+  rounds), texcoord→screen mapping breaks under overview/monitor transforms;
+  (b) clipped Clutter.Clone of the window actor carrying the invert effect —
+  CHOSEN: reuses the PROVEN involution machinery, zero new shader APIs,
+  z-inserted above the source window actor so stacking stays correct
+  (overlapping windows cover the hole — Magnifier-analog semantics).
+- Identity-overlay math (clone translation = −container position) makes the
+  hole content scale-INVARIANT: the clone always re-paints the window exactly
+  where the real window paints; the clip alone selects the rect.
+- Media discovery = AT-SPI2 tree walk of the FOCUSED window's app (PID match,
+  wm_class name fallback): roles IMAGE/VIDEO/ANIMATION ≥48px. Budgeted
+  (240 D-Bus calls/walk), chunked (8ms idle slices), cached (re-walks cost
+  ~0 calls for unchanged subtrees), events (bounds-changed → cheap extents
+  refresh of live holes; document/children events → cached re-walk), hung-app
+  blacklist 60s, pool cap 6, focus change = context gone → holes cleared
+  (alpha.11 evidence-rule analog).
+- Measured calibration: k = frame_rect.width / frame-extents.width per frame;
+  logical(p) = fr.xy + (p − frameExt.xy)·k. Kills HiDPI/scale mismatch WITHOUT
+  assumptions; the Δ between element and frame cancels window movement between
+  measurement and publish.
+- Atspi import is DYNAMIC (await import('gi://Atspi')) — a static import
+  failure would kill the whole module (alpha.16 lesson); now it only costs
+  the lock-on feature. Every AT-SPI API access is ?.() guarded with a
+  one-shot distinctive journal line (`AT-SPI API miss '...'`).
+- toolkit-accessibility: NEVER auto-flipped; journaled hint when OFF
+  (documented command in APPLY §3). Chromium/Firefox/GTK trees usually
+  surface once an AT-SPI client (us) is present.
+- Window-hole interplay: windows carrying a manual/auto window-hole are
+  excluded from element publish AND their element holes dropped on pierce
+  (a rect on a true-color window would RE-INVERT it).
+
+### alpha.23 changes (sandbox; awaiting push)
+- extension.js: media state block + budgets; _mediaInitAtspi (dynamic import,
+  role sanity); _mediaConnectEvents (5 event types, deregistered on disable);
+  _mediaWalk/_mediaResolveFrames/_mediaWalkChunk (budget/cache/chunk/
+  blacklist); _mediaPublishFromFound (area sort, cap 6, frame clip, min
+  edge); _mediaPublish (identity+proximity diff, churn-free updates);
+  _elementHoleCreate/Update/Reposition/Destroy (container+clone+effect,
+  position-changed/size-changed tracking); _mediaRefreshExtents (scroll
+  follow, ≤12 calls); _mediaDropForWindow; focus watcher (400ms debounce);
+  toolkit hint; indicator shows `media lock-on: N rects (auto)` row.
+- gschema: + auto-hole-media (b, default true). install.sh: 5-key schema
+  check + lock-on echo lines. metadata v23 + description. Cargo trio →
+  0.3.0-alpha.23. README (status headline, matrix, roadmap v2.2 shipped /
+  v2.3 hole-quality). APPLY.md rewritten (alpha.23, 6-step protocol with
+  AT-SPI2 journal line + toolkit-accessibility branch). Sandbox gates green:
+  node --check OK, glib-compile-schemas --strict OK, all 5 keys in compiled
+  schema, JSON parses, install.sh bash -n clean.
+
+### Risk table for round 9 (pre-registered)
+| Branch | Evidence in field | Verdict path |
+|---|---|---|
+| R1: gi://Atspi import fails in shell process | `unavailable (Atspi import: …)` journal; rest of extension fine | confirm import mechanics; fallback = out-of-process helper via bus |
+| R2: AT-SPI API variance (get_process_id/getComponent/get_extents) | one-shot `AT-SPI API miss '…'` line names the exact method | adapt call path per line |
+| R3: app trees dormant (toolkit-accessibility off / browser a11y asleep) | walks return 0, hint line present | user runs the documented gsettings; re-test |
+| R4: rect misalignment (deco/scale mismatch beyond k) | screenshot: holes offset/sized wrong | adjust anchor (frame→buffer rect) or per-frame deco offsets |
+| R5: shell jank during walks | UI stutter at 3s cadence | tighten budgets/chunks; blacklist heavier |
+| R6: clone/effect GPU cost | stutter only with many holes | cap 6 → 4; reuse one offscreen |
+| R7: role coverage gaps (CSS-background videos, canvas players) | media plays but no rect | v2.3: ANIMATION+AUDIO, IMG ancestor capture, or screenshot-diff heuristic |
+| Everything green | rects lock, follow scroll/tabs, clear on focus loss | next = v2.3 quality pass, user go pending |
+
+Delivered: zip `Invertonator-rs <sha> 0.3.0-alpha.23` + changed-files mirror byte-verified.

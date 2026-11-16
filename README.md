@@ -4,7 +4,7 @@
 
 ![Invertonator](icon.svg)
 
-> **Status: v0.3.0-alpha.22 — Linux v2.1 holes everywhere (GNOME/Wayland)**:
+> **Status: v0.3.0-alpha.23 — Linux v2.2 media lock-on (GNOME/Wayland)**:
 > **Super+F7** pierces a true-color hole into the window under the
 > pointer while everything around it stays inverted — the Windows
 > F7-pierce analog (plain F7 is browser-claimed — caret browsing — so
@@ -45,6 +45,20 @@
 > ONE buffer to the compositor — a hole covers whichever tab is
 > showing and follows tab switches for free; element-level AT-SPI2
 > rects are v2.2.
+> alpha.23 MEDIA LOCK-ON (v2.2, the UIA tracker analog): while inversion
+> is on, the focused window's AT-SPI2 tree is walked (budgeted, cached,
+> chunked — D-Bus can never jank the shell) and every image/video/
+> animation element ≥48px gets its OWN true-color rect hole; everything
+> else stays inverted. Rect holes = a clipped Clutter.Clone of the
+> window actor (identity overlay, scale-invariant math) carrying the
+> invert effect — the involution trick, now at element granularity.
+> Measured atspi→logical calibration (k = frame-width ratio) makes
+> HiDPI/scale quirks self-correcting; rects follow scrolling (bounds-
+> changed events → cheap extents refresh) and tab switches (document
+> events → cached re-walk); focus change = context gone → holes clear
+> (alpha.11 evidence-rule analog); hung apps blacklisted 60s; pool cap
+> 6; `auto-hole-media` gsettings opt-out; toolkit-accessibility hint
+> journaled when app trees may be dormant.
 > alpha.18 kept: install.sh honesty lines + APPLY zip-freshness gate.
 > alpha.16 kept: GNOME/Wayland backend shipped (compositor-level
 > fragment-shader stage inversion, Super+I, panel indicator, reboot
@@ -92,7 +106,7 @@
 |---|---|---|---|
 | Windows 10+ | Magnifier API (compositor) | ✅ UIA tracker | `Ctrl+Alt+F5` invert · `F6` mode · `F7` pierce · `F2` quit |
 | Linux (X11) | XRandR CRTC gamma | 🚧 v2 (XComposite overlay) — media inverts too for now | `Ctrl+Alt+I` toggle · `Ctrl+Alt+Q` quit |
-| Linux (GNOME/Wayland) | Shell extension — compositor shader | ✅ **v2.1 shipped** — Super+F7 pierce + hole manager + fullscreen video auto-hole; AT-SPI2 element rects = v2.2 | `Super+I` invert · `Super+F7` pierce · panel menu |
+| Linux (GNOME/Wayland) | Shell extension — compositor shader | ✅ **v2.2 shipped** — Super+F7 pierce + hole manager + fullscreen video auto-hole + AT-SPI2 media lock-on (element rects) | `Super+I` invert · `Super+F7` pierce · panel menu |
 | Linux (KDE/Wayland) | KWin's built-in Invert effect | ❌ | user-bound |
 | macOS | ❌ unsupported | ❌ | — |
 
@@ -103,6 +117,9 @@ holes are session-transient: toggling inversion off clears them —
 re-pierce with Super+F7. Fullscreen windows auto-hole while inversion
 is on (video: YouTube fullscreen, mpv, VLC); opt out with
 `gsettings set org.gnome.shell.extensions.invertonator auto-hole-fullscreen false`.
+Media lock-on (element-level image/video rects via AT-SPI2, default
+on): opt out with `... auto-hole-media false`; if app trees come up
+empty, run `gsettings set org.gnome.desktop.interface toolkit-accessibility true`.
 
 No Linux box of your own? Run `invertonator --self-test` on any Linux
 machine — it prints a paste-back diagnostic report (session type, gamma
@@ -253,8 +270,11 @@ Tor Browser) cannot detect it — there is nothing in the web layer to detect.
 - **v2.1** — **GNOME holes-everywhere shipped as alpha.22**: hole manager
   menu, fullscreen video auto-hole, actor-recreate survival, scanout
   guard, OR-window pierce
-- **v2.2** — GNOME element-level holes via AT-SPI2 rects (video element
-  only, browser chrome stays dark)
+- **v2.2** — **GNOME element-level media lock-on shipped as alpha.23**:
+  AT-SPI2 image/video rects (clone rect-holes), scroll/tab follow,
+  measured calibration, hung-app blacklist
+- **v2.3** — GNOME hole quality: element-only video holes without
+  window chrome bleed, per-element pooling beyond 6, tracker telemetry
 - **research** — compositor-level video handling, other Wayland compositors
 
 ## Credits & thanks
