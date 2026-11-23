@@ -30,6 +30,31 @@ PowerShell `$env:OS` check — bash rejects that line at the `{` token
 
 ---
 
+## Round 15 field event — CI: `cargo check --locked` exit 101
+
+GitHub Actions failed with:
+
+```
+error: cannot update the lock file …/Cargo.lock because --locked was
+passed to prevent this
+help: to generate the lock file without accessing the network, remove
+the --locked flag and use --offline instead.
+```
+
+Root cause: **Cargo.lock was stale, not the code.** `Cargo.toml` was
+bumped alpha.24 → alpha.28 across five commits, but the lock file was
+last touched at alpha.23 (`version = "0.3.0-alpha.23"`). CI runs
+`cargo check --locked`, which REFUSES to touch the lock file when the
+manifest moved — so the job died before compiling anything. No
+dependency changed since alpha.23 (verified: `git diff ddd5aa2 HEAD --
+Cargo.toml` touches only the version line), so the complete fix is a
+one-line version sync inside Cargo.lock → `0.3.0-alpha.28` (commit
+alpha.28a, already inside this zip). Do NOT hand-edit the lock beyond
+that, and do NOT remove `--locked` from CI — the flag is what keeps
+your builds reproducible; keep the lock in sync instead.
+
+---
+
 ## What alpha.28 adds (your request: "after selection give them a chance to readjust and then confirm the area")
 
 The alpha.27 selection committed the instant you released the mouse —
@@ -319,7 +344,24 @@ pin-hole, auto-hole-media, auto-hole-fullscreen, start-enabled).
    normal fullscreen behavior returns; leave fullscreen → pin comes
    back. Panel menu → "Stored areas" lists the pin; click the row to
    forget it.
-9. If AT-SPI discovery ALSO still works on your setup, both can coexist:
+9. **NEW — do stored holes survive a restart? (the alpha.28a answer:
+   YES — audited, see below).** After step 8 stored a pin, prove it is
+   on disk first:
+   ```bash
+   gsettings get org.gnome.shell.extensions.invertonator pinned-holes
+   # → [{"cls":"…","tokens":["song x","youtube"],"rel":[0.03,…]}, …]
+   ```
+   That key lives in dconf (`~/.config/dconf/user`) — it is written the
+   INSTANT you press Enter/Confirm, not at logout. Now reboot (or log
+   out + back in; X11: `Alt+F2`, `r`). After login inversion resumes
+   automatically (`start-enabled`); open a YouTube watch page → the
+   true-color rect returns at the SAME relative position within ≤2s,
+   journal: `stored area applied (title […])`. No re-selection. Also
+   try panel-menu inversion OFF → ON: pin effects are destroyed with
+   the shaders but the entries stay in gsettings and re-apply on ON.
+   Fullscreen windows still drop pins by design (windowed layout is
+   meaningless there) — un-fullscreen and the pin returns.
+10. If AT-SPI discovery ALSO still works on your setup, both can coexist:
    the stored pin wins on its window (chrome of a pinned YouTube window
    stays inverted even if the walker is dead — the whole point).
 
@@ -341,7 +383,7 @@ discards the entire line and RUNS NOTHING. (Verified round 14.) alpha.28
 is Linux-only; this section only bumps the Windows VERSION string.
 
 ```powershell
-if ($env:OS -ne 'Windows_NT') { throw 'WINDOWS PowerShell block — wrong machine.' } else { cd C:\Users\admin\invertonator-push; Expand-Archive -Path "$env:USERPROFILE\Downloads\Invertonator-rs-full-source.zip" -DestinationPath . -Force; git add -A; git commit -m "alpha.28: Linux v2.3.4 — pin selection adjust + confirm step (handles, move, Enter/R/Esc)"; git push origin HEAD }
+if ($env:OS -ne 'Windows_NT') { throw 'WINDOWS PowerShell block — wrong machine.' } else { cd C:\Users\admin\invertonator-push; Expand-Archive -Path "$env:USERPROFILE\Downloads\Invertonator-rs-full-source.zip" -DestinationPath . -Force; git add -A; git commit -m "alpha.28a: pin adjust + confirm step (handles, move, Enter/R/Esc) + sync Cargo.lock to 0.3.0-alpha.28 (fixes CI --locked)"; git push origin HEAD }
 ```
 
 Verify: first line of `%LOCALAPPDATA%\Invertonator\log.txt` must read
@@ -350,7 +392,7 @@ alpha.15-identical; its test protocol and Desktop diagnostics still apply.
 
 ---
 
-## File map (25 files, latest state)
+## File map (26 tracked files, latest state)
 
 ```
 .github/workflows/build.yml  CI: windows+ubuntu artifacts + GNOME extension bundle
@@ -359,7 +401,7 @@ APPLY.md                     this file
 apply-linux.sh               ONE-command guarded Fedora apply (verify zip, commit, push, install)
 invertonator-diag.sh         one-shot Linux auto-hole diagnostics (run on Fedora, paste output)
 Cargo.toml                   0.3.0-alpha.28 (windows+linux deps)
-Cargo.lock                   pinned
+Cargo.lock                   synced to 0.3.0-alpha.28 (alpha.28a — fixes CI `--locked`)
 Invertonator-rs-v0.2.0-alpha.2.exe  legacy artifact (safe to git rm)
 LICENSE                      MIT
 README.md                    status + platform matrix (5 platforms) + roadmap

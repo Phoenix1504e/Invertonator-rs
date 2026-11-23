@@ -494,3 +494,46 @@ Delivered: zip `Invertonator-rs <sha> 0.3.0-alpha.24` + changed-files mirror byt
 | P4: false-positive matches (token too generic) | pin appears on non-YouTube windows (e.g. token = short common word) | submenu row shows tokens; user forgets the entry; consider requiring ≥2 tokens matched when title has >2 segments |
 | P5: fullscreen pin conflict | fullscreen shows a mis-shapen true rect | should be impossible (pins dropped on fullscreen) — if seen, the fullscreen check missed a path; check `stored area dropped (window went fullscreen)` line |
 | Everything green | pinned YouTube window: instant true rect, zero walk needed; media walk irrelevant on that window | v2.3.3 converged; next = per-monitor pin variants, Windows-side analog (F8 UIA rect store) |
+
+## Task 27 — alpha.28: pin selection adjust + confirm step
+
+### Field context
+- USER: "okay so after selection give them a chance to readjust and then confirm the area" — alpha.27's commit-on-release was too eager: one sloppy drag and a wrong rect is already stored (then has to be found in the "Stored areas" submenu and forgotten). The readjust step is also the natural place to catch the P3/P4 risks (off-by-a-bit rects from fractional scaling, misclicks) BEFORE they persist.
+
+### alpha.28 changes (v2.3.4)
+- Two-phase state machine in the selection overlay: `drag` → (release) → `adjust` → (Confirm) → commit; plus transient `resize`/`move`/`redrag` phases. The alpha.27 commit path (`_pinSelectCommit`, rel math, tokens) is byte-for-byte unchanged — only gated behind the new confirm.
+- ADJUST CHROME (built once, reused): 8 resize handles (4 corners + 4 edges, 13px squares) positioned from one `_pinSyncChrome` pass; a live `W × H px` size chip (non-reactive, floats above the rect, falls inside when the rect hugs the screen top); a Confirm / Redraw / Cancel bar that follows the rect (below by default, above when the rect reaches the screen bottom, edge-clamped).
+- INTERACTIONS: handle drag = resize (mask-driven, cursor per handle via `Meta.Cursor.NW/N/NE/E/SE/S/SW/W_RESIZE`, restored to DEFAULT on release/teardown); drag inside the rect = move; drag outside = fresh redraw — a too-small outside drag restores the previous rect instead of losing it (the only asymmetry vs the first drag, where too-small still cancels: at step 1 there is nothing to restore).
+- KEYBOARD: Enter (Return/KP_Enter/ISO_Enter) confirms, R redraws, Esc cancels — in every post-drag phase. Toolbar buttons are made non-reactive during live drags so a click can never swallow the release event the drag needs (and a stray press mid-drag self-heals by finalizing at that point).
+- MIN-SIZE: resize clamps keep the rect ≥ PIN_MIN_EDGE (24px) throughout the adjust stage, so Confirm can only ever see a valid rect; the too-small guard in `_pinConfirm` remains as a belt-and-braces (stay in adjust, notify).
+- Versions: metadata 28, Cargo/common.rs 0.3.0-alpha.28. Walker, pins storage, matching, priority — untouched from alpha.27.
+
+### Field event (round 14 — the paste failure, structural fix)
+- The WINDOWS PowerShell block was pasted into Fedora bash AGAIN (`cd C:\Users\admin\invertonator-push` → `No such file or directory`, `Expand-Archive: command not found`, then `nothing to commit, working tree clean` / `Everything up-to-date`). Diagnosis: NOTHING applied, NOTHING harmed — the zip was never extracted (no Expand-Archive in bash) and git refused to commit a clean tree; the alpha.6-era message in the paste never landed. alpha.27→28 gap on origin confirmed untouched.
+- STRUCTURAL FIX (ships in alpha.28): (1) `apply-linux.sh` at repo root + in the zip — the Fedora apply is now ONE guarded command: refuses non-Linux, refuses a stale zip (metadata version + adjust/confirm markers checked in a TEMP extract BEFORE the repo is touched), refuses a dirty repo, commits the release-pinned message, pushes, runs install.sh, prints the logout reminder. Tested: stale-zip abort, happy path (correct commit+push), idempotent re-run (nothing to commit), dirty-repo abort. (2) The Windows block is now ONE PowerShell line gated on `$env:OS` — in bash it is a parse error at `{` and ZERO commands execute (verified by feeding it to bash with echo-markers; nothing ran). (3) APPLY.md restructured: "STOP — two machines" table at the very top, one-liner as primary apply, freshness gate says alpha.28, file map 25 files.
+
+### Risk table for round 14 (pre-registered)
+| Branch | Evidence in field | Verdict path |
+|---|---|---|
+| Q1: two-step works end-to-end | Super+F8 drag → release → `area preview` journal (nothing stored) → adjust → Confirm/Enter → `area stored` | DONE — v2.3.4 quality pass |
+| Q2: handle press eaten by overlay | journal shows redraw (`redrag`) when grabbing a handle, rect jumps | handle actor not picked — check reactive + above-sibling order; move handles to a dedicated top layer |
+| Q3: buttons unclickable / click-through | Confirm click does nothing or redraws | St.Button 'clicked' vs modal grab routing; check `_pinSetToolbarActive(true)` ran (adjust entry) |
+| Q4: toolbar mispositioned (overlaps rect/offscreen) | bar hidden behind panel or pinned at wrong monitor edge | preferred-width measured before first allocation — re-sync on `notify::allocation` if reported |
+| Q5: cursor stuck as resize arrow after Esc | pointer stays NW_RESIZE outside the overlay | `_pinSelectTeardown` resets to DEFAULT; if a crash path skips teardown, Mutter resets on grab end — confirm |
+| Everything green | sloppy drags are fixable before storing; Confirm is deliberate | v2.3.4 converged; next = edge-handle elongation, gsettings-persisted per-pin label, Windows F8 UIA analog |
+
+## Task 28 — alpha.28a: Cargo.lock sync (CI fix) + restart-persistence audit
+
+### Field event (round 15 — GitHub Actions `cargo check --locked` exit 101)
+- CI on origin failed: `error: cannot update the lock file …/Cargo.lock because --locked was passed to prevent this`. Root cause: **stale lock, not code** — `Cargo.toml` was bumped alpha.24→alpha.28 across five commits while `Cargo.lock` was last touched at alpha.23 (`name = "invertonator" / version = "0.3.0-alpha.23"`). `--locked` refuses to update the lock from the network, so the job died before compiling.
+- Verified via `git diff ddd5aa2 HEAD -- Cargo.toml`: only the package version line changed since alpha.23 — zero dependency changes. Complete fix: one-line version sync inside Cargo.lock → `0.3.0-alpha.28` (commit alpha.28a). CI keeps `--locked` (reproducibility); the discipline is "bump Cargo.toml → re-lock → commit both", now noted in APPLY.md's Round 15 section.
+- Lesson filed for future bumps: version-string releases must run `cargo check --locked` locally (or touch Cargo.lock) BEFORE packaging the zip — the sandbox has no cargo, so packaging scripts must diff `Cargo.toml` vs `Cargo.lock` versions as a gate.
+
+### Restart-persistence audit (user question: "check if the stored holes survive restart or not")
+- **Verdict: YES — entries survive reboot / logout / shell crash; the visible holes are re-baked automatically on the next session.** Code chain (extension.js):
+  1. **Disk**: pins live in the `pinned-holes` gsettings key → dconf database (`~/.config/dconf/user`). `_pinConfirm` → `_pinSaveEntries()` writes it the INSTANT Enter/Confirm is pressed, not at logout.
+  2. **Load**: the extension constructor runs `_pinLoadEntries()` on every `enable()` — fresh login, re-login, X11 `Alt+F2 r`, extension toggle.
+  3. **Apply**: `start-enabled` (auto-written by `setInverted`) drives auto-resume → `setInverted(true)` re-loads entries, runs `_pinsRefresh()` over `global.get_window_actors()` (so PRE-EXISTING matched windows get holes immediately, no focus event needed) and starts the 2s `_pinStartTimer` tick; focus + window-created hooks also refresh.
+  4. **Toggle path**: inversion OFF destroys pin effects but keeps gsettings entries (explicit in code); ON reloads and re-applies.
+- By-design exceptions (not persistence failures): fullscreen windows drop pins (windowed rel-layout meaningless there — returns on un-fullscreen); minimized windows are skipped until shown; token drift — if a site changes its title shape entirely, a token-matched pin can stop matching (class fallback fires only when the token list is empty). dconf flush timing is near-immediate; a hard power-loss in the same second as Confirm is the only theoretical loss window.
+- APPLY.md: added Round 15 CI section + test step 9 (restart persistence: `gsettings get org.gnome.shell.extensions.invertonator pinned-holes` → reboot → auto-resume → `stored area applied` journal ≤2s); Windows block commit message updated to alpha.28a; file map notes the lock sync. No code change — metadata/common.rs stay 0.3.0-alpha.28, zip markers unchanged for `apply-linux.sh`.

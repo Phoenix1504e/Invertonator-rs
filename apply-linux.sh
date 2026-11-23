@@ -24,7 +24,7 @@
 set -euo pipefail
 
 REPO_V=28
-MSG="alpha.28: Linux v2.3.4 — pin selection adjust + confirm step (handles, move, Enter/R/Esc)"
+MSG="alpha.28a: pin adjust + confirm step (handles, move, Enter/R/Esc) + sync Cargo.lock to 0.3.0-alpha.28 (fixes CI --locked)"
 EXT_DIR="shell-extension/invertonator@phoenix1504e"
 
 err() {
