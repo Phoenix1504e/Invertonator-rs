@@ -1,9 +1,56 @@
-# Invertonator-rs — Full Source Package (v0.3.0-alpha.27, stored area pins)
+# Invertonator-rs — Full Source Package (v0.3.0-alpha.28, adjust + confirm selection)
 
 Complete repo at a fixed state — extract over your clone, commit, push.
 No `.git` inside, your history is untouched.
 
 ---
+
+## STOP — two machines, two blocks. Paste the RIGHT one.
+
+| Terminal prompt | Use |
+|---|---|
+| `phoenix1504e@fedora:…$` (bash) | the **Fedora one-liner** below — `bash apply-linux.sh` |
+| `PS C:\Users\admin\…>` (PowerShell) | the **Windows block** at the very bottom of this file |
+
+**Round 14 field event (this happened AGAIN):** the Windows block was
+pasted into Fedora bash — `cd C:\Users\admin\invertonator-push` →
+`No such file or directory`, `Expand-Archive: command not found`, then
+`nothing to commit, working tree clean` / `Everything up-to-date`.
+Diagnosis: **nothing was applied and nothing was harmed** — bash has no
+Expand-Archive so the zip was never extracted, and git correctly refused
+to commit a clean tree (the alpha.6-era message in that paste was never
+committed). Remedy: run the Fedora one-liner below.
+
+New in alpha.28: the Fedora path is **one guarded command**
+(`apply-linux.sh` — refuses the wrong machine, refuses a stale zip,
+refuses a dirty repo, commits the right message) and the Windows block
+is **bash-fatal by design**: its whole flow sits on ONE line behind a
+PowerShell `$env:OS` check — bash rejects that line at the `{` token
+(verified: zero commands execute), PowerShell on Windows runs it.
+
+---
+
+## What alpha.28 adds (your request: "after selection give them a chance to readjust and then confirm the area")
+
+The alpha.27 selection committed the instant you released the mouse —
+too fast to fix a sloppy drag. The prompt is now TWO STEPS:
+
+1. **Step 1 — drag (unchanged feel).** Screen dims, drag a rectangle.
+2. **Step 2 — the readjust preview.** On release the dashed rect becomes
+   a solid preview and NOTHING is stored yet. You get:
+   - **8 resize handles** (4 corners + 4 edges) — drag any of them to
+     fine-tune the area, with live `W × H px` size readout;
+   - **move** — drag inside the rect to reposition it;
+   - **redraw** — drag outside the rect (or the Redraw button, or `R`)
+     starts a fresh selection; a too-small outside drag keeps the old
+     rect instead of losing your work;
+   - **a Confirm / Redraw / Cancel bar** that follows the rect (below it,
+     above it when there is no room) — or just press **Enter**.
+   Esc cancels everything, right-click cancels, mouse cursors change per
+   handle so you always know which way a drag will pull.
+3. **Nothing is stored until Confirm** (button or Enter). The commit
+   math (rel-to-frame, title tokens) is byte-for-byte alpha.27's — only
+   the gating in front of it is new.
 
 ## What alpha.27 adds (your request: "select an area once and it gets stored for YouTube")
 
@@ -45,8 +92,9 @@ accessibility tree is closed (LibreWolf hardened builds):
    evicted).
 
 Quick how-to: Super+I → open YouTube → Super+F8 → drag a box around the
-player → done. From then on every YouTube-titled window gets that hole
-instantly.
+player → adjust the handles until the readout covers the player →
+Confirm (or Enter). From then on every YouTube-titled window gets that
+hole instantly.
 
 ## What alpha.26 fixed (field round 11 — journal proved the thrash)
 
@@ -167,18 +215,30 @@ The filename is the SAME across versions. An older download in
 unzip -z ~/Downloads/Invertonator-rs-full-source.zip
 ```
 
-It must print **`Invertonator-rs <sha> 0.3.0-alpha.27`**. If it
-prints alpha.26 or older, re-download the zip from the chat first.
+It must print **`Invertonator-rs <sha> 0.3.0-alpha.28`**. If it
+prints alpha.27 or older, re-download the zip from the chat first.
 
-> **NOTE (round 10):** last round the WINDOWS PowerShell block below
-> was pasted into Fedora bash (`cd C:\Users\admin\invertonator-push`
-> → `No such file or directory`, `Expand-Archive: command not found`,
-> git "nothing to commit / Everything up-to-date") — i.e. the Linux
-> apply never ran. The two blocks are for two DIFFERENT machines: on
-> Fedora, use ONLY the bash block in this section; the PowerShell
-> block is for the Windows machine only.
+> Rounds 10 AND 14 lost to the same paste mix-up (Windows block into
+> Fedora bash) — hence the guards below. The full story is in "STOP —
+> two machines" at the top.
 
-## Apply on Fedora — paste this whole block
+## Apply on Fedora — paste this ONE command
+
+```bash
+cd ~/FromWindows/Projects/Invertonator-rs && \
+unzip -o ~/Downloads/Invertonator-rs-full-source.zip apply-linux.sh -d . && \
+bash apply-linux.sh
+```
+
+`apply-linux.sh` does the whole flow WITH guards: refuses non-Linux,
+verifies the zip is alpha.28 (metadata version + adjust/confirm markers)
+BEFORE touching the repo, refuses a dirty repo, resets to `origin/main`,
+extracts, commits `alpha.28: Linux v2.3.4 — pin selection adjust +
+confirm step (handles, move, Enter/R/Esc)`, pushes, runs the installer
+and prints the logout reminder. Zip somewhere else? `bash apply-linux.sh
+/path/to/zip`.
+
+Manual fallback (only if you want to do it by hand — NO guards):
 
 ```bash
 cd ~/FromWindows/Projects/Invertonator-rs && \
@@ -187,7 +247,7 @@ git reset --hard origin/main && \
 unzip -o ~/Downloads/Invertonator-rs-full-source.zip -d . && \
 git status --short && \
 git add -A && \
-git commit -m "alpha.27: Linux v2.3.3 — stored area pins (Super+F8 select-once, title-token matching)" && \
+git commit -m "alpha.28: Linux v2.3.4 — pin selection adjust + confirm step (handles, move, Enter/R/Esc)" && \
 git push origin HEAD && \
 bash shell-extension/install.sh
 ```
@@ -241,18 +301,24 @@ pin-hole, auto-hole-media, auto-hole-fullscreen, start-enabled).
    fullscreen → rects keep following.
 7. mpv / VLC / a game fullscreen → whole window true color (fallback
    hole, journal: `auto-hole ON (fullscreen, no media nodes)`).
-8. **NEW — the alpha.27 test (the YouTube pin):** inverted, on a YouTube
-   watch page (windowed), press **Super+F8** → screen dims with a hint
-   label. Drag a box around the video player, release. Journal:
+8. **NEW — the alpha.28 test (adjust + confirm, then the YouTube pin):**
+   inverted, on a YouTube watch page (windowed), press **Super+F8** →
+   screen dims with a hint label. Drag a box around the video player and
+   RELEASE — a solid preview appears with 8 handles, a `W × H px` readout
+   and a Confirm / Redraw / Cancel bar (journal:
+   `area preview — drag the handles…`). Drag an edge handle to fine-tune,
+   drag inside the rect to move it — journal stays silent (nothing
+   stored yet). Press **Enter** (or click Confirm). Journal:
    `area stored — match title tokens [song x, youtube] rel=[…]`.
-   Close the tab, open ANOTHER video on YouTube → within ≤2s a true-color
-   rect appears at the SAME relative position (journal:
-   `stored area applied (title […])`) — no walker needed. Resize the
-   window → the rect follows. Fullscreen the video → the pin drops
-   (`stored area dropped (window went fullscreen)`) and normal fullscreen
-   behavior returns; leave fullscreen → pin comes back. Esc mid-drag →
-   nothing stored. Panel menu → "Stored areas" lists the pin; click the
-   row to forget it.
+   Press Super+F8 again, drag, then **R** or Redraw → fresh selection;
+   Esc mid-adjust → nothing stored. Close the tab, open ANOTHER video on
+   YouTube → within ≤2s a true-color rect appears at the SAME relative
+   position (journal: `stored area applied (title […])`) — no walker
+   needed. Resize the window → the rect follows. Fullscreen the video →
+   the pin drops (`stored area dropped (window went fullscreen)`) and
+   normal fullscreen behavior returns; leave fullscreen → pin comes
+   back. Panel menu → "Stored areas" lists the pin; click the row to
+   forget it.
 9. If AT-SPI discovery ALSO still works on your setup, both can coexist:
    the stored pin wins on its window (chrome of a pinned YouTube window
    stays inverted even if the walker is dead — the whole point).
@@ -267,30 +333,32 @@ journalctl --user -b --no-pager | grep -iE 'invertonator|JS ERROR' | tail -40
 
 ---
 
-## Windows machine (if you still boot it)
+## Windows machine (if you still boot it) — NEVER paste this into Fedora bash
+
+The whole flow is ONE PowerShell line gated on `$env:OS`: on Windows it
+runs; in Fedora bash it is a PARSE ERROR at the `{` token — bash
+discards the entire line and RUNS NOTHING. (Verified round 14.) alpha.28
+is Linux-only; this section only bumps the Windows VERSION string.
 
 ```powershell
-cd C:\Users\admin\invertonator-push
-Expand-Archive -Path "$env:USERPROFILE\Downloads\Invertonator-rs-full-source.zip" -DestinationPath . -Force
-git add -A
-git commit -m "alpha.27: Linux v2.3.3 — stored area pins (Super+F8 select-once, title-token matching)"
-git push origin HEAD
+if ($env:OS -ne 'Windows_NT') { throw 'WINDOWS PowerShell block — wrong machine.' } else { cd C:\Users\admin\invertonator-push; Expand-Archive -Path "$env:USERPROFILE\Downloads\Invertonator-rs-full-source.zip" -DestinationPath . -Force; git add -A; git commit -m "alpha.28: Linux v2.3.4 — pin selection adjust + confirm step (handles, move, Enter/R/Esc)"; git push origin HEAD }
 ```
 
 Verify: first line of `%LOCALAPPDATA%\Invertonator\log.txt` must read
-`=== Invertonator-rs v0.3.0-alpha.27 ===`. Windows behavior is
+`=== Invertonator-rs v0.3.0-alpha.28 ===`. Windows behavior is
 alpha.15-identical; its test protocol and Desktop diagnostics still apply.
 
 ---
 
-## File map (24 files, latest state)
+## File map (25 files, latest state)
 
 ```
 .github/workflows/build.yml  CI: windows+ubuntu artifacts + GNOME extension bundle
 .gitignore                   /target, *.exe — keep, protects your clone
 APPLY.md                     this file
+apply-linux.sh               ONE-command guarded Fedora apply (verify zip, commit, push, install)
 invertonator-diag.sh         one-shot Linux auto-hole diagnostics (run on Fedora, paste output)
-Cargo.toml                   0.3.0-alpha.27 (windows+linux deps)
+Cargo.toml                   0.3.0-alpha.28 (windows+linux deps)
 Cargo.lock                   pinned
 Invertonator-rs-v0.2.0-alpha.2.exe  legacy artifact (safe to git rm)
 LICENSE                      MIT
@@ -299,7 +367,7 @@ docs/LINUX-TESTING.md        Fedora-first runbook (Wayland ext / X11 / KDE) +
                              holes test protocol + journal-line diagnosis
 icon.ico / icon.svg          logo (tray + README)
 src/main.rs                  cross-platform entry (cfg dispatcher)
-src/common.rs                settings.json + logging + VERSION (alpha.27)
+src/common.rs                settings.json + logging + VERSION (alpha.28)
 src/win_main.rs              Windows backend (tray, hotkeys, probe, DPI,
                              auto-diagnostics, hysteresis telemetry)
 src/holes.rs                 hole pool + main-thread pump (≈64Hz, context-
@@ -311,7 +379,7 @@ src/scrollhook.rs            low-level wheel hook (scroll-hold, page-dirty)
 src/linux.rs                 X11 XRandR gamma inversion + --self-test +
                              Wayland session awareness
 shell-extension/install.sh                       installer + schema verification + gsettings fallback
-shell-extension/invertonator@phoenix1504e/metadata.json    uuid, v27, shells 45–51
+shell-extension/invertonator@phoenix1504e/metadata.json    uuid, v28, shells 45–51
 shell-extension/invertonator@phoenix1504e/extension.js     compositor shader inversion
                                                            (Cogl.Snippet / dual-API effect,
                                                            uiGroup attach), Super+I,

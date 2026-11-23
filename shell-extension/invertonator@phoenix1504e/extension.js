@@ -80,16 +80,19 @@
 //   automatically (GTK3 apps need a restart to pick it up).
 //
 //   v2.3.3 stored area pins (alpha.27): "select an area once, it gets
-//   stored" — Super+F8 opens a drag-select overlay; the rectangle is
-//   stored NORMALIZED to the focused window's frame together with
-//   match tokens derived from the window title (a YouTube page always
-//   carries a "- youtube" segment; video titles change per video, so
-//   tokens match loosely), class match as fallback. Stored areas live
-//   in gsettings (pinned-holes) and survive reboots: whenever a window
-//   whose title contains a stored token shows up (ANY browser, ANY
-//   session), its pin is re-baked as a rect-shader hole at the stored
-//   relative position — zero AT-SPI budget, instant, and immune to
-//   browsers that hide their a11y tree (LibreWolf hardened builds).
+//   stored" — Super+F8 opens a drag-select overlay; on release the rect
+//   becomes an ADJUSTABLE PREVIEW (v2.3.4: 8 resize handles, drag-inside
+//   to move, drag-outside to redraw, Confirm/Redraw/Cancel bar, Enter
+//   confirms, R redraws, Esc cancels — NOTHING is stored until Confirm);
+//   the confirmed rectangle is stored NORMALIZED to the focused window's
+//   frame together with match tokens derived from the window title (a
+//   YouTube page always carries a "- youtube" segment; video titles
+//   change per video, so tokens match loosely), class match as
+//   fallback. Stored areas live in gsettings (pinned-holes) and survive
+//   reboots: whenever a window whose title contains a stored token shows
+//   up (ANY browser, ANY session), its pin is re-baked as a rect-shader
+//   hole at the stored relative position — zero AT-SPI budget, instant,
+//   and immune to browsers that hide their a11y tree (LibreWolf hardened builds).
 //   The pin rides the window actor like every other rect hole, so moves
 //   and resizes follow; a matching window that goes FULLSCREEN drops
 //   the pin (a windowed player's position is meaningless fullscreen)
@@ -161,6 +164,11 @@ const PIN_TOKEN_MIN = 4;              // title-token length bounds
 const PIN_TOKEN_MAX = 48;
 const PIN_TOKEN_CAP = 4;              // tokens stored per pin
 const PIN_MAX_STORE = 4;              // per-pin rel precision = 4 decimals
+// v2.3.4 two-step selection (alpha.28): after the drag the rect becomes an
+// adjustable preview — 8 handles, move-by-drag, Confirm/Redraw/Cancel bar.
+const PIN_HANDLE = 13;                // px — adjust-handle square size
+const PIN_UI_GAP = 12;                // px — toolbar gap from the rect
+const PIN_MARGIN = 8;                 // px — screen-edge clamp margin
 // Title segments that name the APP, not the site — never stored as match
 // tokens (they would match every window of that app).
 const PIN_APP_TOKENS = new Set([
@@ -2441,12 +2449,17 @@ export default class InvertonatorExtension extends Extension {
         console.log(`Invertonator: forgot ${n} stored area(s)`);
     }
 
-    // --- v2.3.3: the drag-select overlay ---------------------------------
+    // --- v2.3.3/v2.3.4: the drag-select overlay (two steps) ---------------
     //
     // A fullscreen St.Widget above the stage (outside uiGroup, so the
-    // overlay itself is NOT inverted), a modal grab, pointer events draw
-    // the rectangle, Esc cancels, release commits against the anchor
-    // window's frame rect.
+    // overlay itself is NOT inverted) with a modal grab. STEP 1: the
+    // pointer drag draws a dashed rectangle. STEP 2 (on release): the
+    // rectangle becomes a solid PREVIEW the user can fine-tune before
+    // anything is stored — 8 resize handles (corners + edges), drag
+    // inside the rect moves it, drag outside redraws from scratch, and a
+    // Confirm / Redraw / Cancel bar sits beside the rect. Enter confirms,
+    // R redraws, Esc (or right-click) cancels. Nothing is stored until
+    // Confirm; the commit itself is unchanged (alpha.27 rel math).
 
     pinSelectStart() {
         if (!this._pins) {
@@ -2479,7 +2492,7 @@ export default class InvertonatorExtension extends Extension {
             coordinate: Clutter.BindCoordinate.ALL,
         }));
         const hint = new St.Label({
-            text: 'Drag a rectangle to store a true-color area · Esc cancels',
+            text: 'Drag a rectangle · release to fine-tune, then Confirm · Esc cancels',
             style: 'padding: 8px 14px; background: rgba(20, 20, 20, 0.85); ' +
                 'color: #eeeeee; border-radius: 6px; font-size: 13px;',
         });
@@ -2499,6 +2512,13 @@ export default class InvertonatorExtension extends Extension {
             overlay, box, mw,
             mwTitle: mw.get_title?.() ?? '',
             startX: 0, startY: 0, dragging: false, ids: [],
+            phase: 'drag',      // drag | adjust | resize | move | redrag
+            rect: null,         // [x, y, w, h] stage coords (adjust stage)
+            rect0: null,        // rect snapshot at resize/move press
+            mask: null,         // {n,s,e,w} active resize mask
+            pressX: 0, pressY: 0,
+            handles: [], toolbar: null, btns: [], sizeLabel: null,
+            adjustBuilt: false, adjustLogged: false,
         };
         const s = this._pinSelect;
         s.ids.push(overlay.connect('button-press-event',
@@ -2519,7 +2539,8 @@ export default class InvertonatorExtension extends Extension {
             return;
         }
         console.log('Invertonator: area selection started — drag a ' +
-            `rectangle (anchor "${s.mwTitle}"), Esc cancels`);
+            `rectangle (anchor "${s.mwTitle}"), release to adjust, ` +
+            'Esc cancels');
     }
 
     _pinSelectPress(ev) {
@@ -2532,9 +2553,41 @@ export default class InvertonatorExtension extends Extension {
             return Clutter.EVENT_STOP;
         }
         const [x, y] = ev.get_coords();
+        // A press while a resize/move drag is live means the release was
+        // swallowed (e.g. by a button actor under the pointer) — finalize
+        // the drag at this point, then treat this press normally.
+        if ((s.phase === 'resize' || s.phase === 'move') && s.dragging) {
+            this._pinSelectReleaseAt(x, y);
+            if (!this._pinSelect) {
+                return Clutter.EVENT_STOP;
+            }
+        }
+        s.pressX = x;
+        s.pressY = y;
+        if (s.phase === 'drag' || s.phase === 'redrag') {
+            s.startX = x;
+            s.startY = y;
+            s.dragging = true;
+            s.box.visible = true;
+            s.box.set_position(x, y);
+            s.box.set_size(1, 1);
+            return Clutter.EVENT_STOP;
+        }
+        // adjust: press inside the rect moves it; press outside redraws.
+        const [rx, ry, rw, rh] = s.rect;
+        if (x >= rx && x <= rx + rw && y >= ry && y <= ry + rh) {
+            s.phase = 'move';
+            s.rect0 = [...s.rect];
+            s.dragging = true;
+            this._pinSetCursor('MOVE_ON_GRAB');
+            this._pinSetToolbarActive(false);
+            return Clutter.EVENT_STOP;
+        }
+        s.phase = 'redrag';
         s.startX = x;
         s.startY = y;
         s.dragging = true;
+        this._pinStyleDragBox(s);
         s.box.visible = true;
         s.box.set_position(x, y);
         s.box.set_size(1, 1);
@@ -2547,37 +2600,350 @@ export default class InvertonatorExtension extends Extension {
             return Clutter.EVENT_PROPAGATE;
         }
         const [x, y] = ev.get_coords();
-        s.box.set_position(Math.min(s.startX, x), Math.min(s.startY, y));
-        s.box.set_size(Math.max(Math.abs(x - s.startX), 1),
-            Math.max(Math.abs(y - s.startY), 1));
-        return Clutter.EVENT_STOP;
+        if (s.phase === 'drag' || s.phase === 'redrag') {
+            s.box.set_position(Math.min(s.startX, x), Math.min(s.startY, y));
+            s.box.set_size(Math.max(Math.abs(x - s.startX), 1),
+                Math.max(Math.abs(y - s.startY), 1));
+            return Clutter.EVENT_STOP;
+        }
+        if (s.phase === 'move') {
+            const [sw, sh] = this._pinStageBounds(s);
+            const [x0, y0, w, h] = s.rect0;
+            s.rect = [
+                Math.min(Math.max(x0 + x - s.pressX, 0), Math.max(sw - w, 0)),
+                Math.min(Math.max(y0 + y - s.pressY, 0), Math.max(sh - h, 0)),
+                w, h,
+            ];
+            this._pinSyncChrome(s);
+            return Clutter.EVENT_STOP;
+        }
+        if (s.phase === 'resize') {
+            const [sw, sh] = this._pinStageBounds(s);
+            const [x0, y0, w0, h0] = s.rect0;
+            const m = s.mask;
+            let left = x0;
+            let top = y0;
+            let right = x0 + w0;
+            let bottom = y0 + h0;
+            // max/min order keeps the rect >= PIN_MIN_EDGE on every axis.
+            if (m.e) {
+                right = Math.min(Math.max(x, left + PIN_MIN_EDGE), sw);
+            }
+            if (m.w) {
+                left = Math.max(Math.min(x, right - PIN_MIN_EDGE), 0);
+            }
+            if (m.s) {
+                bottom = Math.min(Math.max(y, top + PIN_MIN_EDGE), sh);
+            }
+            if (m.n) {
+                top = Math.max(Math.min(y, bottom - PIN_MIN_EDGE), 0);
+            }
+            s.rect = [left, top, right - left, bottom - top];
+            this._pinSyncChrome(s);
+            return Clutter.EVENT_STOP;
+        }
+        return Clutter.EVENT_PROPAGATE;
     }
 
     _pinSelectRelease(ev) {
+        const [x, y] = ev.get_coords();
+        return this._pinSelectReleaseAt(x, y);
+    }
+
+    _pinSelectReleaseAt(x, y) {
         const s = this._pinSelect;
         if (!s || !s.dragging) {
             return Clutter.EVENT_PROPAGATE;
         }
-        const [x, y] = ev.get_coords();
-        const bx = Math.min(s.startX, x);
-        const by = Math.min(s.startY, y);
-        const bw = Math.abs(x - s.startX);
-        const bh = Math.abs(y - s.startY);
-        if (bw < PIN_MIN_EDGE || bh < PIN_MIN_EDGE) {
-            this.pinSelectCancel();
-            Main.notify('Invertonator', 'Selection too small — nothing stored.');
+        s.dragging = false;
+        if (s.phase === 'drag' || s.phase === 'redrag') {
+            const bx = Math.min(s.startX, x);
+            const by = Math.min(s.startY, y);
+            const bw = Math.abs(x - s.startX);
+            const bh = Math.abs(y - s.startY);
+            if (bw < PIN_MIN_EDGE || bh < PIN_MIN_EDGE) {
+                if (s.phase === 'drag') {
+                    this.pinSelectCancel();
+                    Main.notify('Invertonator',
+                        'Selection too small — nothing stored.');
+                    return Clutter.EVENT_STOP;
+                }
+                // A missed re-drag keeps the previous rect — back to it.
+                this._pinEnterAdjust(s.rect[0], s.rect[1],
+                    s.rect[2], s.rect[3]);
+                return Clutter.EVENT_STOP;
+            }
+            this._pinEnterAdjust(bx, by, bw, bh);
             return Clutter.EVENT_STOP;
         }
-        this._pinSelectCommit(bx, by, bw, bh);
+        // resize / move finished → back to the confirmable preview
+        this._pinEnterAdjust(s.rect[0], s.rect[1], s.rect[2], s.rect[3]);
         return Clutter.EVENT_STOP;
     }
 
     _pinSelectKey(ev) {
-        if (ev.get_key_symbol() === Clutter.KEY_Escape) {
+        const s = this._pinSelect;
+        const sym = ev.get_key_symbol();
+        if (sym === Clutter.KEY_Escape) {
             this.pinSelectCancel();
             return Clutter.EVENT_STOP;
         }
+        if (!s || s.phase === 'drag' || s.phase === 'redrag') {
+            return Clutter.EVENT_PROPAGATE;
+        }
+        if (sym === Clutter.KEY_Return || sym === Clutter.KEY_KP_Enter
+            || sym === Clutter.KEY_ISO_Enter) {
+            this._pinConfirm();
+            return Clutter.EVENT_STOP;
+        }
+        if (sym === Clutter.KEY_r || sym === Clutter.KEY_R) {
+            this._pinRestartDrag();
+            return Clutter.EVENT_STOP;
+        }
         return Clutter.EVENT_PROPAGATE;
+    }
+
+    // STEP 2 — the adjustable preview. Builds the chrome once, re-uses it
+    // on every re-entry (resize release, move release, missed re-drag).
+    _pinEnterAdjust(x, y, w, h) {
+        const s = this._pinSelect;
+        if (!s) {
+            return;
+        }
+        s.phase = 'adjust';
+        s.rect = [x, y, w, h];
+        s.rect0 = null;
+        s.mask = null;
+        s.dragging = false;
+        if (!s.adjustBuilt) {
+            this._pinBuildAdjustUI(s);
+            s.adjustBuilt = true;
+        }
+        this._pinSetCursor('DEFAULT');
+        this._pinStyleAdjustBox(s);
+        this._pinSetToolbarActive(true);
+        this._pinSyncChrome(s);
+        if (!s.adjustLogged) {
+            s.adjustLogged = true;
+            console.log('Invertonator: area preview — drag the handles or ' +
+                'the rect to adjust, then Confirm (Enter); R redraws, ' +
+                'Esc cancels');
+        }
+    }
+
+    _pinHandlePress(h, ev) {
+        const s = this._pinSelect;
+        if (!s) {
+            return Clutter.EVENT_STOP;
+        }
+        if (ev.get_button() !== 1) {
+            this.pinSelectCancel();
+            return Clutter.EVENT_STOP;
+        }
+        const [x, y] = ev.get_coords();
+        s.pressX = x;
+        s.pressY = y;
+        s.phase = 'resize';
+        s.rect0 = [...s.rect];
+        s.mask = h.mask;
+        s.dragging = true;
+        this._pinSetCursor(h.cursor);
+        this._pinSetToolbarActive(false);
+        return Clutter.EVENT_STOP;
+    }
+
+    _pinBuildAdjustUI(s) {
+        // 8 handles — corners + edges — in syncChrome anchor order.
+        const masks = [
+            [{ n: 1, w: 1 }, 'NW_RESIZE'],
+            [{ n: 1 }, 'N_RESIZE'],
+            [{ n: 1, e: 1 }, 'NE_RESIZE'],
+            [{ e: 1 }, 'E_RESIZE'],
+            [{ s: 1, e: 1 }, 'SE_RESIZE'],
+            [{ s: 1 }, 'S_RESIZE'],
+            [{ s: 1, w: 1 }, 'SW_RESIZE'],
+            [{ w: 1 }, 'W_RESIZE'],
+        ];
+        for (const [mask, cursor] of masks) {
+            const hd = new St.Widget({
+                reactive: true,
+                style: 'background: #ffffff; border: 2px solid #1e88e5; ' +
+                    'border-radius: 3px;',
+            });
+            hd.set_size(PIN_HANDLE, PIN_HANDLE);
+            hd.connect('button-press-event',
+                (a, ev) => this._pinHandlePress({ mask, cursor }, ev));
+            s.overlay.add_child(hd);
+            s.handles.push(hd);
+        }
+        // Size chip — non-reactive so presses fall through to the rect
+        // (an inside-rect press means move).
+        s.sizeLabel = new St.Label({
+            reactive: false,
+            style: 'padding: 3px 8px; background: rgba(20, 20, 20, 0.85); ' +
+                'color: #eeeeee; border-radius: 4px; font-size: 11px;',
+        });
+        s.overlay.add_child(s.sizeLabel);
+        // Confirm / Redraw / Cancel bar. Button presses must not reach the
+        // overlay handler (it would read them as redraw / move presses).
+        const tb = new St.BoxLayout({
+            reactive: true,
+            style: 'padding: 6px 8px; background: rgba(20, 20, 20, 0.92); ' +
+                'border-radius: 8px;',
+        });
+        tb.connect('button-press-event', () => Clutter.EVENT_STOP);
+        const mkBtn = (text, cb, accent) => {
+            const b = new St.Button({
+                child: new St.Label({ text }),
+                style: 'padding: 5px 14px; border-radius: 6px; ' +
+                    `background: ${accent}; color: #ffffff; ` +
+                    'font-size: 12px; font-weight: bold;',
+            });
+            b.connect('clicked', cb);
+            tb.add_child(b);
+            s.btns.push(b);
+        };
+        mkBtn('Confirm area', () => this._pinConfirm(), '#2e7d32');
+        mkBtn('Redraw', () => this._pinRestartDrag(), '#546e7a');
+        mkBtn('Cancel', () => this.pinSelectCancel(), '#616161');
+        s.toolbar = tb;
+        s.overlay.add_child(tb);
+    }
+
+    _pinStyleDragBox(s) {
+        s.box.set_style('border: 2px dashed #4fc3f7; ' +
+            'background: rgba(79, 195, 247, 0.18);');
+        for (const hd of s.handles) {
+            hd.visible = false;
+        }
+        if (s.sizeLabel) {
+            s.sizeLabel.visible = false;
+        }
+        if (s.toolbar) {
+            s.toolbar.visible = false;
+        }
+    }
+
+    _pinStyleAdjustBox(s) {
+        s.box.set_style('border: 2px solid #4fc3f7; ' +
+            'background: rgba(79, 195, 247, 0.12);');
+        s.box.visible = true;
+        for (const hd of s.handles) {
+            hd.visible = true;
+        }
+        if (s.sizeLabel) {
+            s.sizeLabel.visible = true;
+        }
+        if (s.toolbar) {
+            s.toolbar.visible = true;
+        }
+    }
+
+    // One place repositions EVERYTHING after any rect change.
+    _pinSyncChrome(s) {
+        const [x, y, w, h] = s.rect;
+        s.box.set_position(x, y);
+        s.box.set_size(w, h);
+        const H2 = Math.round(PIN_HANDLE / 2);
+        const anchors = [
+            [x, y], [x + w / 2, y], [x + w, y],
+            [x + w, y + h / 2],
+            [x + w, y + h], [x + w / 2, y + h], [x, y + h],
+            [x, y + h / 2],
+        ];
+        s.handles.forEach((hd, i) => {
+            const [cx, cy] = anchors[i];
+            hd.set_position(Math.round(cx) - H2, Math.round(cy) - H2);
+        });
+        if (s.sizeLabel) {
+            s.sizeLabel.text = `${Math.round(w)} × ${Math.round(h)} px`;
+            const [, natH] = s.sizeLabel.get_preferred_height(-1);
+            if (y > natH + PIN_UI_GAP) {
+                s.sizeLabel.set_position(Math.round(x),
+                    Math.round(y - natH - 6));
+            } else {
+                s.sizeLabel.set_position(Math.round(x + 6),
+                    Math.round(y + 6));
+            }
+        }
+        if (s.toolbar) {
+            const [, natW] = s.toolbar.get_preferred_width(-1);
+            const [, natTH] = s.toolbar.get_preferred_height(natW);
+            const [sw, sh] = this._pinStageBounds(s);
+            let tx = Math.min(Math.max(x + w / 2 - natW / 2, PIN_MARGIN),
+                Math.max(sw - natW - PIN_MARGIN, PIN_MARGIN));
+            let ty = y + h + PIN_UI_GAP;
+            if (ty + natTH > sh - PIN_MARGIN) {
+                ty = y - natTH - PIN_UI_GAP;   // no room below → above
+            }
+            ty = Math.min(Math.max(ty, PIN_MARGIN),
+                Math.max(sh - natTH - PIN_MARGIN, PIN_MARGIN));
+            s.toolbar.set_position(Math.round(tx), Math.round(ty));
+        }
+    }
+
+    // Buttons only clickable while the preview is idle — a click during a
+    // live drag must not steal the release event the drag needs.
+    _pinSetToolbarActive(on) {
+        const s = this._pinSelect;
+        if (!s || !s.toolbar) {
+            return;
+        }
+        s.toolbar.reactive = on;
+        for (const b of s.btns) {
+            b.reactive = on;
+        }
+    }
+
+    _pinConfirm() {
+        const s = this._pinSelect;
+        if (!s || !s.rect || s.phase === 'drag' || s.phase === 'redrag') {
+            return;
+        }
+        const [x, y, w, h] = s.rect;
+        if (w < PIN_MIN_EDGE || h < PIN_MIN_EDGE) {
+            Main.notify('Invertonator', 'Selection too small — nothing stored.');
+            return;   // stay in adjust — the user can fix or redraw
+        }
+        this._pinSelectCommit(x, y, w, h);
+    }
+
+    _pinRestartDrag() {
+        const s = this._pinSelect;
+        if (!s) {
+            return;
+        }
+        s.phase = 'drag';
+        s.rect = null;
+        s.rect0 = null;
+        s.mask = null;
+        s.dragging = false;
+        this._pinSetCursor('DEFAULT');
+        this._pinStyleDragBox(s);
+        s.box.visible = false;
+        console.log('Invertonator: area selection — redraw requested');
+    }
+
+    _pinSetCursor(name) {
+        try {
+            const c = Meta.Cursor?.[name];
+            if (c !== undefined && c !== null) {
+                global.display.set_cursor(c);
+            }
+        } catch (e) {}
+    }
+
+    _pinStageBounds(s) {
+        try {
+            const [w, h] = global.display.get_size();
+            if (w > 0 && h > 0) {
+                return [w, h];
+            }
+        } catch (e) {}
+        return [
+            s.overlay.width || global.stage.width || 1920,
+            s.overlay.height || global.stage.height || 1080,
+        ];
     }
 
     _pinSelectCommit(x, y, w, h) {
@@ -2652,6 +3018,7 @@ export default class InvertonatorExtension extends Extension {
         if (!s) {
             return;
         }
+        this._pinSetCursor('DEFAULT');
         this._pinSelect = null;
         for (const id of s.ids) {
             try { s.overlay.disconnect(id); } catch (e) {}

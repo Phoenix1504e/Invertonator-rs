@@ -1,9 +1,9 @@
 {
     "uuid": "invertonator@phoenix1504e",
     "name": "Invertonator",
-    "description": "System-wide screen inversion that websites cannot see — the GNOME/Wayland backend of Invertonator-rs. Inverts every pixel inside the compositor, AFTER applications (and their web content) rendered, so the web layer cannot detect it. Super+I toggles; Super+F7 pierces a true-color hole into the window under the pointer; Super+F8 stores a drag-selected area (normalized to the focused window's frame, matched by title tokens — e.g. YouTube) that re-applies automatically whenever a matching window shows up; a hole manager lists every hole in the panel menu; fullscreen windows auto-hole while inversion is on (fullscreen video); AT-SPI2 media lock-on punches true-color rects at exactly the images/videos in the focused window while everything else stays inverted; a panel indicator shows the state. Companion to the Invertonator-rs X11 gamma-ramp binary.",
+    "description": "System-wide screen inversion that websites cannot see — the GNOME/Wayland backend of Invertonator-rs. Inverts every pixel inside the compositor, AFTER applications (and their web content) rendered, so the web layer cannot detect it. Super+I toggles; Super+F7 pierces a true-color hole into the window under the pointer; Super+F8 stores a drag-selected area (drag, fine-tune with resize handles, then confirm; normalized to the focused window's frame, matched by title tokens — e.g. YouTube) that re-applies automatically whenever a matching window shows up; a hole manager lists every hole in the panel menu; fullscreen windows auto-hole while inversion is on (fullscreen video); AT-SPI2 media lock-on punches true-color rects at exactly the images/videos in the focused window while everything else stays inverted; a panel indicator shows the state. Companion to the Invertonator-rs X11 gamma-ramp binary.",
     "url": "https://github.com/Phoenix1504e/Invertonator-rs",
-    "version": 27,
+    "version": 28,
     "shell-version": [
         "45",
         "46",
