@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Invertonator — ONE-command Fedora apply (this copy: alpha.28 / Linux v2.3.4).
+# Invertonator — ONE-command Fedora apply (this copy: alpha.29 / Linux v2.3.5).
 #
 # Why this script exists: the Windows PowerShell apply block has been
 # pasted into Fedora bash TWICE now (round 10 and round 14) — bash eats
@@ -9,7 +9,7 @@
 # This script makes the Fedora path ONE short paste and self-checks
 # everything the manual flow got wrong by hand:
 #   1. refuses to run anywhere but Linux bash;
-#   2. verifies the zip IS alpha.28 BEFORE touching the repo;
+#   2. verifies the zip IS alpha.29 BEFORE touching the repo;
 #   3. refuses a dirty repo (except its own drop-in copy);
 #   4. commits with the correct, release-pinned message;
 #   5. pushes and runs the installer, with the logout reminder.
@@ -23,8 +23,8 @@
 # Per-release: bump REPO_V + MSG below; this script ships INSIDE the zip.
 set -euo pipefail
 
-REPO_V=28
-MSG="alpha.28a: pin adjust + confirm step (handles, move, Enter/R/Esc) + sync Cargo.lock to 0.3.0-alpha.28 (fixes CI --locked)"
+REPO_V=29
+MSG="alpha.29: fix adjust chrome dead-on-click (Q3) — press-driven buttons + overlay hit-test fallback (v2.3.5)"
 EXT_DIR="shell-extension/invertonator@phoenix1504e"
 
 err() {
@@ -56,7 +56,7 @@ for c in "$HOME/Downloads/Invertonator-rs-full-source.zip" \
     fi
 done
 [ -n "$ZIP" ] && [ -f "$ZIP" ] \
-    || err "zip not found (tried arg, ~/Downloads, \$PWD, ~/FromWindows) — download the alpha.28 zip from the chat first"
+    || err "zip not found (tried arg, ~/Downloads, \$PWD, ~/FromWindows) — download the alpha.29 zip from the chat first"
 banner "zip = $ZIP"
 banner "zip header: $(unzip -z "$ZIP" 2>/dev/null | tail -1 || echo '(none)')"
 

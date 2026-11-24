@@ -153,7 +153,7 @@
 |---|---|---|---|
 | Windows 10+ | Magnifier API (compositor) | ✅ UIA tracker | `Ctrl+Alt+F5` invert · `F6` mode · `F7` pierce · `F2` quit |
 | Linux (X11) | XRandR CRTC gamma | 🚧 v2 (XComposite overlay) — media inverts too for now | `Ctrl+Alt+I` toggle · `Ctrl+Alt+Q` quit |
-| Linux (GNOME/Wayland) | Shell extension — compositor shader | ✅ **v2.3.4 shipped** — Super+F7 pierce + hole manager + fullscreen video auto-hole + AT-SPI2 media lock-on (element rects beat the fullscreen hole) + Super+F8 stored area pins (drag → adjust handles → confirm, title-token matched, reboot-proof) | `Super+I` invert · `Super+F7` pierce · `Super+F8` pin area · panel menu |
+| Linux (GNOME/Wayland) | Shell extension — compositor shader | ✅ **v2.3.5 shipped** — Super+F7 pierce + hole manager + fullscreen video auto-hole + AT-SPI2 media lock-on (element rects beat the fullscreen hole) + Super+F8 stored area pins (drag → adjust handles → clickable Confirm/Redraw/Cancel, title-token matched, reboot-proof) | `Super+I` invert · `Super+F7` pierce · `Super+F8` pin area · panel menu |
 | Linux (KDE/Wayland) | KWin's built-in Invert effect | ❌ | user-bound |
 | macOS | ❌ unsupported | ❌ | — |
 

@@ -537,3 +537,26 @@ Delivered: zip `Invertonator-rs <sha> 0.3.0-alpha.24` + changed-files mirror byt
   4. **Toggle path**: inversion OFF destroys pin effects but keeps gsettings entries (explicit in code); ON reloads and re-applies.
 - By-design exceptions (not persistence failures): fullscreen windows drop pins (windowed rel-layout meaningless there — returns on un-fullscreen); minimized windows are skipped until shown; token drift — if a site changes its title shape entirely, a token-matched pin can stop matching (class fallback fires only when the token list is empty). dconf flush timing is near-immediate; a hard power-loss in the same second as Confirm is the only theoretical loss window.
 - APPLY.md: added Round 15 CI section + test step 9 (restart persistence: `gsettings get org.gnome.shell.extensions.invertonator pinned-holes` → reboot → auto-resume → `stored area applied` journal ≤2s); Windows block commit message updated to alpha.28a; file map notes the lock sync. No code change — metadata/common.rs stay 0.3.0-alpha.28, zip markers unchanged for `apply-linux.sh`.
+
+## Task 29 — alpha.29: adjust chrome dead-on-click fix (Q3 confirmed, round 16)
+
+### Field report
+- USER: "the buttons which show after an area is selected which are confirm, redraw and cancel do not work on clicking" — risk-table Q3, confirmed in the field. Drags/move/redrag kept working (those presses are delivered to the grab actor itself), so the modal grab was alive — only the St.Button `clicked` path was dead.
+
+### Root cause (routing class, not state machine)
+- Audited the whole selection state machine (press/motion/release/key, `_pinEnterAdjust` → `_pinSetToolbarActive(true)` at adjust entry, reactive flags) — all correct. The failure sits in DELIVERY: on some Mutter builds the modal grab routes presses to the GRAB actor, so a St.Button never forms its press→release pair and `clicked` never emits. `_pinSelectPress` is bound to the grab actor — the one delivery path proven alive in the field.
+
+### alpha.29 changes (v2.3.5) — two independent click layers, exactly one fires
+1. **Press-driven buttons**: Confirm/Redraw/Cancel now fire on `button-press-event` (guaranteed-delivery event), not on `clicked`; `clicked` stays connected as a belt (all three callbacks are idempotent on a torn-down/phase-changed selection, so a stray second call is a no-op).
+2. **Overlay hit-test fallback**: `_pinSelectPress` (grab actor, field-proven path) hit-tests the press coordinates against the buttons (`_pinButtonAt`), the toolbar padding (`_pinToolbarAt` — absorb only, prevents a pad click from reading as redraw), and the 8 resize handles (`_pinHandleAt`). Each layer consumes with EVENT_STOP → no double-fire under EITHER Mutter behavior.
+3. Handles got the same treatment: `_pinHandlePressXY` (mask/cursor/cursor logic) shared by the actor handler and the fallback — resize now survives grab-starved child delivery too.
+4. New state: `s.toolbarActive` gates both layers (replaces reliance on reactive flags alone); `s.btnActions` / `s.handleSpecs` parallel arrays for the hit tests. `_pinSetToolbarActive` sets flag + reactive together.
+- Version bump: metadata 29, Cargo/common.rs 0.3.0-alpha.29, Cargo.lock synced in the same commit (the alpha.28a lesson — packaging gate now verifies this), README v2.3.5, apply-linux.sh REPO_V=29 + alpha.29 MSG.
+
+### Risk table for round 16 (pre-registered)
+| Branch | Evidence in field | Verdict path |
+|---|---|---|
+| Q3 resolved: buttons fire | click Confirm → `area stored`; Redraw → dashed box + `redraw requested`; Cancel → overlay closes | DONE if the click test in APPLY.md step 8 passes on Fedora |
+| Q3 variant: only SOME clicks dead | hit-test fallback fires from grab actor — journal shows the action on every click | if a click still does nothing, capture journal tail (JS ERROR lines matter) |
+| Q2 regression: handle fires from fallback AND actor | double `redraw`/rect jump on single press | EVENT_STOP on both layers prevents it; if seen, the pick is delivering twice — log ev.get_time() |
+| Q4/Q5 unchanged | toolbar placement, cursor reset — untouched this round | re-verify in the same pass |

@@ -2517,7 +2517,9 @@ export default class InvertonatorExtension extends Extension {
             rect0: null,        // rect snapshot at resize/move press
             mask: null,         // {n,s,e,w} active resize mask
             pressX: 0, pressY: 0,
-            handles: [], toolbar: null, btns: [], sizeLabel: null,
+            handles: [], handleSpecs: [], toolbar: null, btns: [],
+            btnActions: [], sizeLabel: null,
+            toolbarActive: false,   // gates BOTH click layers (see below)
             adjustBuilt: false, adjustLogged: false,
         };
         const s = this._pinSelect;
@@ -2564,6 +2566,30 @@ export default class InvertonatorExtension extends Extension {
         }
         s.pressX = x;
         s.pressY = y;
+        // Press-driven chrome fallback (Q3 field report, round 16: the
+        // Confirm/Redraw/Cancel buttons were dead on click). Some Mutter
+        // builds route modal-grab presses straight to the GRAB actor, so
+        // a St.Button never forms a press→release pair and 'clicked' never
+        // emits. The grab actor's own press path is field-proven — every
+        // drag starts here — so the toolbar buttons AND the resize handles
+        // are ALSO hit-tested at stage coordinates. Whichever layer
+        // receives the press first fires the action exactly once (the
+        // other layer consumes with EVENT_STOP, so no double fire).
+        if (s.toolbarActive) {
+            const act = this._pinButtonAt(x, y);
+            if (act) {
+                act();
+                return Clutter.EVENT_STOP;
+            }
+            if (this._pinToolbarAt(x, y)) {
+                return Clutter.EVENT_STOP;   // toolbar padding — absorb only
+            }
+            const hd = this._pinHandleAt(x, y);
+            if (hd) {
+                this._pinHandlePressXY(hd, x, y);
+                return Clutter.EVENT_STOP;
+            }
+        }
         if (s.phase === 'drag' || s.phase === 'redrag') {
             s.startX = x;
             s.startY = y;
@@ -2732,15 +2758,21 @@ export default class InvertonatorExtension extends Extension {
     }
 
     _pinHandlePress(h, ev) {
-        const s = this._pinSelect;
-        if (!s) {
-            return Clutter.EVENT_STOP;
-        }
         if (ev.get_button() !== 1) {
             this.pinSelectCancel();
             return Clutter.EVENT_STOP;
         }
         const [x, y] = ev.get_coords();
+        return this._pinHandlePressXY(h, x, y);
+    }
+
+    // Primary-button handle grab, from EITHER layer (the handle actor's
+    // own handler, or the overlay hit-test fallback).
+    _pinHandlePressXY(h, x, y) {
+        const s = this._pinSelect;
+        if (!s) {
+            return Clutter.EVENT_STOP;
+        }
         s.pressX = x;
         s.pressY = y;
         s.phase = 'resize';
@@ -2775,6 +2807,7 @@ export default class InvertonatorExtension extends Extension {
                 (a, ev) => this._pinHandlePress({ mask, cursor }, ev));
             s.overlay.add_child(hd);
             s.handles.push(hd);
+            s.handleSpecs.push({ mask, cursor });
         }
         // Size chip — non-reactive so presses fall through to the rect
         // (an inside-rect press means move).
@@ -2799,9 +2832,26 @@ export default class InvertonatorExtension extends Extension {
                     `background: ${accent}; color: #ffffff; ` +
                     'font-size: 12px; font-weight: bold;',
             });
+            // Primary path: fire on PRESS. 'clicked' needs the button's
+            // own press→release pair to survive the modal grab, which is
+            // exactly what Q3 says can fail; a press delivered to the
+            // picked actor does not. The overlay-side hit test
+            // (_pinButtonAt) is the second path — both are
+            // single-fire because each consumes with EVENT_STOP. Any
+            // surviving stray 'clicked' only re-runs an idempotent
+            // action on a torn-down or phase-changed selection.
+            b.connect('button-press-event', () => {
+                const s2 = this._pinSelect;
+                if (s2?.toolbarActive) {
+                    cb();
+                    return Clutter.EVENT_STOP;
+                }
+                return Clutter.EVENT_PROPAGATE;
+            });
             b.connect('clicked', cb);
             tb.add_child(b);
             s.btns.push(b);
+            s.btnActions.push(cb);
         };
         mkBtn('Confirm area', () => this._pinConfirm(), '#2e7d32');
         mkBtn('Redraw', () => this._pinRestartDrag(), '#546e7a');
@@ -2883,16 +2933,73 @@ export default class InvertonatorExtension extends Extension {
     }
 
     // Buttons only clickable while the preview is idle — a click during a
-    // live drag must not steal the release event the drag needs.
+    // live drag must not steal the release event the drag needs. The
+    // toolbarActive flag gates BOTH click layers: the actors' reactive
+    // flags (pick-level) and the overlay hit-test fallback.
     _pinSetToolbarActive(on) {
         const s = this._pinSelect;
         if (!s || !s.toolbar) {
             return;
         }
+        s.toolbarActive = on;
         s.toolbar.reactive = on;
         for (const b of s.btns) {
             b.reactive = on;
         }
+    }
+
+    // Stage-coordinate hit tests for the adjust chrome — the fallback
+    // layer that keeps the buttons and handles usable even when the
+    // modal grab starves the child actors of press delivery (Q3).
+    _pinButtonAt(x, y) {
+        const s = this._pinSelect;
+        if (!s?.toolbarActive || !s.toolbar?.visible) {
+            return null;
+        }
+        for (let i = 0; i < s.btns.length; i++) {
+            const b = s.btns[i];
+            if (!b.visible || !b.reactive) {
+                continue;
+            }
+            const [bw, bh] = b.get_transformed_size();
+            const [bx, by] = b.get_transformed_position();
+            if (bw > 0 && bh > 0 && x >= bx && x <= bx + bw &&
+                y >= by && y <= by + bh) {
+                return s.btnActions[i];
+            }
+        }
+        return null;
+    }
+
+    _pinToolbarAt(x, y) {
+        const s = this._pinSelect;
+        if (!s?.toolbarActive || !s.toolbar?.visible) {
+            return false;
+        }
+        const [tw, th] = s.toolbar.get_transformed_size();
+        const [tx, ty] = s.toolbar.get_transformed_position();
+        return tw > 0 && th > 0 && x >= tx && x <= tx + tw &&
+            y >= ty && y <= ty + th;
+    }
+
+    _pinHandleAt(x, y) {
+        const s = this._pinSelect;
+        if (!s) {
+            return null;
+        }
+        for (let i = 0; i < s.handles.length; i++) {
+            const hd = s.handles[i];
+            if (!hd.visible) {
+                continue;
+            }
+            const [hw, hh] = hd.get_transformed_size();
+            const [hx, hy] = hd.get_transformed_position();
+            if (hw > 0 && hh > 0 && x >= hx && x <= hx + hw &&
+                y >= hy && y <= hy + hh) {
+                return s.handleSpecs[i];
+            }
+        }
+        return null;
     }
 
     _pinConfirm() {

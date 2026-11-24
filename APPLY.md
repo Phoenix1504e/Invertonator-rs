@@ -1,4 +1,4 @@
-# Invertonator-rs — Full Source Package (v0.3.0-alpha.28, adjust + confirm selection)
+# Invertonator-rs — Full Source Package (v0.3.0-alpha.29, clickable adjust chrome)
 
 Complete repo at a fixed state — extract over your clone, commit, push.
 No `.git` inside, your history is untouched.
@@ -55,7 +55,31 @@ your builds reproducible; keep the lock in sync instead.
 
 ---
 
-## What alpha.28 adds (your request: "after selection give them a chance to readjust and then confirm the area")
+## Round 16 field event — Confirm / Redraw / Cancel dead on click (fixed)
+
+Your report: "the buttons which show after an area is selected — confirm,
+redraw and cancel — do not work on clicking." This was pre-registered as
+risk Q3 ("St.Button 'clicked' vs modal grab routing"). Root cause: on some
+Mutter builds the modal grab routes button PRESSes to the grab actor
+instead of the picked child — a St.Button never forms its press→release
+pair and `clicked` never emits, while drags (handled by the grab actor
+itself) keep working. alpha.29 makes the click path double-layered so it
+cannot depend on that routing anymore:
+
+1. **Press-driven buttons** — Confirm/Redraw/Cancel now fire on PRESS (the
+   event that is guaranteed to deliver), not on `clicked`.
+2. **Overlay hit-test fallback** — the grab actor's own press handler
+   (field-proven delivery) additionally hit-tests the press coordinates
+   against the buttons AND the 8 resize handles (`_pinButtonAt` /
+   `_pinToolbarAt` / `_pinHandleAt`). Whichever layer receives the press
+   first fires the action exactly once — the other consumes with
+   EVENT_STOP, so there is no double-fire in either Mutter behavior.
+
+Keyboard shortcuts (Enter / R / Esc) were never affected and remain.
+
+---
+
+## What alpha.29 changes (v2.3.5)
 
 The alpha.27 selection committed the instant you released the mouse —
 too fast to fix a sloppy drag. The prompt is now TWO STEPS:
@@ -240,7 +264,7 @@ The filename is the SAME across versions. An older download in
 unzip -z ~/Downloads/Invertonator-rs-full-source.zip
 ```
 
-It must print **`Invertonator-rs <sha> 0.3.0-alpha.28`**. If it
+It must print **`Invertonator-rs <sha> 0.3.0-alpha.29`**. If it
 prints alpha.27 or older, re-download the zip from the chat first.
 
 > Rounds 10 AND 14 lost to the same paste mix-up (Windows block into
@@ -256,12 +280,12 @@ bash apply-linux.sh
 ```
 
 `apply-linux.sh` does the whole flow WITH guards: refuses non-Linux,
-verifies the zip is alpha.28 (metadata version + adjust/confirm markers)
+verifies the zip is alpha.29 (metadata version + adjust/confirm markers)
 BEFORE touching the repo, refuses a dirty repo, resets to `origin/main`,
-extracts, commits `alpha.28: Linux v2.3.4 — pin selection adjust +
-confirm step (handles, move, Enter/R/Esc)`, pushes, runs the installer
-and prints the logout reminder. Zip somewhere else? `bash apply-linux.sh
-/path/to/zip`.
+extracts, commits `alpha.29: fix adjust chrome dead-on-click (Q3) —
+press-driven buttons + overlay hit-test fallback (v2.3.5)`, pushes, runs
+the installer and prints the logout reminder. Zip somewhere else?
+`bash apply-linux.sh /path/to/zip`.
 
 Manual fallback (only if you want to do it by hand — NO guards):
 
@@ -272,7 +296,7 @@ git reset --hard origin/main && \
 unzip -o ~/Downloads/Invertonator-rs-full-source.zip -d . && \
 git status --short && \
 git add -A && \
-git commit -m "alpha.28: Linux v2.3.4 — pin selection adjust + confirm step (handles, move, Enter/R/Esc)" && \
+git commit -m "alpha.29: fix adjust chrome dead-on-click (Q3) — press-driven buttons + overlay hit-test fallback (v2.3.5)" && \
 git push origin HEAD && \
 bash shell-extension/install.sh
 ```
@@ -326,7 +350,7 @@ pin-hole, auto-hole-media, auto-hole-fullscreen, start-enabled).
    fullscreen → rects keep following.
 7. mpv / VLC / a game fullscreen → whole window true color (fallback
    hole, journal: `auto-hole ON (fullscreen, no media nodes)`).
-8. **NEW — the alpha.28 test (adjust + confirm, then the YouTube pin):**
+8. **the alpha.28/29 test (adjust + confirm, then the YouTube pin):**
    inverted, on a YouTube watch page (windowed), press **Super+F8** →
    screen dims with a hint label. Drag a box around the video player and
    RELEASE — a solid preview appears with 8 handles, a `W × H px` readout
@@ -335,6 +359,12 @@ pin-hole, auto-hole-media, auto-hole-fullscreen, start-enabled).
    drag inside the rect to move it — journal stays silent (nothing
    stored yet). Press **Enter** (or click Confirm). Journal:
    `area stored — match title tokens [song x, youtube] rel=[…]`.
+   **CLICK test (the alpha.29 fix):** Super+F8 again, drag, release, then
+   click **Redraw** (dashed box returns, journal: `redraw requested`),
+   drag again, release, click **Cancel** (overlay closes, journal:
+   `area selection cancelled`), drag once more, release, click
+   **Confirm area** — journal: `area stored`. Every button click must
+   act; if one is still dead, send the journal tail.
    Press Super+F8 again, drag, then **R** or Redraw → fresh selection;
    Esc mid-adjust → nothing stored. Close the tab, open ANOTHER video on
    YouTube → within ≤2s a true-color rect appears at the SAME relative
