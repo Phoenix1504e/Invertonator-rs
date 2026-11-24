@@ -1,7 +1,12 @@
-# Invertonator-rs — Full Source Package (v0.3.0-alpha.29, clickable adjust chrome)
+# Invertonator-rs — Full Source Package (v0.3.0 stable — desktop-empty auto-off)
 
 Complete repo at a fixed state — extract over your clone, commit, push.
 No `.git` inside, your history is untouched.
+
+**This is the STABLE release line (0.3.0, Linux v2.4.0) — first stable cut
+after 16 alpha field rounds. It ships the new desktop-empty auto-off
+feature on top of the alpha.29 click fix. Test protocol below was
+extended accordingly (step 10).**
 
 ---
 
@@ -54,6 +59,36 @@ that, and do NOT remove `--locked` from CI — the flag is what keeps
 your builds reproducible; keep the lock in sync instead.
 
 ---
+
+## What's new in v0.3.0 stable (Linux v2.4.0) — desktop-empty auto-off
+
+Your request: *"if there are no windows open and we are on the home page
+then inversion turns off — add this as a feature, it is just an ease of
+life thing."* Shipped exactly that:
+
+- While inversion is on, **the moment the last real window closes** the
+  inversion turns itself off — with a notification — exactly like a
+  manual Super+I: holes die, the media walker stops, stored area pins
+  keep their gsettings entries, `start-enabled` is cleared, the panel
+  icon flips back. The inverted-wallpaper-on-an-empty-desktop problem is
+  gone.
+- **Counted as real windows**: NORMAL, DIALOG, MODAL_DIALOG, UTILITY,
+  SPLASHSCREEN. A dash-to-dock (DOCK), a desktop-icons layer (DESKTOP),
+  notifications and menus never hold the inversion open.
+- **A minimized window still counts as open** (it is still open —
+  restoring it must not need a re-toggle). Windows on OTHER workspaces
+  also count: the inversion goes off when the last window CLOSES, not
+  when you visit an empty workspace.
+- **Event-driven, no polling**: the trigger is the per-window
+  `unmanaged` signal — the one hook every close path (window closed,
+  app quit, crash, force-kill) passes through. Because there is no
+  poll, pressing Super+I on an ALREADY-empty desktop stays on
+  (pre-arming before you launch the next app works), and the login
+  auto-resume (`start-enabled`) behaves the same.
+- **Opt out** without losing the feature forever:
+  `gsettings set org.gnome.shell.extensions.invertonator auto-off-no-windows false`
+- A Super+F8 selection left open while the last window closes is
+  cancelled cleanly (an orphaned grab overlay would have frozen input).
 
 ## Round 16 field event — Confirm / Redraw / Cancel dead on click (fixed)
 
@@ -264,8 +299,8 @@ The filename is the SAME across versions. An older download in
 unzip -z ~/Downloads/Invertonator-rs-full-source.zip
 ```
 
-It must print **`Invertonator-rs <sha> 0.3.0-alpha.29`**. If it
-prints alpha.27 or older, re-download the zip from the chat first.
+It must print **`Invertonator-rs <sha> 0.3.0`**. If it
+prints alpha.29 or older, re-download the zip from the chat first.
 
 > Rounds 10 AND 14 lost to the same paste mix-up (Windows block into
 > Fedora bash) — hence the guards below. The full story is in "STOP —
@@ -280,12 +315,12 @@ bash apply-linux.sh
 ```
 
 `apply-linux.sh` does the whole flow WITH guards: refuses non-Linux,
-verifies the zip is alpha.29 (metadata version + adjust/confirm markers)
-BEFORE touching the repo, refuses a dirty repo, resets to `origin/main`,
-extracts, commits `alpha.29: fix adjust chrome dead-on-click (Q3) —
-press-driven buttons + overlay hit-test fallback (v2.3.5)`, pushes, runs
-the installer and prints the logout reminder. Zip somewhere else?
-`bash apply-linux.sh /path/to/zip`.
+verifies the zip is v0.3.0 (metadata version 30 + adjust/confirm +
+auto-off markers) BEFORE touching the repo, refuses a dirty repo, resets
+to `origin/main`, extracts, commits `v0.3.0 stable: desktop-empty
+auto-off — last real window closing turns inversion off (v2.4.0;
+includes alpha.29 click fix)`, pushes, runs the installer and prints the
+logout reminder. Zip somewhere else? `bash apply-linux.sh /path/to/zip`.
 
 Manual fallback (only if you want to do it by hand — NO guards):
 
@@ -296,7 +331,7 @@ git reset --hard origin/main && \
 unzip -o ~/Downloads/Invertonator-rs-full-source.zip -d . && \
 git status --short && \
 git add -A && \
-git commit -m "alpha.29: fix adjust chrome dead-on-click (Q3) — press-driven buttons + overlay hit-test fallback (v2.3.5)" && \
+git commit -m "v0.3.0 stable: desktop-empty auto-off — last real window closing turns inversion off (v2.4.0; includes alpha.29 click fix)" && \
 git push origin HEAD && \
 bash shell-extension/install.sh
 ```
@@ -316,13 +351,14 @@ Then **log out and log back in**. Reinstalling over a copy the running
 shell already executes cannot hot-reload — the logout guarantees the
 new module actually runs.
 
-After login: install.sh output should include SIX
+After login: install.sh output should include SEVEN
 `schema check: '...' present` lines (toggle-invert, toggle-pierce,
-pin-hole, auto-hole-media, auto-hole-fullscreen, start-enabled).
+pin-hole, auto-hole-media, auto-hole-fullscreen, auto-off-no-windows,
+start-enabled).
 
 ## Test protocol (6 minutes)
 
-1. `gnome-extensions info invertonator@phoenix1504e` → **Version: 27**, State: ACTIVE.
+1. `gnome-extensions info invertonator@phoenix1504e` → **Version: 30**, State: ACTIVE.
 2. `journalctl --user -b --no-pager | grep -i Invertonator | tail -15` →
    expect: THREE `registered` keybinding lines (toggle-invert,
    toggle-pierce, **pin-hole**), `AT-SPI2 ready — media
@@ -391,9 +427,34 @@ pin-hole, auto-hole-media, auto-hole-fullscreen, start-enabled).
    the shaders but the entries stay in gsettings and re-apply on ON.
    Fullscreen windows still drop pins by design (windowed layout is
    meaningless there) — un-fullscreen and the pin returns.
-10. If AT-SPI discovery ALSO still works on your setup, both can coexist:
-   the stored pin wins on its window (chrome of a pinned YouTube window
-   stays inverted even if the walker is dead — the whole point).
+10. **NEW — the v0.3.0 stable test: desktop-empty auto-off (your request,
+    "no windows open → inversion turns off").** With inversion ON and two
+    windows open, close ONE of them → inversion MUST stay on (journal:
+    nothing new). Close the LAST window → the desktop wallpaper comes
+    back to normal colors IMMEDIATELY, a notification appears ("No
+    windows open — inversion turned off automatically…") and the journal
+    prints `last real window closed — desktop empty, inversion auto-off`
+    followed by `inversion OFF`. The panel indicator flips to
+    `Inversion: OFF`. Sub-cases that must NOT fire (or must fire) the
+    auto-off:
+    a) minimize the last window instead of closing it (still open — stays
+       inverted),
+    b) switch to an empty workspace while windows exist on another one
+       (still open — stays inverted),
+    c) only dash-to-dock / desktop icons / notifications on screen after
+       the last app closes → those are not windows → auto-off DOES fire,
+    d) Super+I pressed on an ALREADY-empty desktop (inversion stays ON —
+       pre-arming; it auto-offs only when the next app's window is opened
+       and closed again),
+    e) opt-out check: `gsettings set org.gnome.shell.extensions.invertonator
+       auto-off-no-windows false`, invert, close the last window → stays
+       ON (set the key back to `true` afterwards).
+    Also confirm pins survived the auto-off: `gsettings get
+    org.gnome.shell.extensions.invertonator pinned-holes` still lists the
+    step-8 entry, and a fresh Super+I re-applies it to a matching window.
+11. If AT-SPI discovery ALSO still works on your setup, both can coexist:
+    the stored pin wins on its window (chrome of a pinned YouTube window
+    stays inverted even if the walker is dead — the whole point).
 
 Report back ONE line: version + whether windowed video/images got true-
 color rects at the right place + whether fullscreen showed video true
@@ -413,11 +474,11 @@ discards the entire line and RUNS NOTHING. (Verified round 14.) alpha.28
 is Linux-only; this section only bumps the Windows VERSION string.
 
 ```powershell
-if ($env:OS -ne 'Windows_NT') { throw 'WINDOWS PowerShell block — wrong machine.' } else { cd C:\Users\admin\invertonator-push; Expand-Archive -Path "$env:USERPROFILE\Downloads\Invertonator-rs-full-source.zip" -DestinationPath . -Force; git add -A; git commit -m "alpha.28a: pin adjust + confirm step (handles, move, Enter/R/Esc) + sync Cargo.lock to 0.3.0-alpha.28 (fixes CI --locked)"; git push origin HEAD }
+if ($env:OS -ne 'Windows_NT') { throw 'WINDOWS PowerShell block — wrong machine.' } else { cd C:\Users\admin\invertonator-push; Expand-Archive -Path "$env:USERPROFILE\Downloads\Invertonator-rs-full-source.zip" -DestinationPath . -Force; git add -A; git commit -m "v0.3.0 stable: desktop-empty auto-off — last real window closing turns inversion off (v2.4.0; includes alpha.29 click fix)"; git push origin HEAD }
 ```
 
 Verify: first line of `%LOCALAPPDATA%\Invertonator\log.txt` must read
-`=== Invertonator-rs v0.3.0-alpha.28 ===`. Windows behavior is
+`=== Invertonator-rs v0.3.0 ===`. Windows behavior is
 alpha.15-identical; its test protocol and Desktop diagnostics still apply.
 
 ---
@@ -430,8 +491,8 @@ alpha.15-identical; its test protocol and Desktop diagnostics still apply.
 APPLY.md                     this file
 apply-linux.sh               ONE-command guarded Fedora apply (verify zip, commit, push, install)
 invertonator-diag.sh         one-shot Linux auto-hole diagnostics (run on Fedora, paste output)
-Cargo.toml                   0.3.0-alpha.28 (windows+linux deps)
-Cargo.lock                   synced to 0.3.0-alpha.28 (alpha.28a — fixes CI `--locked`)
+Cargo.toml                   0.3.0 stable (windows+linux deps)
+Cargo.lock                   synced to 0.3.0 (same commit — CI `--locked` stays green)
 Invertonator-rs-v0.2.0-alpha.2.exe  legacy artifact (safe to git rm)
 LICENSE                      MIT
 README.md                    status + platform matrix (5 platforms) + roadmap
@@ -439,7 +500,7 @@ docs/LINUX-TESTING.md        Fedora-first runbook (Wayland ext / X11 / KDE) +
                              holes test protocol + journal-line diagnosis
 icon.ico / icon.svg          logo (tray + README)
 src/main.rs                  cross-platform entry (cfg dispatcher)
-src/common.rs                settings.json + logging + VERSION (alpha.28)
+src/common.rs                settings.json + logging + VERSION (v0.3.0)
 src/win_main.rs              Windows backend (tray, hotkeys, probe, DPI,
                              auto-diagnostics, hysteresis telemetry)
 src/holes.rs                 hole pool + main-thread pump (≈64Hz, context-
@@ -451,7 +512,7 @@ src/scrollhook.rs            low-level wheel hook (scroll-hold, page-dirty)
 src/linux.rs                 X11 XRandR gamma inversion + --self-test +
                              Wayland session awareness
 shell-extension/install.sh                       installer + schema verification + gsettings fallback
-shell-extension/invertonator@phoenix1504e/metadata.json    uuid, v28, shells 45–51
+shell-extension/invertonator@phoenix1504e/metadata.json    uuid, v30 (0.3.0 stable), shells 45–51
 shell-extension/invertonator@phoenix1504e/extension.js     compositor shader inversion
                                                            (Cogl.Snippet / dual-API effect,
                                                            uiGroup attach), Super+I,
@@ -463,7 +524,11 @@ shell-extension/invertonator@phoenix1504e/extension.js     compositor shader inv
                                                            capture), scanout guard,
                                                            v2.3.3 Super+F8 stored area
                                                            pins (select-once, title-token
-                                                           matching, reboot-proof)
+                                                           matching, reboot-proof),
+                                                           v2.4 desktop-empty auto-off
+                                                           (last window closing turns
+                                                           inversion off; gsettings
+                                                           auto-off-no-windows)
 shell-extension/invertonator@phoenix1504e/schemas/org.gnome.shell.extensions.invertonator.gschema.xml
 shell-extension/invertonator@phoenix1504e/schemas/gschemas.compiled
 worklog.md                   project memory: tasks, field findings, SHA chain

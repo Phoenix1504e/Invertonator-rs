@@ -100,6 +100,23 @@
 //   manual Super+F7 pierce > stored pins > media rects > fullscreen
 //   auto-hole.
 //
+//   v2.4 desktop-empty auto-off (v0.3.0 stable): the global pass inverts
+//   EVERY pixel — on an empty desktop that is just an inverted wallpaper,
+//   which nobody asked for. While inversion is on, the moment the LAST
+//   real window closes (or crashes, or is force-killed — every close path
+//   ends in MetaWindow::unmanaged) the inversion turns itself off with a
+//   notification, exactly like a manual Super+I: stored area pins survive
+//   in gsettings, start-enabled is cleared, the panel icon flips back.
+//   "Real window" = NORMAL / DIALOG / MODAL_DIALOG / UTILITY / SPLASHSCREEN
+//   — docks, desktop-icon layers, notifications and menus do NOT hold the
+//   inversion open. A MINIMIZED window still counts as open (it is still
+//   open — restoring it must not need a re-toggle). Event-driven only: no
+//   polling, so an explicit Super+I on an already-empty desktop stays on
+//   (pre-arming before you launch the next app works), and the login
+//   auto-resume behaves the same. Opt out:
+//   gsettings set org.gnome.shell.extensions.invertonator
+//   auto-off-no-windows false
+//
 // Tested against the GNOME 45-51 extension API surface (ESM imports,
 // Extension.getSettings, Main.wm.addKeybinding, PanelMenu.Button).
 //
@@ -772,6 +789,10 @@ export default class InvertonatorExtension extends Extension {
                     this._onFullscreenChange(mw)),
                 unmanagedId: mw.connect('unmanaged', () => {
                     this._fullscreenWatch?.delete(mw);
+                    // v2.4: every close path (window closed, app quit,
+                    // crash, force-kill) passes through here — the one
+                    // hook the desktop-empty auto-off needs.
+                    this._onWindowGone(mw);
                 }),
             });
             // The handler is state-driven — this call covers windows that
@@ -850,6 +871,95 @@ export default class InvertonatorExtension extends Extension {
             try { mw.disconnect(entry.unmanagedId); } catch (e) {}
         }
         this._fullscreenWatch.clear();
+    }
+
+    // --- v2.4: desktop-empty auto-off -------------------------------------
+    //
+    // Inversion is a FULL-SCREEN pass — with no window left open it is
+    // just an inverted wallpaper. When the last real window closes while
+    // inversion is on, turn it off automatically (same teardown as a
+    // manual toggle: holes die, media walker stops, pin EFFECTS die while
+    // the stored entries stay in gsettings, start-enabled is cleared, the
+    // indicator flips back).
+    //
+    // Counting is event-driven (the per-window 'unmanaged' hook above is
+    // the only trigger) — deliberate design, no polling tick:
+    //   * a close is the ONLY thing that can empty the desktop;
+    //   * an explicit Super+I on an already-empty desktop must survive
+    //     (pre-arming before the next app launches) — a poll would kill
+    //     it seconds later and make the toggle feel broken.
+
+    // How many "real" windows are open (optionally ignoring one that is
+    // closing — at 'unmanaged' time its actor can still be listed).
+    // Whitelist, not blacklist: only the types a user opens count, so a
+    // dash-to-dock (DOCK), a desktop-icons layer (DESKTOP), notifications
+    // or menus never hold the inversion open. Override-redirect popups are
+    // transient chrome, not windows.
+    _desktopWindowCount(exclude) {
+        let n = 0;
+        for (const actor of global.get_window_actors()) {
+            const mw = actor.get_meta_window?.();
+            if (!mw || mw === exclude) {
+                continue;
+            }
+            if (mw.is_override_redirect?.() ?? false) {
+                continue;
+            }
+            let t;
+            try {
+                t = mw.window_type ?? mw.get_window_type?.();
+            } catch (e) {
+                t = undefined;
+            }
+            if (t !== undefined &&
+                t !== Meta.WindowType.NORMAL &&
+                t !== Meta.WindowType.DIALOG &&
+                t !== Meta.WindowType.MODAL_DIALOG &&
+                t !== Meta.WindowType.UTILITY &&
+                t !== Meta.WindowType.SPLASHSCREEN) {
+                continue;
+            }
+            n++;
+        }
+        return n;
+    }
+
+    _autoOffSetting() {
+        try {
+            return this._settings?.get_boolean('auto-off-no-windows') ?? true;
+        } catch (e) {
+            return true;   // stale schema without the key: feature stays on
+        }
+    }
+
+    // 'unmanaged' on any watched window — fires while inverted or not;
+    // everything below only ever acts on an ACTIVE inversion.
+    _onWindowGone(mw) {
+        if (!this._inverted || !this._settings) {
+            return;
+        }
+        if (!this._autoOffSetting()) {
+            return;
+        }
+        if (this._desktopWindowCount(mw) !== 0) {
+            return;
+        }
+        console.log('Invertonator: last real window closed — desktop ' +
+            'empty, inversion auto-off');
+        // A mid-selection grab must not outlive the inversion it belongs
+        // to (Super+F8 held open while the last window closed underneath
+        // it would otherwise leave an orphaned overlay).
+        if (this._pinSelect) {
+            this.pinSelectCancel(true);
+            console.log('Invertonator: area selection cancelled (desktop ' +
+                'went empty)');
+        }
+        this.setInverted(false);
+        try {
+            Main.notify('Invertonator',
+                'No windows open — inversion turned off automatically. ' +
+                `Press ${this.accelFor('toggle-invert', 'Super+I')} to re-enable.`);
+        } catch (e) {}
     }
 
     // --- v2.1: direct-scanout guard --------------------------------------

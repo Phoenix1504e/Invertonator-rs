@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Invertonator — ONE-command Fedora apply (this copy: alpha.29 / Linux v2.3.5).
+# Invertonator — ONE-command Fedora apply (this copy: v0.3.0 stable / Linux v2.4.0).
 #
 # Why this script exists: the Windows PowerShell apply block has been
 # pasted into Fedora bash TWICE now (round 10 and round 14) — bash eats
@@ -9,7 +9,7 @@
 # This script makes the Fedora path ONE short paste and self-checks
 # everything the manual flow got wrong by hand:
 #   1. refuses to run anywhere but Linux bash;
-#   2. verifies the zip IS alpha.29 BEFORE touching the repo;
+#   2. verifies the zip IS v0.3.0 BEFORE touching the repo;
 #   3. refuses a dirty repo (except its own drop-in copy);
 #   4. commits with the correct, release-pinned message;
 #   5. pushes and runs the installer, with the logout reminder.
@@ -23,9 +23,12 @@
 # Per-release: bump REPO_V + MSG below; this script ships INSIDE the zip.
 set -euo pipefail
 
-REPO_V=29
-MSG="alpha.29: fix adjust chrome dead-on-click (Q3) — press-driven buttons + overlay hit-test fallback (v2.3.5)"
+REPO_V=30
+MSG="v0.3.0 stable: desktop-empty auto-off — last real window closing turns inversion off (v2.4.0; includes alpha.29 click fix)"
 EXT_DIR="shell-extension/invertonator@phoenix1504e"
+# Content markers this release MUST contain (freshness + feature gates).
+MARK1='Confirm area'          # alpha.28 adjust+confirm flow
+MARK2='auto-off-no-windows'  # v2.4 desktop-empty auto-off
 
 err() {
     echo
@@ -56,7 +59,7 @@ for c in "$HOME/Downloads/Invertonator-rs-full-source.zip" \
     fi
 done
 [ -n "$ZIP" ] && [ -f "$ZIP" ] \
-    || err "zip not found (tried arg, ~/Downloads, \$PWD, ~/FromWindows) — download the alpha.29 zip from the chat first"
+    || err "zip not found (tried arg, ~/Downloads, \$PWD, ~/FromWindows) — download the v0.3.0 zip from the chat first"
 banner "zip = $ZIP"
 banner "zip header: $(unzip -z "$ZIP" 2>/dev/null | tail -1 || echo '(none)')"
 
@@ -67,9 +70,13 @@ unzip -q "$ZIP" -d "$TMP"
 VER="$(grep -oP '"version":\s*\K[0-9]+' "$TMP/$EXT_DIR/metadata.json" 2>/dev/null || echo 0)"
 [ "$VER" = "$REPO_V" ] \
     || err "STALE ZIP (metadata version $VER, need $REPO_V) — re-download the zip from the chat. Repo untouched."
-grep -q 'Confirm area' "$TMP/$EXT_DIR/extension.js" \
+grep -q "$MARK1" "$TMP/$EXT_DIR/extension.js" \
     || err "zip content check failed (no adjust+confirm markers) — re-download the zip."
-banner "zip verified: alpha.$REPO_V, adjust+confirm markers present"
+grep -q "$MARK2" "$TMP/$EXT_DIR/extension.js" \
+    || err "zip content check failed (no desktop-empty auto-off marker) — re-download the zip."
+grep -q "$MARK2" "$TMP/$EXT_DIR/schemas/org.gnome.shell.extensions.invertonator.gschema.xml" \
+    || err "zip content check failed (schema missing auto-off-no-windows) — re-download the zip."
+banner "zip verified: v0.3.0 (metadata $REPO_V), adjust+confirm + auto-off markers present"
 
 # --- guard 5: clean repo (this script's own drop-in copy is exempt) ----------
 git fetch origin
@@ -102,3 +109,4 @@ else
 fi
 banner "DONE — now LOG OUT AND BACK IN (GNOME cannot hot-reload the extension)."
 banner "Then Super+I → Super+F8 → drag → adjust the handles → Confirm (or Enter)."
+banner "Stable-release test: invert → close the last window → inversion auto-off + notification."

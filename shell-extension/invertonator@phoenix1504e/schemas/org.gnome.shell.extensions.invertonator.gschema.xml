@@ -84,6 +84,23 @@
             auto-hole-fullscreen false). Manual Super+F7 holes are unaffected
             and are never auto-removed by un-fullscreening.</description>
         </key>
+        <key name="auto-off-no-windows" type="b">
+            <default>true</default>
+            <summary>Auto turn off when the last window closes</summary>
+            <description>While inversion is on, closing the LAST real window
+            turns the inversion off automatically — with nothing open the
+            full-screen pass is just an inverted wallpaper. Counted as real
+            windows: NORMAL, DIALOG, MODAL_DIALOG, UTILITY, SPLASHSCREEN —
+            docks, desktop-icon layers, notifications and menus never hold
+            the inversion open, a MINIMIZED window still counts as open (it
+            is still open; restoring it must not need a re-toggle). Fires
+            only on an actual close event, so pressing Super+I on an
+            already-empty desktop stays on (pre-arming works). This is the
+            same teardown as a manual toggle: stored area pins survive in
+            gsettings and come back with the next Super+I. Opt out:
+            gsettings set org.gnome.shell.extensions.invertonator
+            auto-off-no-windows false</description>
+        </key>
         <key name="start-enabled" type="b">
             <default>false</default>
             <summary>Inversion state</summary>

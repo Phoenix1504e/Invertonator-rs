@@ -560,3 +560,37 @@ Delivered: zip `Invertonator-rs <sha> 0.3.0-alpha.24` + changed-files mirror byt
 | Q3 variant: only SOME clicks dead | hit-test fallback fires from grab actor — journal shows the action on every click | if a click still does nothing, capture journal tail (JS ERROR lines matter) |
 | Q2 regression: handle fires from fallback AND actor | double `redraw`/rect jump on single press | EVENT_STOP on both layers prevents it; if seen, the pick is delivering twice — log ev.get_time() |
 | Q4/Q5 unchanged | toolbar placement, cursor reset — untouched this round | re-verify in the same pass |
+
+## Task 30 — v0.3.0 STABLE (Linux v2.4.0): desktop-empty auto-off (user request, round 17)
+
+### Field request
+- USER: "if there are no windows open and we are on the home page then inversion turns off — add this as a feature, it is not present yet, just an ease of life thing … this will be a stable release, everything perfect, thorough testing, official release." User explicitly designated this cut STABLE → version line promoted: 0.3.0-alpha.29 → **0.3.0** (Cargo/lock/common.rs), metadata 30, Linux v2.4.0.
+
+### Design (deliberate semantics — documented everywhere)
+- The global pass inverts EVERY pixel; with no window open it is an inverted wallpaper → while inverted, closing the LAST real window auto-offs (setInverted(false) — identical teardown to a manual toggle; stored pin entries survive, start-enabled cleared, indicator flips).
+- Predicate `_desktopWindowCount(exclude)`: whitelist NORMAL/DIALOG/MODAL_DIALOG/UTILITY/SPLASHSCREEN, skip override-redirect — docks, desktop-icon layers, notifications never hold inversion open. Minimized windows count as OPEN (restoring must not need a re-toggle). Windows on other workspaces count (fires on CLOSE, not on workspace visits).
+- Event-driven only: the per-window 'unmanaged' hook (every close path ends there) → `_onWindowGone(mw)`. NO polling tick — on purpose: a poll would kill an explicit Super+I on an already-empty desktop seconds later (bounce); pre-arming must work. Login auto-resume behaves the same.
+- Escape hatch: new gsettings key `auto-off-no-windows` (default true) in the schema XML + recompiled gschemas.compiled; install.sh schema check extended to SEVEN keys; `_autoOffSetting()` falls open (feature stays on) if a stale schema lacks the key.
+- Safety: a Super+F8 selection left open while the last window closes is cancelled before teardown (orphaned grab overlay would freeze input).
+
+### v0.3.0 changes
+1. extension.js: header v2.4 block; `_watchWindow` unmanaged handler calls `_onWindowGone(mw)`; new section `_desktopWindowCount` / `_autoOffSetting` / `_onWindowGone` (log + pinSelectCancel(true) + setInverted(false) + Main.notify with accelFor-accelerated hint).
+2. Schema: `auto-off-no-windows` key (default true), gschemas.compiled recompiled (glib-compile-schemas present in the pack env; install.sh recompiles on the target anyway), all 8 keys verified present in the compiled binary.
+3. metadata.json: version 30 + description sentence. install.sh: key-check loop + feature echo line. apply-linux.sh: REPO_V=30, v0.3.0 MSG, THREE zip content markers (adjust+confirm, auto-off in extension.js, auto-off in schema XML), wording updates.
+4. Cargo.toml/Cargo.lock/src/common.rs → 0.3.0 (lock synced in the SAME commit — alpha.28a lesson; packaging gate re-verifies).
+5. README (status, platform matrix v2.4.0, history entries v2.3.3–v2.4.0), APPLY.md (title, "What's new in v0.3.0 stable" section, freshness gate `0.3.0`, Fedora/manual commands, SEVEN schema lines, test protocol step 1 Version: 30 + NEW step 10 auto-off tests a–e, Windows block message bumped — it had been left at alpha.28a in round 16, file map refreshed).
+
+### Pre-release verification (in the pack environment, no cargo/GNOME)
+- `bash -n` on apply-linux.sh + install.sh; node ESM syntax check on extension.js.
+- Mocked-GI scenario harness (scripts/test_extension.mjs): loads the REAL extension.js against stubbed gi:// + resource:// modules and drives the state machine — 15 scenarios, all green (see the run log in the packaging step): two-window close order, last-close auto-off (notify + start-enabled false + effect removed), dock-only desktop fires, override-redirect-only fires, minimized window holds, dialog holds, explicit enable on empty desktop survives, opt-out key holds, setting read failure falls open, not-inverted no-op, selection-cancel path, disable→enable cycle, created-then-closed churn, double-close batch, accelFor notification text.
+- Packaging gate: Cargo.toml == Cargo.lock == 0.3.0, metadata 30; every packaged file byte-compared against the workdir.
+
+### Risk table for round 17 (stable release)
+| Branch | Evidence in field | Verdict path |
+|---|---|---|
+| Feature works | close last window → wallpaper back to normal + notification + journal `desktop empty, inversion auto-off` | DONE if APPLY.md step 10 passes |
+| Over-firing | inversion drops while a window is still open (dock-only case intended; anything else a bug) | sub-cases a–e isolate which predicate branch miscounts — capture journal tail |
+| Under-firing | last close does nothing | check `gsettings get … auto-off-no-windows` first, then journal for `unmanaged`-path JS ERRORs |
+| Q3 regression (alpha.29 click fix) | Confirm/Redraw/Cancel clicks | APPLY.md step 8 click test re-run in the same pass |
+| Restart persistence | reboot → auto-resume + pin re-apply | APPLY.md step 9 re-run; with an empty desktop at login, inversion resumes and STAYS on (explicit-restore semantics) |
+| Schema/keybinding death | hotkeys dead after install | install.sh now verifies SEVEN keys — a missing line means the shipped gschemas.compiled is stale |

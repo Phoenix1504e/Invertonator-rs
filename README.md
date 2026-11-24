@@ -4,7 +4,17 @@
 
 ![Invertonator](icon.svg)
 
-> **Status: v0.3.0-alpha.26 — Linux v2.3.2 re-root thrash fix (GNOME/Wayland)**:
+> **Status: v0.3.0 stable — Linux v2.4.0 desktop-empty auto-off (GNOME/Wayland)**:
+> **first stable cut** after 16 alpha field rounds. New in v2.4.0: while
+> inversion is on, **closing the last window turns the inversion off
+> automatically** — with no window left open the full-screen pass is just
+> an inverted wallpaper, and that is exactly what you do not want on the
+> home page. Same teardown as a manual Super+I (stored area pins survive
+> in gsettings), dock/desktop-icon/notification-only screens count as
+> empty, minimized windows still count as open, opt-out via
+> `gsettings set org.gnome.shell.extensions.invertonator
+> auto-off-no-windows false`. Ships on top of the alpha.29
+> press-driven-button click fix.
 > **Super+F7** pierces a true-color hole into the window under the
 > pointer while everything around it stays inverted — the Windows
 > F7-pierce analog (plain F7 is browser-claimed — caret browsing — so
@@ -153,7 +163,7 @@
 |---|---|---|---|
 | Windows 10+ | Magnifier API (compositor) | ✅ UIA tracker | `Ctrl+Alt+F5` invert · `F6` mode · `F7` pierce · `F2` quit |
 | Linux (X11) | XRandR CRTC gamma | 🚧 v2 (XComposite overlay) — media inverts too for now | `Ctrl+Alt+I` toggle · `Ctrl+Alt+Q` quit |
-| Linux (GNOME/Wayland) | Shell extension — compositor shader | ✅ **v2.3.5 shipped** — Super+F7 pierce + hole manager + fullscreen video auto-hole + AT-SPI2 media lock-on (element rects beat the fullscreen hole) + Super+F8 stored area pins (drag → adjust handles → clickable Confirm/Redraw/Cancel, title-token matched, reboot-proof) | `Super+I` invert · `Super+F7` pierce · `Super+F8` pin area · panel menu |
+| Linux (GNOME/Wayland) | Shell extension — compositor shader | ✅ **v2.4.0 shipped (v0.3.0 stable)** — Super+F7 pierce + hole manager + fullscreen video auto-hole + AT-SPI2 media lock-on (element rects beat the fullscreen hole) + Super+F8 stored area pins (drag → adjust handles → clickable Confirm/Redraw/Cancel, title-token matched, reboot-proof) + desktop-empty auto-off (last window closing turns inversion off) | `Super+I` invert · `Super+F7` pierce · `Super+F8` pin area · panel menu |
 | Linux (KDE/Wayland) | KWin's built-in Invert effect | ❌ | user-bound |
 | macOS | ❌ unsupported | ❌ | — |
 
@@ -341,6 +351,24 @@ Tor Browser) cannot detect it — there is nothing in the web layer to detect.
   priority, invertonator-diag.sh host-side probe incl. browser
   a11y-hardening detection; still queued: per-element pooling beyond 6,
   tracker telemetry
+- **v2.3.3** — **stored area pins shipped as alpha.27** (your "select an
+  area once and it gets stored for YouTube"): Super+F8 drag-select,
+  normalized to the focused window frame, title-token matched,
+  gsettings-persisted (reboot-proof), re-applied the moment a matching
+  window shows up
+- **v2.3.4** — **adjust + confirm shipped as alpha.28**: the selection
+  preview gets 8 resize handles, drag-to-move, drag-outside redraw and a
+  Confirm/Redraw/Cancel bar — nothing is stored until Confirm
+- **v2.3.5** — **dead-on-click fix shipped as alpha.29** (field round
+  16, risk Q3): press-driven buttons + grab-actor hit-test fallback so
+  Confirm/Redraw/Cancel fire under every Mutter grab-routing behavior
+- **v2.4.0 — v0.3.0 STABLE** — **desktop-empty auto-off** (your "no
+  windows open → inversion turns off"): the last real window closing
+  turns the inversion off with a notification, exactly like a manual
+  Super+I; docks/desktop-icons/notifications count as empty, minimized
+  windows still count as open, event-driven (no polling — Super+I on an
+  already-empty desktop stays on), opt-out gsettings key
+  `auto-off-no-windows`
 - **research** — compositor-level video handling, other Wayland compositors
 
 ## Credits & thanks
